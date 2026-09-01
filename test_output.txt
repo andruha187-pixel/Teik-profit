@@ -1,0 +1,3 @@
+BTC/XRP/ETH B/C PAPER/LIVE + NET TP regression: OK
+PAPER example PnL: $+0.31186
+LIVE example PnL estimate: $+0.31186
