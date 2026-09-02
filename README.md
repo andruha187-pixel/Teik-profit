@@ -1,23 +1,37 @@
-# BTC / XRP / ETH — B + C PAPER/LIVE bot for Coolify
+# MULTI7 SAFE67 A/B/C/E — PAPER/LIVE + NET TP 0.60
+
+Trading build of the uploaded MULTI7 A/B/C/E PAPER bot.
 
 Version:
 
 ```text
-18.0-btc-xrp-eth-bc-paper-live-tp
+19.0-multi7-abce-paper-live-tp60
 ```
 
-This trading build keeps only six strategies:
+## Tokens and strategies
+
+Default tokens:
 
 ```text
-BTC B
-BTC C
-XRP B
-XRP C
-ETH B
-ETH C
+BTC
+XRP
+BNB
+SOL
+ETH
+DOGE
+HYPE
 ```
 
-Each strategy has its own independent mode:
+Four strategies per token = **28 independent strategy accounts**:
+
+```text
+A
+B
+C
+E
+```
+
+Each has its own mode:
 
 ```text
 PAPER
@@ -25,230 +39,272 @@ LIVE
 OFF
 ```
 
-Default mode after a fresh database is `PAPER`. Global trading starts `OFF`
-until `START` is pressed.
+Fresh database defaults every strategy to `PAPER`.
+Global trading starts `OFF`; use `START`.
 
-There are no hourly ZIP reports in this trading build. All bot-tracked PAPER
-and LIVE actions remain in persistent SQLite.
+## Strategy logic preserved
 
-## B strategy
-
-B keeps the previous wide SAFE67 entry and old reversal DCA control:
+### A — SAFE67 BASE
 
 ```text
 FIRST V2 eligible:
-price    0.55..0.75
+price 0.55..0.75
 momentum 0.03..0.30
-lookback 2 decision ticks
 
 ENTRY:
-price    0.67..0.75
+price 0.67..0.75
 momentum 0.05..0.10
-default  5 shares
+default 5 shares
 
-DCA ARM:
+No DCA
+No stop-loss
+```
+
+### B — SAFE67 old reversal DCA
+
+```text
+ENTRY:
+price 0.67..0.75
+momentum 0.05..0.10
+default 5 shares
+
+DCA arm:
 held-side ask <= 0.50
 elapsed <= 120 sec
-NO BUY on the arm tick
+NO BUY on arm tick
 
-LATER DCA:
+Later:
 momentum >= +0.05
 ask <= 0.60
 default +5 shares
-one DCA only
+one DCA
 ```
 
-B intentionally has no new `0.30` DCA floor and no `+0.15` rebound cap.
+B intentionally keeps no `0.30` floor and no `+0.15` rebound cap.
 
-No stop-loss. No side switching.
-
-## C strategy
-
-C keeps the tighter entry and safer DCA:
+### C — tighter entry + safer reversal DCA
 
 ```text
-FIRST V2 eligible:
-price    0.55..0.75
-momentum 0.03..0.30
-
 ENTRY:
-price    0.67..0.70
+price 0.67..0.70
 momentum 0.05..0.10
-default  5 shares
+default 5 shares
 
-DCA ARM:
-held-side ask <= 0.50
+DCA arm:
+ask <= 0.50
 elapsed <= 120 sec
-NO BUY on the arm tick
+NO BUY on arm tick
 
-LATER DCA:
-ask      0.30..0.60
+Later:
+ask 0.30..0.60
 momentum +0.05..+0.15
-default  +5 shares
-one DCA only
+default +5 shares
+one DCA
 ```
 
-No stop-loss. No side switching.
+### E — cross-token consensus
 
-## Configurable NET take-profit
+```text
+target entry:
+price 0.67..0.75
+momentum 0.05..0.10
 
-The same `.env` parameter is used for all six strategies:
+confirmation:
+>= 2 DISTINCT OTHER tokens
+with A/BASE SAFE67 PASS
+same direction
+previous 10 sec
+
+default ENTRY 5 shares
+No DCA
+```
+
+The target token does not count itself. One other token counts once.
+
+A signals are still evaluated as consensus sources even when A's trading mode is
+`OFF`; `OFF` blocks order execution, not signal/gate recording.
+
+No strategy switches sides and there is no stop-loss.
+
+## Default NET take-profit
+
+Default:
+
+```text
+TAKE_PROFIT_USDC=0.60
+```
+
+This is **+$0.60 NET for the whole remaining position**, not per share.
+
+The bot's threshold calculation includes:
+
+```text
+entry gross cost
++ entry commission
+- prior exit net
+- projected current sell net
+including projected exit commission
+```
+
+Change it in hosting Environment Variables:
 
 ```text
 TAKE_PROFIT_USDC=0.30
-```
-
-`0.30` means the bot tries to close the **whole remaining position** once the
-bot-tracked executable result reaches at least **+$0.30 NET** after:
-
-```text
-entry cost
-+ entry fee
-+ estimated exit fee
-```
-
-Examples:
-
-```text
-TAKE_PROFIT_USDC=0.30
-TAKE_PROFIT_USDC=0.50
+TAKE_PROFIT_USDC=0.60
 TAKE_PROFIT_USDC=1.00
+```
+
+Disable:
+
+```text
 TAKE_PROFIT_USDC=OFF
 ```
 
-`OFF`, `NONE`, `DISABLED` or `0` disables TP.
+or:
 
-For a position that already has a DCA, the target is still `$0.30` for the
-**entire remaining position**, not `$0.30` per share.
+```text
+TAKE_PROFIT_USDC=0
+```
 
-PAPER TP walks visible bids and requires enough visible depth for the entire
-remaining position before it closes.
+After changing an environment variable, redeploy/restart the service.
 
-LIVE TP first checks the same bot-tracked NET threshold, refreshes the bid book,
-then uses the same protected real-order path as the trading bot: signed limit
-order converted to `FAK`.
+For B/C after a DCA, `0.60` is still the target for the **whole remaining
+position**, including all buys and fees.
 
-If a real TP receives a genuine partial fill, TP becomes latched and the bot
-continues trying to flatten the bot-tracked remainder on later cycles.
-An ambiguous submission remains fail-closed and is not blindly retried.
+### PAPER TP
+
+PAPER requires enough visible bid depth to sell the entire remaining position.
+It does not record a partial PAPER take-profit merely to hit the threshold.
+
+### LIVE TP
+
+LIVE checks the same bot-tracked NET target, freshness-checks the book and uses
+the protected real-order path:
+
+```text
+signed LIMIT -> FAK SELL
+```
+
+A genuine partial LIVE TP fill is recorded. Once a real TP has partially filled,
+TP becomes latched and the bot continues trying to flatten the bot-tracked
+remainder on later cycles.
+
+An ambiguous submission remains fail-closed; it is not blindly duplicated.
 
 `STOP` blocks new ENTRY/DCA actions, but TP monitoring continues for already
-open bot-tracked positions.
+open bot-tracked PAPER/LIVE positions.
 
-## PAPER / LIVE safety
+## LIVE safety
 
-LIVE is guarded at several levels.
+Master gate:
 
-First, Coolify must explicitly contain:
+```text
+LIVE_MASTER_ENABLE=0
+```
+
+First deploy with `0`. In Telegram use:
+
+```text
+WALLET
+```
+
+Verify:
+
+```text
+SDK: READY
+Wallet: expected address
+Collateral: expected balance
+LIVE master: OFF
+```
+
+Then set:
 
 ```text
 LIVE_MASTER_ENABLE=1
 ```
 
-Second, each individual strategy must be switched to LIVE in Telegram and
-confirmed within 60 seconds.
-
-Example:
-
-```text
-MODE BTC B LIVE
-CONFIRM LIVE BTC B
-```
-
-A real order uses:
-
-```text
-signed LIMIT order
--> FAK
--> actual accepted fill amount is persisted
-```
-
-Before execution the order book is refreshed when required.
-
-If the exchange/network result after submission is ambiguous, the market/action
-is marked fail-closed so the bot does not automatically submit a possible
-duplicate real order.
-
-## B and C simultaneously LIVE
-
-By default:
-
-```text
-ALLOW_DOUBLE_LIVE=0
-```
-
-This is intentional.
-
-If `BTC B` is LIVE, the bot blocks `BTC C` from becoming LIVE at the same time,
-and vice versa. The same rule applies to XRP and ETH.
-
-Why: B and C may generate the same entry on the same 5-minute market. If both
-are LIVE they are two independent strategies and can submit two independent
-real orders.
-
-If you deliberately want that behavior:
-
-```text
-ALLOW_DOUBLE_LIVE=1
-```
-
 and redeploy.
 
-PAPER strategies are not affected by this rule. For example, you can run:
+Every individual strategy still needs a second 60-second Telegram confirmation:
 
 ```text
-BTC B = LIVE
-BTC C = PAPER
-```
-
-## Telegram commands
-
-Modes:
-
-```text
-MODES
-
-MODE BTC B PAPER
-MODE BTC B OFF
 MODE BTC B LIVE
 CONFIRM LIVE BTC B
-
-MODE BTC C PAPER
-MODE BTC C LIVE
-CONFIRM LIVE BTC C
 ```
 
-Use `XRP` or `ETH` in exactly the same way.
+Examples:
 
-Sizes for both B/C on one token:
+```text
+MODE ETH C LIVE
+CONFIRM LIVE ETH C
+
+MODE SOL E LIVE
+CONFIRM LIVE SOL E
+```
+
+Switch back:
+
+```text
+MODE BTC B PAPER
+MODE BTC B OFF
+```
+
+Mode crossing PAPER <-> LIVE is blocked while that strategy holds an open
+position in the other execution mode.
+
+## Multiple LIVE strategies on one token
+
+Default:
+
+```text
+ALLOW_MULTI_LIVE_PER_TOKEN=0
+```
+
+This prevents, for example, BTC A and BTC B from both being LIVE at the same
+time. The strategies can share a signal and would otherwise send independent
+real orders.
+
+If you deliberately want several A/B/C/E strategies LIVE on the same token:
+
+```text
+ALLOW_MULTI_LIVE_PER_TOKEN=1
+```
+
+then redeploy.
+
+Different tokens can be LIVE at the same time.
+
+## Sizes
+
+Whole token:
 
 ```text
 SIZE BTC 5 5
 ```
 
-This sets:
+sets:
 
 ```text
-BTC B ENTRY = 5
-BTC B DCA   = 5
-BTC C ENTRY = 5
-BTC C DCA   = 5
+A ENTRY = 5
+E ENTRY = 5
+B ENTRY = 5, DCA = 5
+C ENTRY = 5, DCA = 5
 ```
 
-Per-strategy sizing:
+Per strategy:
 
 ```text
+SIZE BTC A 5
 SIZE BTC B 5 5
 SIZE BTC C 5 5
-SIZE XRP B 5 5
-SIZE XRP C 5 5
-SIZE ETH B 5 5
-SIZE ETH C 5 5
+SIZE BTC E 5
 ```
 
-A strategy cannot be resized while it has an open bot-tracked position.
+Use the other token names in the same way.
 
-Other commands/buttons:
+Sizes cannot be changed while that strategy has an open bot-tracked position.
+
+## Telegram controls
 
 ```text
 START
@@ -263,44 +319,27 @@ WALLET
 EMERGENCY STOP
 ```
 
-## Coolify deployment
+## LIVE execution
 
-The repository already contains a `Dockerfile`.
-
-Use GitHub as the source and let Coolify build the Dockerfile.
-
-Application port:
+The real-order wrapper is the same protected pattern used in the earlier
+PAPER/LIVE bot:
 
 ```text
-8080
+fresh book check
+signed LIMIT order
+converted to FAK
+actual accepted fill amount persisted
 ```
 
-Health endpoint:
+If the response after submission is ambiguous, that market/action is marked
+fail-closed and the bot does not automatically submit a possible duplicate.
 
-```text
-/health
-```
+LIVE settlement PnL is bot-tracked from accepted fill amounts. Winning LIVE
+shares that remain to market settlement are **not auto-redeemed** by this bot.
 
-Create persistent storage and mount it at:
+## Hosting variables
 
-```text
-/var/data
-```
-
-The database is:
-
-```text
-/var/data/btc_xrp_eth_bc_paper_live_tp.db
-```
-
-Without a persistent `/var/data` volume, a rebuild/redeploy may lose the
-bot-tracked database state.
-
-## Environment variables
-
-The complete template is in `.env.example`.
-
-For the first deploy, the important block is:
+Minimum first-deploy block:
 
 ```text
 TELEGRAM_BOT_TOKEN=
@@ -313,107 +352,106 @@ POLYMARKET_PRIVATE_KEY=
 POLYMARKET_WALLET_ADDRESS=
 
 LIVE_MASTER_ENABLE=0
-ALLOW_DOUBLE_LIVE=0
+ALLOW_MULTI_LIVE_PER_TOKEN=0
 
-TAKE_PROFIT_USDC=0.30
+TAKE_PROFIT_USDC=0.60
 
 PAPER_START_BALANCE=500
 ENTRY_ORDER_SIZE=5
 DCA_ORDER_SIZE=5
 ```
 
-Never commit a real private key into GitHub or `.env.example`. Put it only in
-Coolify Environment Variables / Secrets.
+Never put the real `POLYMARKET_PRIVATE_KEY` in GitHub. Keep it only in the
+hosting Environment/Secret store.
 
-These are optional and should remain blank unless your Polymarket wallet setup
-specifically uses them:
+Optional:
 
 ```text
 POLYMARKET_RELAYER_API_KEY=
 POLYMARKET_RELAYER_API_KEY_ADDRESS=
 ```
 
-The full strategy defaults are also exposed in `.env.example`, but you do not
-need to copy every one of them into Coolify unless you want to override the
-defaults.
+Leave them blank unless your wallet setup specifically uses them.
 
-## Safe first LIVE launch
+The complete template is in `.env.example`.
 
-Deploy initially with:
+## Coolify
 
-```text
-LIVE_MASTER_ENABLE=0
-ALLOW_DOUBLE_LIVE=0
-```
+A `Dockerfile` is included.
 
-Then in Telegram press:
+Expose:
 
 ```text
-WALLET
+8080
 ```
 
-Verify:
+Persistent storage mount:
 
 ```text
-SDK: READY
-Wallet: the expected wallet
-Collateral: the expected balance
+/var/data
 ```
 
-Only after that change Coolify to:
+Health endpoint:
 
 ```text
-LIVE_MASTER_ENABLE=1
+/health
 ```
 
-and redeploy.
-
-For the first real-money test, keep only one strategy LIVE, for example:
+Database:
 
 ```text
-MODE BTC B LIVE
-CONFIRM LIVE BTC B
-START
+/var/data/safe67_multi7_abce_paper_live_tp60.db
 ```
 
-Keep the other five PAPER or OFF until you confirm the real entry/TP behavior.
+## Render
 
-## Dependencies
-
-The trading build uses:
+Build:
 
 ```text
-aiohttp>=3.10,<4
-websockets>=13,<16
-python-dotenv>=1.0,<2
-polymarket-client==0.7.0
+pip install -r requirements.txt
 ```
 
-## Verification
+Start:
+
+```text
+python main.py
+```
+
+Persistent disk should also be mounted at:
+
+```text
+/var/data
+```
+
+## Reports
+
+The hourly ZIP reporter is deliberately disabled in this LIVE trading build.
+Persistent SQLite still stores PAPER trades, LIVE orders, exits, signals,
+consensus decisions, trajectories and results.
+
+## Regression
 
 Run:
 
 ```text
-python test_bc_paper_live_tp.py
+python test_multi7_abce_live_tp60.py
 ```
 
 Expected:
 
 ```text
-BTC/XRP/ETH B/C PAPER/LIVE + NET TP regression: OK
-PAPER example PnL: $+0.31186
-LIVE example PnL estimate: $+0.31186
+MULTI7 A/B/C/E PAPER/LIVE + NET TP60 regression: OK
 ```
 
-The regression explicitly checks:
+The regression verifies:
 
-- BTC B accepts the old deep `.25` DCA after a valid rebound;
-- C rejects a target entry above `.70`;
-- C rejects DCA below `.30`;
-- C rejects rebound momentum above `+.15`;
-- C accepts a valid `.35 / +.10` DCA;
-- PAPER TP does not close below `+$0.30 NET` and does close above it;
-- the protected LIVE FAK buy path works with a fake SDK client;
-- LIVE TP sends a SELL FAK and flattens the bot-tracked position;
-- a fully TP-closed strategy cannot buy that market again;
-- same-token double-LIVE protection defaults to OFF.
+- 7 tokens × A/B/C/E = 28 strategies;
+- uploaded A/B/C/E entry and DCA settings;
+- B can still take the old deep rebound DCA;
+- C rejects DCA below 0.30 and rebound momentum above +0.15;
+- E still requires two other-token A/BASE confirmations;
+- `TAKE_PROFIT_USDC` defaults to 0.60 and can be changed/disabled via ENV;
+- PAPER TP does not close below +$0.60 NET and closes above it;
+- fake-SDK LIVE ENTRY uses the FAK wrapper;
+- fake-SDK LIVE TP sends a SELL FAK and fully closes;
+- multiple LIVE strategies on the same token are blocked by default.
