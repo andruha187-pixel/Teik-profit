@@ -33,17 +33,18 @@ load_dotenv()
 #   Bybit USDT linear (publicTrade + orderbook50 + allLiquidation)
 #   Coinbase spot where configured (market_trades + level2)
 #
-# Four PAPER strategies per token:
+# Five PAPER strategies per token:
 #   BASE        = exact SAFE67-style first V2 gate, ENTRY only
 #   EXT_CONFIRM = BASE + external same-direction confirmation
 #   EXT_VETO    = BASE unless external flow strongly opposes it
-#   PRE_JUMP    = earlier entry below SAFE67 when cross-exchange microstructure is strong
+#   PRE_JUMP    = main early-entry hypothesis, ext score >= 0.40
+#   PRE_JUMP35  = control early-entry hypothesis, ext score >= 0.35
 #
 # The lab also records external features every 500 ms and snapshots the
 # 1/3/5/10/20 seconds BEFORE detected Polymarket jumps.
 # ============================================================
 
-VERSION = "1.0-multi7-prejump-lab"
+VERSION = "1.1-multi7-prejump-dual"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -100,14 +101,15 @@ EXT_VETO_MIN_OPPOSING_VENUES = int(os.getenv("EXT_VETO_MIN_OPPOSING_VENUES", "2"
 
 PREJUMP_PRICE_MIN = float(os.getenv("PREJUMP_PRICE_MIN", "0.52"))
 PREJUMP_PRICE_MAX = float(os.getenv("PREJUMP_PRICE_MAX", "0.66"))
-PREJUMP_SCORE = float(os.getenv("PREJUMP_SCORE", "0.55"))
+PREJUMP_SCORE = float(os.getenv("PREJUMP_SCORE", "0.40"))
+PREJUMP_CONTROL_SCORE = float(os.getenv("PREJUMP_CONTROL_SCORE", "0.35"))
 PREJUMP_MIN_VENUES = int(os.getenv("PREJUMP_MIN_VENUES", "2"))
-PREJUMP_MIN_ELAPSED = float(os.getenv("PREJUMP_MIN_ELAPSED", "5"))
+PREJUMP_MIN_ELAPSED = float(os.getenv("PREJUMP_MIN_ELAPSED", "1"))
 PREJUMP_MAX_ELAPSED = float(os.getenv("PREJUMP_MAX_ELAPSED", "160"))
 PREJUMP_PM_MOM_MIN = float(os.getenv("PREJUMP_PM_MOM_MIN", "-0.01"))
 PREJUMP_PM_MOM_MAX = float(os.getenv("PREJUMP_PM_MOM_MAX", "0.05"))
 PREJUMP_REQUIRE_BINANCE_BYBIT = os.getenv(
-    "PREJUMP_REQUIRE_BINANCE_BYBIT", "1"
+    "PREJUMP_REQUIRE_BINANCE_BYBIT", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
 
 # Jump detector used for retrospective lead/lag study.
@@ -187,8 +189,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("prejump-lab")
 
-# Four strategies, all ENTRY-only by design. This isolates signal quality.
-STRATEGY_CODES = ("BASE", "EXT_CONFIRM", "EXT_VETO", "PRE_JUMP")
+# Five strategies, all ENTRY-only by design. This isolates signal quality.
+# PRE_JUMP and PRE_JUMP35 run in parallel on the same live feed.
+STRATEGY_CODES = ("BASE", "EXT_CONFIRM", "EXT_VETO", "PRE_JUMP", "PRE_JUMP35")
 STRATEGIES = [
     {"symbol": symbol, "code": code, "name": f"{symbol}_{code}"}
     for symbol in SYMBOLS
@@ -1835,19 +1838,19 @@ def pm_fast_momentum(condition_id, asset, seconds=1.0):
 
 
 async def evaluate_prejump(market, elapsed):
-    strategy = next(x for x in STRATEGIES_BY_SYMBOL[market_symbol(market)] if x["code"] == "PRE_JUMP")
-    st = get_strategy_state(market["condition_id"], strategy)
-    if st["closed"] or st["started"] or st["gate_decided"]:
-        return
+    """Evaluate the main 0.40 PRE_JUMP and the 0.35 control in parallel."""
     if not (PREJUMP_MIN_ELAPSED <= elapsed <= PREJUMP_MAX_ELAPSED):
         return
 
-    feature = latest_feature(market_symbol(market))
+    symbol = market_symbol(market)
+    feature = latest_feature(symbol)
     if not feature or si(feature.get("fresh_venues")) < PREJUMP_MIN_VENUES:
         return
+
     ext_score = sf(feature.get("ext_score"))
-    if abs(ext_score) < PREJUMP_SCORE:
+    if abs(ext_score) < min(PREJUMP_SCORE, PREJUMP_CONTROL_SCORE):
         return
+
     outcome = "Up" if ext_score > 0 else "Down"
     asset = market["up_asset"] if outcome == "Up" else market["down_asset"]
     directional = directional_external(feature, outcome)
@@ -1859,22 +1862,41 @@ async def evaluate_prejump(market, elapsed):
     ask = best_ask(asset)
     if ask is None or not (PREJUMP_PRICE_MIN <= ask <= PREJUMP_PRICE_MAX):
         return
+
     mom = pm_fast_momentum(market["condition_id"], asset, 1.0)
     if mom is None or not (PREJUMP_PM_MOM_MIN <= mom <= PREJUMP_PM_MOM_MAX):
         return
 
-    st["gate_decided"] = True
-    st["gate_passed"] = True
-    st["gate_asset"] = asset
-    reason = "PREJUMP_EXTERNAL_OK"
-    store_gate(market, strategy, asset, outcome, ask, ask - mom, mom, elapsed, True, reason, feature)
-    store_signal(market, strategy, asset, outcome, ask, mom, elapsed, reason, feature)
-    log.info(
-        "PREJUMP %-4s %s %.3f pmMom=%+.3f | ext=%+.3f votes=%d | venues=%s",
-        market_symbol(market), outcome, ask, mom, directional["score"],
-        directional["same_votes"], ",".join(feature.get("fresh_names") or []),
+    # The same market snapshot is offered to both hypotheses.  Because each
+    # variant has its own state/cash ledger, a >=0.40 signal can legitimately
+    # create one PAPER entry in PRE_JUMP and one in PRE_JUMP35 for A/B testing.
+    variants = (
+        ("PRE_JUMP", PREJUMP_SCORE),
+        ("PRE_JUMP35", PREJUMP_CONTROL_SCORE),
     )
-    await execute_paper_entry(market, strategy, asset, outcome, feature)
+    early = elapsed < 5.0
+    for code, score_threshold in variants:
+        if directional["score"] + 1e-12 < score_threshold:
+            continue
+
+        strategy = next(x for x in STRATEGIES_BY_SYMBOL[symbol] if x["code"] == code)
+        st = get_strategy_state(market["condition_id"], strategy)
+        if st["closed"] or st["started"] or st["gate_decided"]:
+            continue
+
+        st["gate_decided"] = True
+        st["gate_passed"] = True
+        st["gate_asset"] = asset
+        reason = "PREJUMP_EXTERNAL_OK_EARLY" if early else "PREJUMP_EXTERNAL_OK"
+        store_gate(market, strategy, asset, outcome, ask, ask - mom, mom, elapsed, True, reason, feature)
+        store_signal(market, strategy, asset, outcome, ask, mom, elapsed, reason, feature)
+        log.info(
+            "%s %-4s %-10s %s %.3f pmMom=%+.3f | ext=%+.3f threshold=%.2f votes=%d | venues=%s | elapsed=%.2fs",
+            "PREJUMP EARLY" if early else "PREJUMP",
+            symbol, code, outcome, ask, mom, directional["score"], score_threshold,
+            directional["same_votes"], ",".join(feature.get("fresh_names") or []), elapsed,
+        )
+        await execute_paper_entry(market, strategy, asset, outcome, feature)
 
 # ============================================================
 # FAST FEATURE SAMPLING / JUMP DETECTOR / HORIZON LABELS
@@ -2429,7 +2451,8 @@ def make_report(start_ts, end_ts):
         "BASE = current SAFE67-style first V2 gate, ENTRY only",
         f"EXT_CONFIRM = BASE + ext score >= {EXT_CONFIRM_SCORE:.2f}, >= {EXT_CONFIRM_MIN_VENUES} same-side venue votes",
         f"EXT_VETO = BASE unless ext score <= {EXT_VETO_SCORE:.2f} with >= {EXT_VETO_MIN_OPPOSING_VENUES} opposing votes",
-        f"PRE_JUMP = price {PREJUMP_PRICE_MIN:.2f}..{PREJUMP_PRICE_MAX:.2f}, ext |score| >= {PREJUMP_SCORE:.2f}, >= {PREJUMP_MIN_VENUES} venue votes",
+        f"PRE_JUMP = price {PREJUMP_PRICE_MIN:.2f}..{PREJUMP_PRICE_MAX:.2f}, directional score >= {PREJUMP_SCORE:.2f}, >= {PREJUMP_MIN_VENUES} venue votes, from {PREJUMP_MIN_ELAPSED:g}s",
+        f"PRE_JUMP35 = control, same rules but directional score >= {PREJUMP_CONTROL_SCORE:.2f}",
         "",
         f"Detected Polymarket jumps: {len(jumps)}",
         f"Signals: {len(signals)} | PAPER entries: {len(trades)} | TP exits: {len(exits)}",
@@ -2663,7 +2686,8 @@ async def send_lab_info():
         f"EXT_VETO: blocks BASE when external directional score <= {EXT_VETO_SCORE:.2f} "
         f"with >= {EXT_VETO_MIN_OPPOSING_VENUES} opposing votes.\n"
         f"PRE_JUMP: PM ask {PREJUMP_PRICE_MIN:.2f}–{PREJUMP_PRICE_MAX:.2f}, "
-        f"external score >= {PREJUMP_SCORE:.2f}, >= {PREJUMP_MIN_VENUES} venues.\n\n"
+        f"directional score >= {PREJUMP_SCORE:.2f}, >= {PREJUMP_MIN_VENUES} venues, from {PREJUMP_MIN_ELAPSED:g}s.\n"
+        f"PRE_JUMP35 control: same rules, score >= {PREJUMP_CONTROL_SCORE:.2f}.\n\n"
         f"TP simulation: +${TAKE_PROFIT_USDC:.2f} NET.\n"
         f"Jump label: +{JUMP_MOVE:.2f} in {JUMP_WINDOW_SEC:g}s.\n"
         "Hourly ZIP contains 500ms features plus 1/3/5/10/20s pre-jump contexts."
