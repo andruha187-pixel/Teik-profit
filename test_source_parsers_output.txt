@@ -1,0 +1,4 @@
+External source message parser regression: OK
+Binance aggTrade maker/taker sign: OK
+Bybit trade + liquidation direction: OK
+Coinbase maker-side inversion + L2: OK
