@@ -3,7 +3,3 @@ Strong external composite example: +0.594
 BASE / EXT_CONFIRM / EXT_VETO / PRE_JUMP paths: OK
 Jump pre-context 1/3/5/10/20s: OK
 PAPER NET TP + horizon labels: OK
-External source message parser regression: OK
-Binance aggTrade maker/taker sign: OK
-Bybit trade + liquidation direction: OK
-Coinbase maker-side inversion + L2: OK
