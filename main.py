@@ -33,9 +33,11 @@ load_dotenv()
 #   Bybit USDT linear (publicTrade + orderbook50 + allLiquidation)
 #   Coinbase spot where configured (market_trades + level2)
 #
-# Two PAPER strategies per token:
-#   PRE_JUMP    = main early-entry hypothesis, directional score >= 0.40
-#   PRE_JUMP42  = stricter parallel hypothesis, directional score >= 0.42
+# Four PAPER strategies per token:
+#   PRE_JUMP       = score >= 0.40, elapsed 1..160s (continuity control)
+#   PRE_JUMP42     = score >= 0.42, elapsed 1..160s (continuity control)
+#   PRE_JUMP10     = score >= 0.40, elapsed 10..120s (clean timing test)
+#   PRE_JUMP42_10  = score >= 0.42, elapsed 10..120s (clean timing test)
 #
 # Legacy BASE / EXT_CONFIRM / EXT_VETO / PRE_JUMP35 are disabled to reduce
 # strategy-loop and TP-monitoring load. External feature/jump collection remains on.
@@ -44,7 +46,7 @@ load_dotenv()
 # 1/3/5/10/20 seconds BEFORE detected Polymarket jumps.
 # ============================================================
 
-VERSION = "1.2-multi7-prejump-040-042"
+VERSION = "1.3-multi7-prejump-4way-timing"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -106,6 +108,9 @@ PREJUMP_HIGH_SCORE = float(os.getenv("PREJUMP_HIGH_SCORE", "0.42"))
 PREJUMP_MIN_VENUES = int(os.getenv("PREJUMP_MIN_VENUES", "2"))
 PREJUMP_MIN_ELAPSED = float(os.getenv("PREJUMP_MIN_ELAPSED", "1"))
 PREJUMP_MAX_ELAPSED = float(os.getenv("PREJUMP_MAX_ELAPSED", "160"))
+# Parallel timing-window experiment. These do not change the historical 1..160s controls.
+PREJUMP_TEST_MIN_ELAPSED = float(os.getenv("PREJUMP_TEST_MIN_ELAPSED", "10"))
+PREJUMP_TEST_MAX_ELAPSED = float(os.getenv("PREJUMP_TEST_MAX_ELAPSED", "120"))
 PREJUMP_PM_MOM_MIN = float(os.getenv("PREJUMP_PM_MOM_MIN", "-0.01"))
 PREJUMP_PM_MOM_MAX = float(os.getenv("PREJUMP_PM_MOM_MAX", "0.05"))
 PREJUMP_REQUIRE_BINANCE_BYBIT = os.getenv(
@@ -191,7 +196,7 @@ log = logging.getLogger("prejump-lab")
 
 # Only two active PAPER strategies. PRE_JUMP keeps its old variant name so the
 # existing 0.40 cash/statistics in SQLite continue across this deployment.
-STRATEGY_CODES = ("PRE_JUMP", "PRE_JUMP42")
+STRATEGY_CODES = ("PRE_JUMP", "PRE_JUMP42", "PRE_JUMP10", "PRE_JUMP42_10")
 STRATEGIES = [
     {"symbol": symbol, "code": code, "name": f"{symbol}_{code}"}
     for symbol in SYMBOLS
@@ -1838,8 +1843,15 @@ def pm_fast_momentum(condition_id, asset, seconds=1.0):
 
 
 async def evaluate_prejump(market, elapsed):
-    """Evaluate PRE_JUMP 0.40 and PRE_JUMP42 0.42 independently."""
-    if not (PREJUMP_MIN_ELAPSED <= elapsed <= PREJUMP_MAX_ELAPSED):
+    """Evaluate four independent PRE_JUMP PAPER branches.
+
+    Controls keep the existing 1..160s behavior so their SQLite history remains
+    comparable. New timing branches use 10..120s to test whether removing the
+    noisy first seconds and weak late tail improves expectancy.
+    """
+    global_min = min(PREJUMP_MIN_ELAPSED, PREJUMP_TEST_MIN_ELAPSED)
+    global_max = max(PREJUMP_MAX_ELAPSED, PREJUMP_TEST_MAX_ELAPSED)
+    if not (global_min <= elapsed <= global_max):
         return
 
     symbol = market_symbol(market)
@@ -1867,14 +1879,18 @@ async def evaluate_prejump(market, elapsed):
     if mom is None or not (PREJUMP_PM_MOM_MIN <= mom <= PREJUMP_PM_MOM_MAX):
         return
 
-    # Independent state per threshold matters: PRE_JUMP42 can ignore an earlier
-    # 0.40 signal and later enter another direction if a >=0.42 signal appears.
+    # Each branch has independent state. A stricter/later branch can ignore an
+    # earlier weaker signal and still enter later, even in the opposite direction.
     variants = (
-        ("PRE_JUMP", PREJUMP_SCORE),
-        ("PRE_JUMP42", PREJUMP_HIGH_SCORE),
+        ("PRE_JUMP",      PREJUMP_SCORE,      PREJUMP_MIN_ELAPSED,      PREJUMP_MAX_ELAPSED),
+        ("PRE_JUMP42",    PREJUMP_HIGH_SCORE, PREJUMP_MIN_ELAPSED,      PREJUMP_MAX_ELAPSED),
+        ("PRE_JUMP10",    PREJUMP_SCORE,      PREJUMP_TEST_MIN_ELAPSED, PREJUMP_TEST_MAX_ELAPSED),
+        ("PRE_JUMP42_10", PREJUMP_HIGH_SCORE, PREJUMP_TEST_MIN_ELAPSED, PREJUMP_TEST_MAX_ELAPSED),
     )
-    early = elapsed < 5.0
-    for code, score_threshold in variants:
+
+    for code, score_threshold, min_elapsed, max_elapsed in variants:
+        if not (min_elapsed <= elapsed <= max_elapsed):
+            continue
         if directional["score"] + 1e-12 < score_threshold:
             continue
 
@@ -1886,14 +1902,20 @@ async def evaluate_prejump(market, elapsed):
         st["gate_decided"] = True
         st["gate_passed"] = True
         st["gate_asset"] = asset
-        reason = "PREJUMP_EXTERNAL_OK_EARLY" if early else "PREJUMP_EXTERNAL_OK"
+        if code in {"PRE_JUMP10", "PRE_JUMP42_10"}:
+            reason = "PREJUMP_EXTERNAL_OK_10_120"
+        elif elapsed < 5.0:
+            reason = "PREJUMP_EXTERNAL_OK_EARLY"
+        else:
+            reason = "PREJUMP_EXTERNAL_OK"
+
         store_gate(market, strategy, asset, outcome, ask, ask - mom, mom, elapsed, True, reason, feature)
         store_signal(market, strategy, asset, outcome, ask, mom, elapsed, reason, feature)
         log.info(
-            "%s %-4s %-10s %s %.3f pmMom=%+.3f | ext=%+.3f threshold=%.2f votes=%d | venues=%s | elapsed=%.2fs",
-            "PREJUMP EARLY" if early else "PREJUMP",
+            "PREJUMP %-4s %-13s %s %.3f pmMom=%+.3f | ext=%+.3f threshold=%.2f votes=%d | window=%.0f..%.0fs | venues=%s | elapsed=%.2fs",
             symbol, code, outcome, ask, mom, directional["score"], score_threshold,
-            directional["same_votes"], ",".join(feature.get("fresh_names") or []), elapsed,
+            directional["same_votes"], min_elapsed, max_elapsed,
+            ",".join(feature.get("fresh_names") or []), elapsed,
         )
         await execute_paper_entry(market, strategy, asset, outcome, feature)
 
@@ -2448,8 +2470,11 @@ def make_report(start_ts, end_ts):
         f"PAPER TP: +${TAKE_PROFIT_USDC:.2f} NET",
         "",
         "ACTIVE PAPER STRATEGIES",
-        f"PRE_JUMP = price {PREJUMP_PRICE_MIN:.2f}..{PREJUMP_PRICE_MAX:.2f}, directional score >= {PREJUMP_SCORE:.2f}, >= {PREJUMP_MIN_VENUES} venue votes, from {PREJUMP_MIN_ELAPSED:g}s",
-        f"PRE_JUMP42 = same rules, directional score >= {PREJUMP_HIGH_SCORE:.2f}",
+        f"PRE_JUMP = score >= {PREJUMP_SCORE:.2f}, elapsed {PREJUMP_MIN_ELAPSED:g}..{PREJUMP_MAX_ELAPSED:g}s",
+        f"PRE_JUMP42 = score >= {PREJUMP_HIGH_SCORE:.2f}, elapsed {PREJUMP_MIN_ELAPSED:g}..{PREJUMP_MAX_ELAPSED:g}s",
+        f"PRE_JUMP10 = score >= {PREJUMP_SCORE:.2f}, elapsed {PREJUMP_TEST_MIN_ELAPSED:g}..{PREJUMP_TEST_MAX_ELAPSED:g}s",
+        f"PRE_JUMP42_10 = score >= {PREJUMP_HIGH_SCORE:.2f}, elapsed {PREJUMP_TEST_MIN_ELAPSED:g}..{PREJUMP_TEST_MAX_ELAPSED:g}s",
+        f"All: PM ask {PREJUMP_PRICE_MIN:.2f}..{PREJUMP_PRICE_MAX:.2f}, >= {PREJUMP_MIN_VENUES} venue votes",
         "Legacy BASE / EXT_CONFIRM / EXT_VETO / PRE_JUMP35 disabled",
         "",
         f"Detected Polymarket jumps: {len(jumps)}",
@@ -2460,7 +2485,7 @@ def make_report(start_ts, end_ts):
         lines.append(f"[{symbol}]")
         for s in [x for x in summaries if x["symbol"] == symbol]:
             lines.append(
-                f"{s['code']:<11} PnL {s['pnl']:+.2f} | W/L {s['wins']}/{s['losses']} "
+                f"{s['code']:<13} PnL {s['pnl']:+.2f} | W/L {s['wins']}/{s['losses']} "
                 f"({s['winrate_pct']:.1f}%) | TP {s['tp_exits']} | cash {s['cash_now']:.2f}"
             )
         lines.append("")
@@ -2677,11 +2702,13 @@ async def send_trades():
 
 async def send_lab_info():
     await tg_send(
-        "🧪 PRE-JUMP LAB 0.40 vs 0.42\n"
+        "🧪 PRE-JUMP LAB — 4-way forward test\n"
         "PAPER ONLY — no real orders.\n\n"
-        f"PRE_JUMP: PM ask {PREJUMP_PRICE_MIN:.2f}–{PREJUMP_PRICE_MAX:.2f}, "
-        f"directional score >= {PREJUMP_SCORE:.2f}, >= {PREJUMP_MIN_VENUES} venues, from {PREJUMP_MIN_ELAPSED:g}s.\n"
-        f"PRE_JUMP42: same rules, score >= {PREJUMP_HIGH_SCORE:.2f}.\n"
+        f"PRE_JUMP: score >= {PREJUMP_SCORE:.2f}, {PREJUMP_MIN_ELAPSED:g}–{PREJUMP_MAX_ELAPSED:g}s.\n"
+        f"PRE_JUMP42: score >= {PREJUMP_HIGH_SCORE:.2f}, {PREJUMP_MIN_ELAPSED:g}–{PREJUMP_MAX_ELAPSED:g}s.\n"
+        f"PRE_JUMP10: score >= {PREJUMP_SCORE:.2f}, {PREJUMP_TEST_MIN_ELAPSED:g}–{PREJUMP_TEST_MAX_ELAPSED:g}s.\n"
+        f"PRE_JUMP42_10: score >= {PREJUMP_HIGH_SCORE:.2f}, {PREJUMP_TEST_MIN_ELAPSED:g}–{PREJUMP_TEST_MAX_ELAPSED:g}s.\n"
+        f"All use PM ask {PREJUMP_PRICE_MIN:.2f}–{PREJUMP_PRICE_MAX:.2f} and >= {PREJUMP_MIN_VENUES} same-side venues.\n"
         "BASE / EXT_CONFIRM / EXT_VETO / PRE_JUMP35 are disabled.\n\n"
         f"TP simulation: +${TAKE_PROFIT_USDC:.2f} NET.\n"
         f"Jump label: +{JUMP_MOVE:.2f} in {JUMP_WINDOW_SEC:g}s.\n"
