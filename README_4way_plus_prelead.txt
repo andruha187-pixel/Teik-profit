@@ -1,67 +1,50 @@
-MULTI7 PRE-JUMP LAB v1.5 — 4 controls + PRE_LEAD + PRE_LEAD_SAFE
-=================================================================
+MULTI7 PRE-JUMP LAB v1.6 — 4 controls + PRE_LEAD + PRE_LEAD_SAFE + PRE_LEAD_CONFIRM
+================================================================================
 
-PAPER ONLY. No wallet/private key and no real orders.
+PAPER ONLY. No private key and no LIVE order placement.
 
-The existing five branches are preserved:
-  PRE_JUMP      score >= 0.40, elapsed 1..160s
-  PRE_JUMP42    score >= 0.42, elapsed 1..160s
-  PRE_JUMP10    score >= 0.40, elapsed 10..120s
-  PRE_JUMP42_10 score >= 0.42, elapsed 10..120s
-  PRE_LEAD      original early branch, unchanged
+Existing branches are kept unchanged:
+  PRE_JUMP       score >= 0.40, elapsed 1..160s
+  PRE_JUMP42     score >= 0.42, elapsed 1..160s
+  PRE_JUMP10     score >= 0.40, elapsed 10..120s
+  PRE_JUMP42_10  score >= 0.42, elapsed 10..120s
+  PRE_LEAD       original early projection branch
+  PRE_LEAD_SAFE  first PRE_LEAD candidate + projected >= 0.55 + ask <= 0.56
 
-New sixth branch:
-  PRE_LEAD_SAFE
+NEW: PRE_LEAD_CONFIRM
+---------------------
+The first candidate that would qualify for PRE_LEAD_SAFE is binding for this
+branch. It does NOT wait for a nicer later candidate in the same 5-minute market.
 
-PRE_LEAD_SAFE default signal
-----------------------------
-It must first satisfy the exact same PRE_LEAD candidate rules:
-- independent loop: 100ms
-- current directional score >= 0.34 but still < 0.40
-- same direction already present in the ~300ms lookback sample
-- score increased by at least +0.015
-- linear 300ms projection reaches >= 0.40
-- >= 2 same-side venue votes
-- PM ask 0.52..0.66
-- PM 1s momentum -0.01..+0.05
-- elapsed 1..160s
+Default sequence:
+  1) first PRE_LEAD_SAFE candidate appears
+  2) wait PRELEAD_CONFIRM_MS=125ms
+  3) original direction must still be supported by >=2 fresh venues/votes
+  4) directional external score may fade by at most 0.01 from the candidate
+  5) confirm ask must still be <=0.56 and PM momentum must remain in the normal band
+  6) only then the branch records a confirmed signal / simulated submission
+  7) after submission it STILL waits the full PRELEAD_SIM_DELAY_MS=250ms
+  8) PAPER fill is capped at confirm ask +0.05 and hard PRELEAD_PRICE_MAX
 
-Then PRE_LEAD_SAFE adds ONLY the two frozen forward-test filters:
-- projected_score >= 0.55
-- signal ask <= 0.56
+So PRE_LEAD_CONFIRM pays both costs honestly: ~125ms confirmation + ~250ms
+Polymarket taker-delay simulation. This is deliberate.
 
-These values were selected from the first 8h PRE_LEAD sample and should now be
-left unchanged while collecting the next forward sample. The earlier 18/18 is
-in-sample and is NOT a guarantee of future performance.
+Frozen forward-test defaults:
+  PRELEAD_CONFIRM_MS=125
+  PRELEAD_CONFIRM_MAX_SCORE_FADE=0.01
+  PRELEAD_CONFIRM_PRICE_MAX=0.56
+  PRELEAD_CONFIRM_MIN_VENUES=2
 
-Execution model
----------------
-Both PRE_LEAD branches deliberately wait PRELEAD_SIM_DELAY_MS=250ms before
-PAPER execution, then attempt full-size execution from the then-current book at:
+Do not tune these during the first forward sample.
 
-  max buy price = min(0.66, signal_ask + 0.05)
+Hourly ZIP adds:
+  prelead_confirm_checks.csv      every first SAFE candidate and PASS/REJECT
+  prelead_confirm_execution.csv   delayed execution after confirmed signals
+  prelead_confirm_alignment.csv   lead/lag vs ordinary PRE_JUMP and PM jumps
 
-So PRE_LEAD_SAFE does NOT get an instant virtual fill. Example: signal ask 0.56
-allows delayed execution only up to 0.61. If the market has moved beyond that,
-the signal is recorded as a miss.
+The previous PRE_LEAD and PRE_LEAD_SAFE CSVs remain separate and unchanged.
 
-Hourly ZIP files
-----------------
-Original PRE_LEAD stays in:
-  prelead_execution.csv
-  prelead_alignment.csv
-
-PRE_LEAD_SAFE has separate files:
-  prelead_safe_execution.csv
-  prelead_safe_alignment.csv
-
-strategy_summary.csv / signal_events.csv / paper_trades.csv / market_results.csv
-also contain PRE_LEAD_SAFE as a normal independent strategy variant.
-
-Forward-test env additions
---------------------------
-PRELEAD_SAFE_PROJECTED_SCORE=0.55
-PRELEAD_SAFE_PRICE_MAX=0.56
-
-Keep the existing PRE_LEAD and four PRE_JUMP settings unchanged for a clean
-forward comparison.
+Deployment
+----------
+Dockerfile and requirements.txt are in the ZIP root. Put all files directly in
+the GitHub repository root used by Coolify, then redeploy.

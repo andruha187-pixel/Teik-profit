@@ -11,10 +11,13 @@ lab = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(lab)
 
 assert lab.STRATEGY_CODES == (
-    'PRE_JUMP','PRE_JUMP42','PRE_JUMP10','PRE_JUMP42_10','PRE_LEAD','PRE_LEAD_SAFE'
+    'PRE_JUMP','PRE_JUMP42','PRE_JUMP10','PRE_JUMP42_10','PRE_LEAD','PRE_LEAD_SAFE','PRE_LEAD_CONFIRM'
 )
 assert abs(lab.PRELEAD_SAFE_PROJECTED_SCORE - 0.55) < 1e-12
 assert abs(lab.PRELEAD_SAFE_PRICE_MAX - 0.56) < 1e-12
+assert lab.PRELEAD_CONFIRM_MS == 125
+assert abs(lab.PRELEAD_CONFIRM_MAX_SCORE_FADE - 0.01) < 1e-12
+assert abs(lab.PRELEAD_CONFIRM_PRICE_MAX - 0.56) < 1e-12
 
 # Original PRE_LEAD math remains unchanged: 0.36 -> 0.38 over 300ms projects to 0.40.
 sym='BTC'; now=1_000_000
@@ -39,6 +42,16 @@ assert ok_safe, (ok_safe, why)
 ok_safe, why = lab.prelead_safe_filter(strong, 0.57)
 assert not ok_safe and why == 'safe_price_above_max', (ok_safe, why)
 
+# CONFIRM pure gate: persistence allows <=0.01 fade, but rejects a larger fade.
+ok_c, why_c, floor = lab.prelead_confirm_filter(0.38, 0.371, 0.56, 2, 3)
+assert ok_c and why_c == 'ok' and abs(floor-0.37) < 1e-12, (ok_c,why_c,floor)
+ok_c, why_c, floor = lab.prelead_confirm_filter(0.38, 0.369, 0.56, 2, 3)
+assert not ok_c and why_c == 'confirm_score_faded', (ok_c,why_c,floor)
+ok_c, why_c, _ = lab.prelead_confirm_filter(0.38, -0.20, 0.56, 2, 3)
+assert not ok_c and why_c == 'confirm_direction_flipped'
+ok_c, why_c, _ = lab.prelead_confirm_filter(0.38, 0.39, 0.57, 2, 3)
+assert not ok_c and why_c == 'confirm_price_outside_band'
+
 # Down direction remains symmetric in the shared PRE_LEAD logic.
 lab.lead_feature_history[sym].clear()
 lab.lead_feature_history[sym].append({'sample_ms': now-300, 'ext_score': -0.36})
@@ -58,12 +71,14 @@ assert path.exists()
 with zipfile.ZipFile(path) as z:
     names=set(z.namelist())
     for name in ('prelead_execution.csv','prelead_alignment.csv',
-                 'prelead_safe_execution.csv','prelead_safe_alignment.csv'):
+                 'prelead_safe_execution.csv','prelead_safe_alignment.csv',
+                 'prelead_confirm_checks.csv','prelead_confirm_execution.csv','prelead_confirm_alignment.csv'):
         assert name in names, name
 
 # Both lead branches have separate PAPER accounts after init.
 assert lab.paper_cash('BTC_PRE_LEAD') == lab.PAPER_START_BALANCE
 assert lab.paper_cash('BTC_PRE_LEAD_SAFE') == lab.PAPER_START_BALANCE
+assert lab.paper_cash('BTC_PRE_LEAD_CONFIRM') == lab.PAPER_START_BALANCE
 
 # Delayed execution helper works independently for PRE_LEAD_SAFE too.
 lab.PRELEAD_SIM_DELAY_MS = 0
@@ -82,4 +97,37 @@ with lab.db() as c:
 assert tr is not None and ex is not None and ex['status']=='FILLED'
 assert abs(float(ex['cap_price']) - 0.61) < 1e-9, ex['cap_price']
 
-print('OK PRE_LEAD + PRE_LEAD_SAFE tests')
+print('OK PRE_LEAD + PRE_LEAD_SAFE + PRE_LEAD_CONFIRM tests')
+
+# Full CONFIRM pass path: confirmation is checked first; only then the 250ms model starts.
+lab.PRELEAD_CONFIRM_MS = 0
+lab.PRELEAD_SIM_DELAY_MS = 0
+market2={
+    'condition_id':'confirm-test-cid','symbol':'BTC','start_ts':lab.time.time()-10,'end_ts':lab.time.time()+290,
+    'up_asset':'UPC','down_asset':'DNC'
+}
+strategy2=next(x for x in lab.STRATEGIES_BY_SYMBOL['BTC'] if x['code']=='PRE_LEAD_CONFIRM')
+lab.markets[market2['condition_id']]=market2
+lab.books['UPC']={'asks':{0.55:10.0},'bids':{0.54:10.0},'received_ms':lab.now_ms(),'source':'test'}
+t0=lab.now_ms()
+lab.lead_pm_history[market2['condition_id']]['UPC'].clear()
+lab.lead_pm_history[market2['condition_id']]['UPC'].append((t0-1000,0.55))
+lab.lead_pm_history[market2['condition_id']]['UPC'].append((t0,0.55))
+curfeat={'sample_ms':t0,'ext_score':0.385,'up_votes':2,'down_votes':0,'fresh_venues':3,'fresh_names':['binance','bybit','coinbase']}
+lab.lead_feature_history['BTC'].append(curfeat)
+candidate_diag={'score_now':0.38,'score_prev':0.35,'score_delta':0.03,'projected_score':0.56,
+                'actual_lookback_ms':300,'target_score':0.40,'safe_projected_score_min':0.55,'safe_price_max':0.56}
+candidate_feat=dict(curfeat); candidate_feat['prelead']=candidate_diag
+asyncio.run(lab._confirm_prelead_candidate(market2,strategy2,'UPC','Up',0.55,0.0,candidate_feat,candidate_diag,t0))
+# Let the zero-delay execution task scheduled inside confirmation run to completion.
+async def _drain():
+    if lab.lead_exec_tasks:
+        await asyncio.gather(*list(lab.lead_exec_tasks))
+asyncio.run(_drain())
+with lab.db() as c:
+    cc=c.execute("SELECT * FROM prelead_confirm_events WHERE condition_id=? AND variant=?",('confirm-test-cid',strategy2['name'])).fetchone()
+    sig=c.execute("SELECT * FROM signal_events WHERE condition_id=? AND variant=?",('confirm-test-cid',strategy2['name'])).fetchone()
+    tr2=c.execute("SELECT * FROM paper_trades WHERE condition_id=? AND variant=?",('confirm-test-cid',strategy2['name'])).fetchone()
+assert cc is not None and cc['status']=='PASSED', dict(cc) if cc else None
+assert sig is not None and tr2 is not None
+print('OK PRE_LEAD_CONFIRM async pass path')

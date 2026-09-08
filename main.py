@@ -46,7 +46,7 @@ load_dotenv()
 # 1/3/5/10/20 seconds BEFORE detected Polymarket jumps.
 # ============================================================
 
-VERSION = "1.5-multi7-prejump-4way-plus-lead-safe"
+VERSION = "1.6-multi7-prejump-4way-plus-lead-confirm"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -144,6 +144,16 @@ PRELEAD_SIM_MAX_SLIPPAGE = max(0.0, float(os.getenv("PRELEAD_SIM_MAX_SLIPPAGE", 
 PRELEAD_SAFE_PROJECTED_SCORE = float(os.getenv("PRELEAD_SAFE_PROJECTED_SCORE", "0.55"))
 PRELEAD_SAFE_PRICE_MAX = float(os.getenv("PRELEAD_SAFE_PRICE_MAX", "0.56"))
 
+# Seventh PAPER branch: take the exact frozen PRE_LEAD_SAFE *first candidate*,
+# wait a very short confirmation window before simulated submission, and require
+# the same-direction external impulse to persist instead of immediately fading.
+# The 250ms Polymarket taker-hold simulation starts only after confirmation, so
+# this branch pays the real latency cost of waiting for confirmation.
+PRELEAD_CONFIRM_MS = max(0, int(os.getenv("PRELEAD_CONFIRM_MS", "125")))
+PRELEAD_CONFIRM_MAX_SCORE_FADE = max(0.0, float(os.getenv("PRELEAD_CONFIRM_MAX_SCORE_FADE", "0.01")))
+PRELEAD_CONFIRM_PRICE_MAX = float(os.getenv("PRELEAD_CONFIRM_PRICE_MAX", str(PRELEAD_SAFE_PRICE_MAX)))
+PRELEAD_CONFIRM_MIN_VENUES = int(os.getenv("PRELEAD_CONFIRM_MIN_VENUES", str(PRELEAD_MIN_VENUES)))
+
 # Keep the lead thresholds internally coherent even if env values are mistyped.
 PRELEAD_TARGET_SCORE = max(0.01, min(1.0, PRELEAD_TARGET_SCORE))
 PRELEAD_MIN_SCORE = max(0.0, min(PRELEAD_TARGET_SCORE - 1e-6, PRELEAD_MIN_SCORE))
@@ -151,6 +161,8 @@ PRELEAD_PRICE_MIN = max(0.01, min(0.99, PRELEAD_PRICE_MIN))
 PRELEAD_PRICE_MAX = max(PRELEAD_PRICE_MIN, min(0.99, PRELEAD_PRICE_MAX))
 PRELEAD_SAFE_PROJECTED_SCORE = max(PRELEAD_TARGET_SCORE, min(1.0, PRELEAD_SAFE_PROJECTED_SCORE))
 PRELEAD_SAFE_PRICE_MAX = max(PRELEAD_PRICE_MIN, min(PRELEAD_PRICE_MAX, PRELEAD_SAFE_PRICE_MAX))
+PRELEAD_CONFIRM_PRICE_MAX = max(PRELEAD_PRICE_MIN, min(PRELEAD_PRICE_MAX, PRELEAD_CONFIRM_PRICE_MAX))
+PRELEAD_CONFIRM_MIN_VENUES = max(1, PRELEAD_CONFIRM_MIN_VENUES)
 
 # Jump detector used for retrospective lead/lag study.
 JUMP_MOVE = float(os.getenv("JUMP_MOVE", "0.08"))
@@ -229,10 +241,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("prejump-lab")
 
-# Keep the four existing PAPER controls and the original PRE_LEAD unchanged.
-# PRE_LEAD_SAFE is a sixth, independent forward-test account with two frozen
-# extra gates (projected score and signal ask). Existing SQLite histories remain intact.
-STRATEGY_CODES = ("PRE_JUMP", "PRE_JUMP42", "PRE_JUMP10", "PRE_JUMP42_10", "PRE_LEAD", "PRE_LEAD_SAFE")
+# Keep the four existing PAPER controls, PRE_LEAD, and PRE_LEAD_SAFE unchanged.
+# PRE_LEAD_CONFIRM is a seventh independent account that waits 125ms (default)
+# after the first SAFE candidate and only proceeds if the same-side impulse persists.
+STRATEGY_CODES = ("PRE_JUMP", "PRE_JUMP42", "PRE_JUMP10", "PRE_JUMP42_10", "PRE_LEAD", "PRE_LEAD_SAFE", "PRE_LEAD_CONFIRM")
 STRATEGIES = [
     {"symbol": symbol, "code": code, "name": f"{symbol}_{code}"}
     for symbol in SYMBOLS
@@ -567,6 +579,29 @@ def init_db():
             note TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS prelead_confirm_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            candidate_ms INTEGER,
+            confirm_ms INTEGER,
+            condition_id TEXT,
+            symbol TEXT,
+            variant TEXT,
+            outcome TEXT,
+            asset TEXT,
+            candidate_ask REAL,
+            confirm_ask REAL,
+            candidate_score REAL,
+            confirm_score REAL,
+            score_change REAL,
+            intended_confirm_ms INTEGER,
+            actual_confirm_ms INTEGER,
+            same_votes INTEGER,
+            fresh_venues INTEGER,
+            status TEXT,
+            reason TEXT,
+            note TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS state (
             key TEXT PRIMARY KEY,
             value TEXT
@@ -581,6 +616,7 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_trial_entry ON trials(entry_ms);
         CREATE INDEX IF NOT EXISTS idx_health_ms ON source_health_log(sample_ms);
         CREATE INDEX IF NOT EXISTS idx_lead_exec_ms ON lead_exec_events(signal_ms);
+        CREATE INDEX IF NOT EXISTS idx_prelead_confirm_ms ON prelead_confirm_events(candidate_ms);
         """)
 
         defaults = {"trading_enabled": "1"}
@@ -2057,6 +2093,44 @@ def prelead_safe_filter(diag, ask):
     return True, "ok"
 
 
+def prelead_confirm_filter(candidate_score, confirm_score, confirm_ask, same_votes, fresh_venues):
+    """Pure persistence gate for PRE_LEAD_CONFIRM; deliberately simple/frozen."""
+    floor = max(PRELEAD_MIN_SCORE, sf(candidate_score) - PRELEAD_CONFIRM_MAX_SCORE_FADE)
+    if sf(confirm_score) <= 0:
+        return False, "confirm_direction_flipped", floor
+    if sf(confirm_score) + 1e-12 < floor:
+        return False, "confirm_score_faded", floor
+    if si(fresh_venues) < PRELEAD_CONFIRM_MIN_VENUES:
+        return False, "confirm_sources_stale", floor
+    if si(same_votes) < PRELEAD_CONFIRM_MIN_VENUES:
+        return False, "confirm_votes_faded", floor
+    if confirm_ask is None:
+        return False, "confirm_no_book", floor
+    if not (PRELEAD_PRICE_MIN <= sf(confirm_ask) <= PRELEAD_CONFIRM_PRICE_MAX):
+        return False, "confirm_price_outside_band", floor
+    return True, "ok", floor
+
+
+def _store_prelead_confirm(candidate_ms, confirm_ms, market, strategy, outcome, asset,
+                           candidate_ask, confirm_ask, candidate_score, confirm_score,
+                           same_votes, fresh_venues, status, reason, note=""):
+    with db() as conn:
+        conn.execute("""
+            INSERT INTO prelead_confirm_events(
+                candidate_ms,confirm_ms,condition_id,symbol,variant,outcome,asset,
+                candidate_ask,confirm_ask,candidate_score,confirm_score,score_change,
+                intended_confirm_ms,actual_confirm_ms,same_votes,fresh_venues,status,reason,note
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            candidate_ms, confirm_ms, market["condition_id"], market_symbol(market),
+            strategy["name"], outcome, asset, candidate_ask, confirm_ask,
+            candidate_score, confirm_score, sf(confirm_score) - sf(candidate_score),
+            PRELEAD_CONFIRM_MS, max(0, confirm_ms - candidate_ms), same_votes, fresh_venues,
+            status, reason, str(note)[:300],
+        ))
+        conn.commit()
+
+
 def prelead_pm_momentum(condition_id, asset, seconds=1.0):
     h = lead_pm_history[condition_id][asset]
     if len(h) < 2:
@@ -2116,6 +2190,185 @@ async def _execute_prelead_after_delay(market, strategy, asset, outcome, signal_
         cap, exec_ask, "FILLED" if ok else "MISSED_LIQ_OR_BLOCK",
         "delayed PAPER FAK-style full-size simulation",
     )
+
+
+async def _confirm_prelead_candidate(market, strategy, asset, outcome, candidate_ask,
+                                     candidate_mom, candidate_feature, candidate_diag,
+                                     candidate_ms):
+    """Wait briefly, require persistence, then start the normal 250ms delayed-fill model."""
+    if PRELEAD_CONFIRM_MS > 0:
+        await asyncio.sleep(PRELEAD_CONFIRM_MS / 1000.0)
+
+    confirm_ms = now_ms()
+    symbol = market_symbol(market)
+    st = get_strategy_state(market["condition_id"], strategy)
+    if st["closed"] or st["started"]:
+        _store_prelead_confirm(
+            candidate_ms, confirm_ms, market, strategy, outcome, asset,
+            candidate_ask, best_ask(asset), sf(candidate_diag.get("score_now")), 0.0,
+            0, 0, "REJECTED", "confirm_state_closed", "market already closed/started",
+        )
+        return
+
+    current = lead_feature_history[symbol][-1] if lead_feature_history[symbol] else None
+    if not current:
+        _store_prelead_confirm(
+            candidate_ms, confirm_ms, market, strategy, outcome, asset,
+            candidate_ask, best_ask(asset), sf(candidate_diag.get("score_now")), 0.0,
+            0, 0, "REJECTED", "confirm_feature_missing", "no current LEAD feature",
+        )
+        store_gate(market, strategy, asset, outcome, candidate_ask, candidate_ask-candidate_mom,
+                   candidate_mom, (confirm_ms/1000.0)-market["start_ts"], False,
+                   "PRELEAD_CONFIRM_FEATURE_MISSING", candidate_feature)
+        return
+
+    sign = 1.0 if outcome == "Up" else -1.0
+    candidate_score = sf(candidate_diag.get("score_now"))
+    confirm_score = sign * sf(current.get("ext_score"))
+    directional = directional_external(current, outcome)
+    confirm_ask = best_ask(asset)
+    fresh = si(current.get("fresh_venues"))
+    same_votes = si(directional.get("same_votes"))
+    ok, why, floor = prelead_confirm_filter(
+        candidate_score, confirm_score, confirm_ask, same_votes, fresh
+    )
+    if ok and PREJUMP_REQUIRE_BINANCE_BYBIT and not (directional["binance_same"] and directional["bybit_same"]):
+        ok, why = False, "confirm_binance_bybit_not_same"
+
+    confirm_mom = prelead_pm_momentum(market["condition_id"], asset, 1.0)
+    if ok and (confirm_mom is None or not (PRELEAD_PM_MOM_MIN <= confirm_mom <= PRELEAD_PM_MOM_MAX)):
+        ok, why = False, "confirm_pm_momentum_outside_band"
+
+    actual_confirm_ms = max(0, confirm_ms - candidate_ms)
+    confirm_diag = {
+        "candidate_ms": candidate_ms,
+        "confirm_ms": confirm_ms,
+        "intended_confirm_ms": PRELEAD_CONFIRM_MS,
+        "actual_confirm_ms": actual_confirm_ms,
+        "candidate_score": candidate_score,
+        "confirm_score": confirm_score,
+        "score_change": confirm_score - candidate_score,
+        "score_floor": floor,
+        "max_score_fade": PRELEAD_CONFIRM_MAX_SCORE_FADE,
+        "candidate_ask": candidate_ask,
+        "confirm_ask": confirm_ask,
+        "confirm_price_max": PRELEAD_CONFIRM_PRICE_MAX,
+        "same_votes": same_votes,
+        "fresh_venues": fresh,
+        "confirm_momentum": confirm_mom,
+        "passed": bool(ok),
+        "reason": why,
+    }
+    enriched = dict(current)
+    enriched["prelead"] = dict(candidate_diag)
+    enriched["prelead_confirm"] = confirm_diag
+
+    _store_prelead_confirm(
+        candidate_ms, confirm_ms, market, strategy, outcome, asset,
+        candidate_ask, confirm_ask, candidate_score, confirm_score, same_votes, fresh,
+        "PASSED" if ok else "REJECTED", why,
+        f"score floor {floor:.3f}; candidate ask {candidate_ask:.3f}",
+    )
+
+    elapsed_confirm = max(0.0, confirm_ms / 1000.0 - market["start_ts"])
+    if not ok:
+        st["gate_passed"] = False
+        store_gate(
+            market, strategy, asset, outcome, confirm_ask if confirm_ask is not None else candidate_ask,
+            candidate_ask, confirm_mom if confirm_mom is not None else candidate_mom,
+            elapsed_confirm, False, f"PRELEAD_CONFIRM_REJECT_{why.upper()}", enriched,
+        )
+        log.info(
+            "PRE_LEAD_CONFIRM REJECT %-4s %s | score %.3f->%.3f floor=%.3f | ask %.3f->%s | votes=%d fresh=%d | %s | waited=%dms",
+            symbol, outcome, candidate_score, confirm_score, floor, candidate_ask,
+            f"{confirm_ask:.3f}" if confirm_ask is not None else "n/a", same_votes, fresh, why, actual_confirm_ms,
+        )
+        return
+
+    st["gate_passed"] = True
+    st["gate_asset"] = asset
+    reason = "PRELEAD_CONFIRM_PERSIST_OK"
+    store_gate(market, strategy, asset, outcome, confirm_ask, candidate_ask, confirm_mom,
+               elapsed_confirm, True, reason, enriched)
+    store_signal(market, strategy, asset, outcome, confirm_ask, confirm_mom,
+                 elapsed_confirm, reason, enriched)
+    log.info(
+        "PRE_LEAD_CONFIRM PASS %-4s %s | score %.3f->%.3f floor=%.3f | ask %.3f->%.3f | votes=%d | confirm=%dms then delay=%dms cap=%.3f",
+        symbol, outcome, candidate_score, confirm_score, floor, candidate_ask, confirm_ask,
+        same_votes, actual_confirm_ms, PRELEAD_SIM_DELAY_MS,
+        min(PRELEAD_PRICE_MAX, confirm_ask + PRELEAD_SIM_MAX_SLIPPAGE),
+    )
+
+    task = asyncio.create_task(
+        _execute_prelead_after_delay(
+            market, strategy, asset, outcome, confirm_ask, enriched, confirm_ms
+        )
+    )
+    lead_exec_tasks.add(task)
+    task.add_done_callback(lead_exec_tasks.discard)
+
+
+async def evaluate_prelead_confirm(market, elapsed, feature):
+    """First PRE_LEAD_SAFE candidate, then a 125ms persistence check before submission."""
+    if not (PRELEAD_MIN_ELAPSED <= elapsed <= PRELEAD_MAX_ELAPSED):
+        return
+    symbol = market_symbol(market)
+    strategy = next(x for x in STRATEGIES_BY_SYMBOL[symbol] if x["code"] == "PRE_LEAD_CONFIRM")
+    st = get_strategy_state(market["condition_id"], strategy)
+    if st["closed"] or st["started"] or st["gate_decided"]:
+        return
+    if not feature or si(feature.get("fresh_venues")) < PRELEAD_MIN_VENUES:
+        return
+
+    ext_score = sf(feature.get("ext_score"))
+    if abs(ext_score) < PRELEAD_MIN_SCORE:
+        return
+    outcome = "Up" if ext_score > 0 else "Down"
+    asset = market["up_asset"] if outcome == "Up" else market["down_asset"]
+    directional = directional_external(feature, outcome)
+    if directional["same_votes"] < PRELEAD_MIN_VENUES:
+        return
+    if PREJUMP_REQUIRE_BINANCE_BYBIT and not (directional["binance_same"] and directional["bybit_same"]):
+        return
+
+    passed, diag = prelead_projection(symbol, feature, outcome)
+    if not passed:
+        return
+    ask = best_ask(asset)
+    if ask is None or not (PRELEAD_PRICE_MIN <= ask <= PRELEAD_PRICE_MAX):
+        return
+    safe_ok, safe_reason = prelead_safe_filter(diag, ask)
+    if not safe_ok:
+        return
+    mom = prelead_pm_momentum(market["condition_id"], asset, 1.0)
+    if mom is None or not (PRELEAD_PM_MOM_MIN <= mom <= PRELEAD_PM_MOM_MAX):
+        return
+
+    diag = dict(diag)
+    diag.update({
+        "safe_filter": True,
+        "safe_reason": safe_reason,
+        "safe_projected_score_min": PRELEAD_SAFE_PROJECTED_SCORE,
+        "safe_price_max": PRELEAD_SAFE_PRICE_MAX,
+        "confirm_wait_ms": PRELEAD_CONFIRM_MS,
+        "confirm_max_score_fade": PRELEAD_CONFIRM_MAX_SCORE_FADE,
+    })
+
+    # First SAFE candidate is binding: while confirmation runs, this market is
+    # closed to later PRE_LEAD_CONFIRM candidates, whether this one passes or fails.
+    st["gate_decided"] = True
+    st["gate_passed"] = False
+    st["gate_asset"] = asset
+    candidate_ms = now_ms()
+    enriched = dict(feature)
+    enriched["prelead"] = diag
+    task = asyncio.create_task(
+        _confirm_prelead_candidate(
+            market, strategy, asset, outcome, ask, mom, enriched, diag, candidate_ms
+        )
+    )
+    lead_exec_tasks.add(task)
+    task.add_done_callback(lead_exec_tasks.discard)
 
 
 async def evaluate_prelead_variant(market, elapsed, feature, code):
@@ -2218,10 +2471,11 @@ async def prelead_loop():
                         if ask is not None:
                             lead_pm_history[market["condition_id"]][asset].append((t_ms, ask))
                     if trading_enabled() and 0 <= elapsed <= TRADE_WINDOW_SECONDS:
-                        # Evaluate both from the exact same 100ms feature snapshot.
-                        # PRE_LEAD remains the control; PRE_LEAD_SAFE is independent.
+                        # Evaluate all LEAD branches from the exact same 100ms feature snapshot.
+                        # PRE_LEAD and PRE_LEAD_SAFE remain untouched controls; CONFIRM is independent.
                         await evaluate_prelead(market, elapsed, feature)
                         await evaluate_prelead_safe(market, elapsed, feature)
+                        await evaluate_prelead_confirm(market, elapsed, feature)
         except Exception:
             log.exception("PRE_LEAD loop failed")
 
@@ -2731,7 +2985,7 @@ def strategy_summary(strategy, start_ms=None, end_ms=None):
 
 def lead_alignment_rows(signal_rows, code=None):
     """Flatten PRE_LEAD diagnostics and measure actual lead to PRE_JUMP/jump."""
-    accepted = {"PRE_LEAD", "PRE_LEAD_SAFE"}
+    accepted = {"PRE_LEAD", "PRE_LEAD_SAFE", "PRE_LEAD_CONFIRM"}
     if code is not None:
         accepted = {str(code)}
     lead_rows = []
@@ -2780,6 +3034,14 @@ def lead_alignment_rows(signal_rows, code=None):
                 "projected_score": diag.get("projected_score"), "target_score": diag.get("target_score"),
                 "safe_projected_score_min": diag.get("safe_projected_score_min"),
                 "safe_price_max": diag.get("safe_price_max"),
+                "confirm_candidate_ms": (feat.get("prelead_confirm") or {}).get("candidate_ms"),
+                "confirm_ms": (feat.get("prelead_confirm") or {}).get("confirm_ms"),
+                "confirm_wait_ms": (feat.get("prelead_confirm") or {}).get("actual_confirm_ms"),
+                "confirm_candidate_score": (feat.get("prelead_confirm") or {}).get("candidate_score"),
+                "confirm_score": (feat.get("prelead_confirm") or {}).get("confirm_score"),
+                "confirm_score_change": (feat.get("prelead_confirm") or {}).get("score_change"),
+                "confirm_candidate_ask": (feat.get("prelead_confirm") or {}).get("candidate_ask"),
+                "confirm_ask": (feat.get("prelead_confirm") or {}).get("confirm_ask"),
                 "same_votes": r["same_votes"],
                 "base_prejump_ms": base_ms,
                 "lead_to_prejump_ms": (base_ms - si(r["signal_ms"])) if base_ms is not None else None,
@@ -2835,19 +3097,28 @@ def make_report(start_ts, end_ts):
             "SELECT * FROM lead_exec_events WHERE signal_ms>=? AND signal_ms<? ORDER BY signal_ms",
             (sm, em),
         ).fetchall()
+        confirm_checks = conn.execute(
+            "SELECT * FROM prelead_confirm_events WHERE candidate_ms>=? AND candidate_ms<? ORDER BY candidate_ms",
+            (sm, em),
+        ).fetchall()
 
     lead_alignment = lead_alignment_rows(signals, "PRE_LEAD")
     lead_safe_alignment = lead_alignment_rows(signals, "PRE_LEAD_SAFE")
+    lead_confirm_alignment = lead_alignment_rows(signals, "PRE_LEAD_CONFIRM")
     lead_with_base = [x for x in lead_alignment if x.get("lead_to_prejump_ms") is not None]
     lead_ms_vals = [si(x["lead_to_prejump_ms"]) for x in lead_with_base]
     lead_median_ms = statistics.median(lead_ms_vals) if lead_ms_vals else None
     safe_with_base = [x for x in lead_safe_alignment if x.get("lead_to_prejump_ms") is not None]
     safe_ms_vals = [si(x["lead_to_prejump_ms"]) for x in safe_with_base]
     safe_median_ms = statistics.median(safe_ms_vals) if safe_ms_vals else None
+    confirm_with_base = [x for x in lead_confirm_alignment if x.get("lead_to_prejump_ms") is not None]
+    confirm_ms_vals = [si(x["lead_to_prejump_ms"]) for x in confirm_with_base]
+    confirm_median_ms = statistics.median(confirm_ms_vals) if confirm_ms_vals else None
 
-    # Preserve the original PRE_LEAD CSVs for clean continuity; SAFE gets its own files.
+    # Preserve every branch in separate CSVs for clean forward comparison.
     lead_execs_regular = [r for r in lead_execs if str(r["variant"]).endswith("_PRE_LEAD")]
     lead_execs_safe = [r for r in lead_execs if str(r["variant"]).endswith("_PRE_LEAD_SAFE")]
+    lead_execs_confirm = [r for r in lead_execs if str(r["variant"]).endswith("_PRE_LEAD_CONFIRM")]
 
     d1 = datetime.fromtimestamp(start_ts, tz=timezone.utc)
     d2 = datetime.fromtimestamp(end_ts, tz=timezone.utc)
@@ -2870,7 +3141,8 @@ def make_report(start_ts, end_ts):
         f"PRE_JUMP42_10 = score >= {PREJUMP_HIGH_SCORE:.2f}, elapsed {PREJUMP_TEST_MIN_ELAPSED:g}..{PREJUMP_TEST_MAX_ELAPSED:g}s",
         f"PRE_LEAD = score {PRELEAD_MIN_SCORE:.3f}..< {PRELEAD_TARGET_SCORE:.2f}, rising >= {PRELEAD_MIN_DELTA:.3f} over ~{PRELEAD_LOOKBACK_MS}ms, projected {PRELEAD_HORIZON_MS}ms >= {PRELEAD_TARGET_SCORE:.2f}",
         f"PRE_LEAD_SAFE = exact PRE_LEAD candidate + projected >= {PRELEAD_SAFE_PROJECTED_SCORE:.2f} + signal ask <= {PRELEAD_SAFE_PRICE_MAX:.2f}",
-        f"Both LEAD branches: wait {PRELEAD_SIM_DELAY_MS}ms, cap signal ask +{PRELEAD_SIM_MAX_SLIPPAGE:.2f} and <= {PRELEAD_PRICE_MAX:.2f}",
+        f"PRE_LEAD_CONFIRM = first SAFE candidate + wait {PRELEAD_CONFIRM_MS}ms + same-direction score may fade <= {PRELEAD_CONFIRM_MAX_SCORE_FADE:.3f} + confirm ask <= {PRELEAD_CONFIRM_PRICE_MAX:.2f}",
+        f"All accepted LEAD submissions then wait {PRELEAD_SIM_DELAY_MS}ms, cap submit ask +{PRELEAD_SIM_MAX_SLIPPAGE:.2f} and <= {PRELEAD_PRICE_MAX:.2f}",
         f"Base 4: PM ask {PREJUMP_PRICE_MIN:.2f}..{PREJUMP_PRICE_MAX:.2f}, >= {PREJUMP_MIN_VENUES} venue votes",
         "Legacy BASE / EXT_CONFIRM / EXT_VETO / PRE_JUMP35 disabled",
         "",
@@ -2878,6 +3150,7 @@ def make_report(start_ts, end_ts):
         f"Signals: {len(signals)} | PAPER entries: {len(trades)} | TP exits: {len(exits)}",
         f"PRE_LEAD signals: {len(lead_alignment)} | later same-direction PRE_JUMP: {len(lead_with_base)} | median lead: {lead_median_ms if lead_median_ms is not None else 'n/a'} ms",
         f"PRE_LEAD_SAFE signals: {len(lead_safe_alignment)} | later same-direction PRE_JUMP: {len(safe_with_base)} | median lead: {safe_median_ms if safe_median_ms is not None else 'n/a'} ms",
+        f"PRE_LEAD_CONFIRM passed signals: {len(lead_confirm_alignment)} | candidate checks: {len(confirm_checks)} | later same-direction PRE_JUMP: {len(confirm_with_base)} | median lead from confirm: {confirm_median_ms if confirm_median_ms is not None else 'n/a'} ms",
         "",
     ]
     for symbol in SYMBOLS:
@@ -2904,6 +3177,9 @@ def make_report(start_ts, end_ts):
         z.writestr("prelead_alignment.csv", csv_bytes(lead_alignment))
         z.writestr("prelead_safe_execution.csv", csv_bytes(lead_execs_safe))
         z.writestr("prelead_safe_alignment.csv", csv_bytes(lead_safe_alignment))
+        z.writestr("prelead_confirm_checks.csv", csv_bytes(confirm_checks))
+        z.writestr("prelead_confirm_execution.csv", csv_bytes(lead_execs_confirm))
+        z.writestr("prelead_confirm_alignment.csv", csv_bytes(lead_confirm_alignment))
     return path, summaries
 
 
@@ -3105,7 +3381,7 @@ async def send_trades():
 
 async def send_lab_info():
     await tg_send(
-        "🧪 PRE-JUMP LAB — 4 controls + PRE_LEAD + PRE_LEAD_SAFE\n"
+        "🧪 PRE-JUMP LAB — 4 controls + PRE_LEAD + PRE_LEAD_SAFE + PRE_LEAD_CONFIRM\n"
         "PAPER ONLY — no real orders.\n\n"
         f"PRE_JUMP: score >= {PREJUMP_SCORE:.2f}, {PREJUMP_MIN_ELAPSED:g}–{PREJUMP_MAX_ELAPSED:g}s.\n"
         f"PRE_JUMP42: score >= {PREJUMP_HIGH_SCORE:.2f}, {PREJUMP_MIN_ELAPSED:g}–{PREJUMP_MAX_ELAPSED:g}s.\n"
@@ -3113,12 +3389,14 @@ async def send_lab_info():
         f"PRE_JUMP42_10: score >= {PREJUMP_HIGH_SCORE:.2f}, {PREJUMP_TEST_MIN_ELAPSED:g}–{PREJUMP_TEST_MAX_ELAPSED:g}s.\n"
         f"PRE_LEAD: score {PRELEAD_MIN_SCORE:.3f}..< {PRELEAD_TARGET_SCORE:.2f}, rising >= {PRELEAD_MIN_DELTA:.3f} over ~{PRELEAD_LOOKBACK_MS}ms, projected {PRELEAD_HORIZON_MS}ms ahead >= {PRELEAD_TARGET_SCORE:.2f}.\n"
         f"PRE_LEAD_SAFE: same candidate + projected >= {PRELEAD_SAFE_PROJECTED_SCORE:.2f} + signal ask <= {PRELEAD_SAFE_PRICE_MAX:.2f}.\n"
-        f"Both LEAD branches simulate {PRELEAD_SIM_DELAY_MS}ms taker hold then fill only up to signal ask +{PRELEAD_SIM_MAX_SLIPPAGE:.2f} (hard max {PRELEAD_PRICE_MAX:.2f}).\n"
+        f"PRE_LEAD_CONFIRM: first SAFE candidate, wait {PRELEAD_CONFIRM_MS}ms; same-side score may fade at most {PRELEAD_CONFIRM_MAX_SCORE_FADE:.3f}, confirm ask <= {PRELEAD_CONFIRM_PRICE_MAX:.2f}; first candidate is binding.\n"
+        f"After CONFIRM passes, it still simulates the full {PRELEAD_SIM_DELAY_MS}ms taker hold, so total candidate→execution is about {PRELEAD_CONFIRM_MS + PRELEAD_SIM_DELAY_MS}ms plus loop jitter.\n"
+        f"LEAD fills are capped at submit ask +{PRELEAD_SIM_MAX_SLIPPAGE:.2f} (hard max {PRELEAD_PRICE_MAX:.2f}).\n"
         f"The original four keep PM ask {PREJUMP_PRICE_MIN:.2f}–{PREJUMP_PRICE_MAX:.2f} and >= {PREJUMP_MIN_VENUES} same-side venues unchanged.\n"
         "BASE / EXT_CONFIRM / EXT_VETO / PRE_JUMP35 are disabled.\n\n"
         f"TP simulation: +${TAKE_PROFIT_USDC:.2f} NET.\n"
         f"Jump label: +{JUMP_MOVE:.2f} in {JUMP_WINDOW_SEC:g}s.\n"
-        "Hourly ZIP contains separate PRE_LEAD and PRE_LEAD_SAFE execution/alignment CSVs for clean forward comparison."
+        "Hourly ZIP contains separate PRE_LEAD / SAFE / CONFIRM files; CONFIRM also exports prelead_confirm_checks.csv with every pass/reject."
     )
 
 
