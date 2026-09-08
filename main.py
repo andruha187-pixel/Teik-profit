@@ -46,7 +46,7 @@ load_dotenv()
 # 1/3/5/10/20 seconds BEFORE detected Polymarket jumps.
 # ============================================================
 
-VERSION = "1.4-multi7-prejump-4way-plus-lead"
+VERSION = "1.5-multi7-prejump-4way-plus-lead-safe"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -138,11 +138,19 @@ PRELEAD_PM_MOM_MAX = float(os.getenv("PRELEAD_PM_MOM_MAX", str(PREJUMP_PM_MOM_MA
 PRELEAD_SIM_DELAY_MS = max(0, int(os.getenv("PRELEAD_SIM_DELAY_MS", "250")))
 PRELEAD_SIM_MAX_SLIPPAGE = max(0.0, float(os.getenv("PRELEAD_SIM_MAX_SLIPPAGE", "0.05")))
 
-# Keep the lead threshold internally coherent even if env values are mistyped.
+# Forward-test branch selected from the first 8h PRE_LEAD sample. It reuses the
+# exact PRE_LEAD signal path and adds only two frozen quality gates. Keep these
+# fixed during forward testing to avoid repeatedly fitting the same data.
+PRELEAD_SAFE_PROJECTED_SCORE = float(os.getenv("PRELEAD_SAFE_PROJECTED_SCORE", "0.55"))
+PRELEAD_SAFE_PRICE_MAX = float(os.getenv("PRELEAD_SAFE_PRICE_MAX", "0.56"))
+
+# Keep the lead thresholds internally coherent even if env values are mistyped.
 PRELEAD_TARGET_SCORE = max(0.01, min(1.0, PRELEAD_TARGET_SCORE))
 PRELEAD_MIN_SCORE = max(0.0, min(PRELEAD_TARGET_SCORE - 1e-6, PRELEAD_MIN_SCORE))
 PRELEAD_PRICE_MIN = max(0.01, min(0.99, PRELEAD_PRICE_MIN))
 PRELEAD_PRICE_MAX = max(PRELEAD_PRICE_MIN, min(0.99, PRELEAD_PRICE_MAX))
+PRELEAD_SAFE_PROJECTED_SCORE = max(PRELEAD_TARGET_SCORE, min(1.0, PRELEAD_SAFE_PROJECTED_SCORE))
+PRELEAD_SAFE_PRICE_MAX = max(PRELEAD_PRICE_MIN, min(PRELEAD_PRICE_MAX, PRELEAD_SAFE_PRICE_MAX))
 
 # Jump detector used for retrospective lead/lag study.
 JUMP_MOVE = float(os.getenv("JUMP_MOVE", "0.08"))
@@ -221,10 +229,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("prejump-lab")
 
-# Keep the four existing PAPER controls unchanged and add one independent
-# experimental EARLY/LEAD branch. Existing SQLite variant names/cash histories
-# remain intact; PRE_LEAD starts with its own PAPER account on first launch.
-STRATEGY_CODES = ("PRE_JUMP", "PRE_JUMP42", "PRE_JUMP10", "PRE_JUMP42_10", "PRE_LEAD")
+# Keep the four existing PAPER controls and the original PRE_LEAD unchanged.
+# PRE_LEAD_SAFE is a sixth, independent forward-test account with two frozen
+# extra gates (projected score and signal ask). Existing SQLite histories remain intact.
+STRATEGY_CODES = ("PRE_JUMP", "PRE_JUMP42", "PRE_JUMP10", "PRE_JUMP42_10", "PRE_LEAD", "PRE_LEAD_SAFE")
 STRATEGIES = [
     {"symbol": symbol, "code": code, "name": f"{symbol}_{code}"}
     for symbol in SYMBOLS
@@ -2038,6 +2046,17 @@ def prelead_projection(symbol, feature, outcome):
     }
 
 
+def prelead_safe_filter(diag, ask):
+    """Frozen forward-test overlay: projected >= 0.55 and signal ask <= 0.56 by default."""
+    if not diag:
+        return False, "diag_missing"
+    if sf(diag.get("projected_score")) + 1e-12 < PRELEAD_SAFE_PROJECTED_SCORE:
+        return False, "safe_projection_below_min"
+    if ask is None or sf(ask) > PRELEAD_SAFE_PRICE_MAX + 1e-12:
+        return False, "safe_price_above_max"
+    return True, "ok"
+
+
 def prelead_pm_momentum(condition_id, asset, seconds=1.0):
     h = lead_pm_history[condition_id][asset]
     if len(h) < 2:
@@ -2099,12 +2118,14 @@ async def _execute_prelead_after_delay(market, strategy, asset, outcome, signal_
     )
 
 
-async def evaluate_prelead(market, elapsed, feature):
-    """Experimental branch: forecast the 0.40 crossing ~300ms ahead, PAPER only."""
+async def evaluate_prelead_variant(market, elapsed, feature, code):
+    """Evaluate PRE_LEAD or the frozen PRE_LEAD_SAFE overlay, PAPER only."""
+    if code not in {"PRE_LEAD", "PRE_LEAD_SAFE"}:
+        return
     if not (PRELEAD_MIN_ELAPSED <= elapsed <= PRELEAD_MAX_ELAPSED):
         return
     symbol = market_symbol(market)
-    strategy = next(x for x in STRATEGIES_BY_SYMBOL[symbol] if x["code"] == "PRE_LEAD")
+    strategy = next(x for x in STRATEGIES_BY_SYMBOL[symbol] if x["code"] == code)
     st = get_strategy_state(market["condition_id"], strategy)
     if st["closed"] or st["started"] or st["gate_decided"]:
         return
@@ -2129,6 +2150,18 @@ async def evaluate_prelead(market, elapsed, feature):
     ask = best_ask(asset)
     if ask is None or not (PRELEAD_PRICE_MIN <= ask <= PRELEAD_PRICE_MAX):
         return
+    if code == "PRE_LEAD_SAFE":
+        safe_ok, safe_reason = prelead_safe_filter(diag, ask)
+        if not safe_ok:
+            return
+        diag = dict(diag)
+        diag.update({
+            "safe_filter": True,
+            "safe_reason": safe_reason,
+            "safe_projected_score_min": PRELEAD_SAFE_PROJECTED_SCORE,
+            "safe_price_max": PRELEAD_SAFE_PRICE_MAX,
+        })
+
     mom = prelead_pm_momentum(market["condition_id"], asset, 1.0)
     if mom is None or not (PRELEAD_PM_MOM_MIN <= mom <= PRELEAD_PM_MOM_MAX):
         return
@@ -2139,21 +2172,30 @@ async def evaluate_prelead(market, elapsed, feature):
     signal_ms = now_ms()
     enriched = dict(feature)
     enriched["prelead"] = diag
-    reason = "PRELEAD_PROJECTED_CROSS"
+    reason = "PRELEAD_SAFE_FILTER_OK" if code == "PRE_LEAD_SAFE" else "PRELEAD_PROJECTED_CROSS"
     store_gate(market, strategy, asset, outcome, ask, ask - mom, mom, elapsed, True, reason, enriched)
     store_signal(market, strategy, asset, outcome, ask, mom, elapsed, reason, enriched)
     log.info(
-        "PRELEAD %-4s %s ask=%.3f pmMom=%+.3f | score %.3f<-%.3f delta=%+.3f projected=%.3f target=%.2f | votes=%d | delay=%dms cap=%.3f | elapsed=%.2fs",
-        symbol, outcome, ask, mom, diag["score_now"], diag["score_prev"],
-        diag["score_delta"], diag["projected_score"], PRELEAD_TARGET_SCORE,
-        directional["same_votes"], PRELEAD_SIM_DELAY_MS,
-        min(PRELEAD_PRICE_MAX, ask + PRELEAD_SIM_MAX_SLIPPAGE), elapsed,
+        "%s %-4s %s ask=%.3f pmMom=%+.3f | score %.3f<-%.3f delta=%+.3f projected=%.3f | votes=%d | delay=%dms cap=%.3f | elapsed=%.2fs",
+        code, symbol, outcome, ask, mom, diag["score_now"], diag["score_prev"],
+        diag["score_delta"], diag["projected_score"], directional["same_votes"],
+        PRELEAD_SIM_DELAY_MS, min(PRELEAD_PRICE_MAX, ask + PRELEAD_SIM_MAX_SLIPPAGE), elapsed,
     )
     task = asyncio.create_task(
         _execute_prelead_after_delay(market, strategy, asset, outcome, ask, enriched, signal_ms)
     )
     lead_exec_tasks.add(task)
     task.add_done_callback(lead_exec_tasks.discard)
+
+
+async def evaluate_prelead(market, elapsed, feature):
+    """Original PRE_LEAD branch preserved unchanged in logic."""
+    await evaluate_prelead_variant(market, elapsed, feature, "PRE_LEAD")
+
+
+async def evaluate_prelead_safe(market, elapsed, feature):
+    """Forward-test overlay: same PRE_LEAD candidate plus projected>=0.55 and ask<=0.56."""
+    await evaluate_prelead_variant(market, elapsed, feature, "PRE_LEAD_SAFE")
 
 
 async def prelead_loop():
@@ -2176,7 +2218,10 @@ async def prelead_loop():
                         if ask is not None:
                             lead_pm_history[market["condition_id"]][asset].append((t_ms, ask))
                     if trading_enabled() and 0 <= elapsed <= TRADE_WINDOW_SECONDS:
+                        # Evaluate both from the exact same 100ms feature snapshot.
+                        # PRE_LEAD remains the control; PRE_LEAD_SAFE is independent.
                         await evaluate_prelead(market, elapsed, feature)
+                        await evaluate_prelead_safe(market, elapsed, feature)
         except Exception:
             log.exception("PRE_LEAD loop failed")
 
@@ -2684,12 +2729,21 @@ def strategy_summary(strategy, start_ms=None, end_ms=None):
 
 
 
-def lead_alignment_rows(signal_rows):
+def lead_alignment_rows(signal_rows, code=None):
     """Flatten PRE_LEAD diagnostics and measure actual lead to PRE_JUMP/jump."""
+    accepted = {"PRE_LEAD", "PRE_LEAD_SAFE"}
+    if code is not None:
+        accepted = {str(code)}
+    lead_rows = []
+    for r in signal_rows:
+        variant = str(r["variant"])
+        matched = next((c for c in accepted if variant.endswith("_" + c)), None)
+        if matched:
+            lead_rows.append((r, matched))
+
     out = []
-    lead_rows = [r for r in signal_rows if str(r["variant"]).endswith("_PRE_LEAD")]
     with db() as conn:
-        for r in lead_rows:
+        for r, branch_code in lead_rows:
             try:
                 feat = json.loads(str(r["features_json"] or "{}"))
             except Exception:
@@ -2717,12 +2771,15 @@ def lead_alignment_rows(signal_rows):
             base_ms = si(base["signal_ms"]) if base else None
             jump_ms = si(jump["jump_ms"]) if jump else None
             out.append({
-                "symbol": r["symbol"], "condition_id": r["condition_id"], "outcome": r["outcome"],
+                "symbol": r["symbol"], "variant": r["variant"], "code": branch_code,
+                "condition_id": r["condition_id"], "outcome": r["outcome"],
                 "lead_signal_ms": r["signal_ms"], "elapsed_sec": r["elapsed_sec"],
                 "pm_ask": r["pm_ask"], "pm_bid": r["pm_bid"], "pm_momentum": r["pm_momentum"],
                 "score_now": diag.get("score_now"), "score_prev": diag.get("score_prev"),
                 "score_delta": diag.get("score_delta"), "lookback_ms": diag.get("actual_lookback_ms"),
                 "projected_score": diag.get("projected_score"), "target_score": diag.get("target_score"),
+                "safe_projected_score_min": diag.get("safe_projected_score_min"),
+                "safe_price_max": diag.get("safe_price_max"),
                 "same_votes": r["same_votes"],
                 "base_prejump_ms": base_ms,
                 "lead_to_prejump_ms": (base_ms - si(r["signal_ms"])) if base_ms is not None else None,
@@ -2736,6 +2793,7 @@ def lead_alignment_rows(signal_rows):
                 "exec_note": ex["note"] if ex else "",
             })
     return out
+
 
 def make_report(start_ts, end_ts):
     sm, em = start_ts * 1000, end_ts * 1000
@@ -2778,10 +2836,18 @@ def make_report(start_ts, end_ts):
             (sm, em),
         ).fetchall()
 
-    lead_alignment = lead_alignment_rows(signals)
+    lead_alignment = lead_alignment_rows(signals, "PRE_LEAD")
+    lead_safe_alignment = lead_alignment_rows(signals, "PRE_LEAD_SAFE")
     lead_with_base = [x for x in lead_alignment if x.get("lead_to_prejump_ms") is not None]
     lead_ms_vals = [si(x["lead_to_prejump_ms"]) for x in lead_with_base]
     lead_median_ms = statistics.median(lead_ms_vals) if lead_ms_vals else None
+    safe_with_base = [x for x in lead_safe_alignment if x.get("lead_to_prejump_ms") is not None]
+    safe_ms_vals = [si(x["lead_to_prejump_ms"]) for x in safe_with_base]
+    safe_median_ms = statistics.median(safe_ms_vals) if safe_ms_vals else None
+
+    # Preserve the original PRE_LEAD CSVs for clean continuity; SAFE gets its own files.
+    lead_execs_regular = [r for r in lead_execs if str(r["variant"]).endswith("_PRE_LEAD")]
+    lead_execs_safe = [r for r in lead_execs if str(r["variant"]).endswith("_PRE_LEAD_SAFE")]
 
     d1 = datetime.fromtimestamp(start_ts, tz=timezone.utc)
     d2 = datetime.fromtimestamp(end_ts, tz=timezone.utc)
@@ -2803,13 +2869,15 @@ def make_report(start_ts, end_ts):
         f"PRE_JUMP10 = score >= {PREJUMP_SCORE:.2f}, elapsed {PREJUMP_TEST_MIN_ELAPSED:g}..{PREJUMP_TEST_MAX_ELAPSED:g}s",
         f"PRE_JUMP42_10 = score >= {PREJUMP_HIGH_SCORE:.2f}, elapsed {PREJUMP_TEST_MIN_ELAPSED:g}..{PREJUMP_TEST_MAX_ELAPSED:g}s",
         f"PRE_LEAD = score {PRELEAD_MIN_SCORE:.3f}..< {PRELEAD_TARGET_SCORE:.2f}, rising >= {PRELEAD_MIN_DELTA:.3f} over ~{PRELEAD_LOOKBACK_MS}ms, projected {PRELEAD_HORIZON_MS}ms >= {PRELEAD_TARGET_SCORE:.2f}",
-        f"PRE_LEAD execution model: wait {PRELEAD_SIM_DELAY_MS}ms, cap signal ask +{PRELEAD_SIM_MAX_SLIPPAGE:.2f} and <= {PRELEAD_PRICE_MAX:.2f}",
+        f"PRE_LEAD_SAFE = exact PRE_LEAD candidate + projected >= {PRELEAD_SAFE_PROJECTED_SCORE:.2f} + signal ask <= {PRELEAD_SAFE_PRICE_MAX:.2f}",
+        f"Both LEAD branches: wait {PRELEAD_SIM_DELAY_MS}ms, cap signal ask +{PRELEAD_SIM_MAX_SLIPPAGE:.2f} and <= {PRELEAD_PRICE_MAX:.2f}",
         f"Base 4: PM ask {PREJUMP_PRICE_MIN:.2f}..{PREJUMP_PRICE_MAX:.2f}, >= {PREJUMP_MIN_VENUES} venue votes",
         "Legacy BASE / EXT_CONFIRM / EXT_VETO / PRE_JUMP35 disabled",
         "",
         f"Detected Polymarket jumps: {len(jumps)}",
         f"Signals: {len(signals)} | PAPER entries: {len(trades)} | TP exits: {len(exits)}",
         f"PRE_LEAD signals: {len(lead_alignment)} | later same-direction PRE_JUMP: {len(lead_with_base)} | median lead: {lead_median_ms if lead_median_ms is not None else 'n/a'} ms",
+        f"PRE_LEAD_SAFE signals: {len(lead_safe_alignment)} | later same-direction PRE_JUMP: {len(safe_with_base)} | median lead: {safe_median_ms if safe_median_ms is not None else 'n/a'} ms",
         "",
     ]
     for symbol in SYMBOLS:
@@ -2832,8 +2900,10 @@ def make_report(start_ts, end_ts):
         z.writestr("trials_3_5_10_20s.csv", csv_bytes(trials))
         z.writestr("market_results.csv", csv_bytes(results))
         z.writestr("source_health.csv", csv_bytes(health))
-        z.writestr("prelead_execution.csv", csv_bytes(lead_execs))
+        z.writestr("prelead_execution.csv", csv_bytes(lead_execs_regular))
         z.writestr("prelead_alignment.csv", csv_bytes(lead_alignment))
+        z.writestr("prelead_safe_execution.csv", csv_bytes(lead_execs_safe))
+        z.writestr("prelead_safe_alignment.csv", csv_bytes(lead_safe_alignment))
     return path, summaries
 
 
@@ -3035,19 +3105,20 @@ async def send_trades():
 
 async def send_lab_info():
     await tg_send(
-        "🧪 PRE-JUMP LAB — 4 controls + EARLY/LEAD\n"
+        "🧪 PRE-JUMP LAB — 4 controls + PRE_LEAD + PRE_LEAD_SAFE\n"
         "PAPER ONLY — no real orders.\n\n"
         f"PRE_JUMP: score >= {PREJUMP_SCORE:.2f}, {PREJUMP_MIN_ELAPSED:g}–{PREJUMP_MAX_ELAPSED:g}s.\n"
         f"PRE_JUMP42: score >= {PREJUMP_HIGH_SCORE:.2f}, {PREJUMP_MIN_ELAPSED:g}–{PREJUMP_MAX_ELAPSED:g}s.\n"
         f"PRE_JUMP10: score >= {PREJUMP_SCORE:.2f}, {PREJUMP_TEST_MIN_ELAPSED:g}–{PREJUMP_TEST_MAX_ELAPSED:g}s.\n"
         f"PRE_JUMP42_10: score >= {PREJUMP_HIGH_SCORE:.2f}, {PREJUMP_TEST_MIN_ELAPSED:g}–{PREJUMP_TEST_MAX_ELAPSED:g}s.\n"
         f"PRE_LEAD: score {PRELEAD_MIN_SCORE:.3f}..< {PRELEAD_TARGET_SCORE:.2f}, rising >= {PRELEAD_MIN_DELTA:.3f} over ~{PRELEAD_LOOKBACK_MS}ms, projected {PRELEAD_HORIZON_MS}ms ahead >= {PRELEAD_TARGET_SCORE:.2f}.\n"
-        f"PRE_LEAD simulates {PRELEAD_SIM_DELAY_MS}ms taker hold then fills only up to signal ask +{PRELEAD_SIM_MAX_SLIPPAGE:.2f} (hard max {PRELEAD_PRICE_MAX:.2f}).\n"
+        f"PRE_LEAD_SAFE: same candidate + projected >= {PRELEAD_SAFE_PROJECTED_SCORE:.2f} + signal ask <= {PRELEAD_SAFE_PRICE_MAX:.2f}.\n"
+        f"Both LEAD branches simulate {PRELEAD_SIM_DELAY_MS}ms taker hold then fill only up to signal ask +{PRELEAD_SIM_MAX_SLIPPAGE:.2f} (hard max {PRELEAD_PRICE_MAX:.2f}).\n"
         f"The original four keep PM ask {PREJUMP_PRICE_MIN:.2f}–{PREJUMP_PRICE_MAX:.2f} and >= {PREJUMP_MIN_VENUES} same-side venues unchanged.\n"
         "BASE / EXT_CONFIRM / EXT_VETO / PRE_JUMP35 are disabled.\n\n"
         f"TP simulation: +${TAKE_PROFIT_USDC:.2f} NET.\n"
         f"Jump label: +{JUMP_MOVE:.2f} in {JUMP_WINDOW_SEC:g}s.\n"
-        "Hourly ZIP also contains prelead_execution.csv and prelead_alignment.csv to measure actual lead vs normal PRE_JUMP and PM jumps."
+        "Hourly ZIP contains separate PRE_LEAD and PRE_LEAD_SAFE execution/alignment CSVs for clean forward comparison."
     )
 
 
