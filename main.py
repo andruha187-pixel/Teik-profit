@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ============================================================
-# MULTI7 PRE-JUMP LAB — PAPER ONLY
+# MULTI7 PRE_LEAD_SAFE LIVE-SIM LAB — PAPER ONLY
 # ============================================================
 # Purpose:
 #   Measure whether external crypto microstructure leads Polymarket 5m moves.
@@ -46,7 +46,7 @@ load_dotenv()
 # 1/3/5/10/20 seconds BEFORE detected Polymarket jumps.
 # ============================================================
 
-VERSION = "1.6-multi7-prejump-4way-plus-lead-confirm"
+VERSION = "1.7-multi7-prelead-safe-live-sim"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -174,7 +174,13 @@ ENTRY_ORDER_SIZE = float(os.getenv("ENTRY_ORDER_SIZE", "5"))
 PAPER_START_BALANCE = float(os.getenv("PAPER_START_BALANCE", "500"))
 MIN_FREE_CASH = float(os.getenv("MIN_FREE_CASH", "5"))
 CRYPTO_FEE_RATE = float(os.getenv("CRYPTO_FEE_RATE", "0.07"))
-TAKE_PROFIT_USDC = float(os.getenv("TAKE_PROFIT_USDC", "0.60"))
+TAKE_PROFIT_DEFAULT_USDC = float(os.getenv("TAKE_PROFIT_USDC", "0.90"))
+TAKE_PROFIT_MIN_USDC = max(0.05, float(os.getenv("TAKE_PROFIT_MIN_USDC", "0.10")))
+TAKE_PROFIT_MAX_USDC = max(TAKE_PROFIT_MIN_USDC, float(os.getenv("TAKE_PROFIT_MAX_USDC", "2.00")))
+TAKE_PROFIT_STEP_USDC = max(0.01, float(os.getenv("TAKE_PROFIT_STEP_USDC", "0.10")))
+TP_LIVE_SIM_DELAY_MS = max(0, int(os.getenv("TP_LIVE_SIM_DELAY_MS", "250")))
+TP_LIVE_SIM_MIN_HOLD_MS = max(0, int(os.getenv("TP_LIVE_SIM_MIN_HOLD_MS", "2000")))
+TP_LIVE_SIM_SCAN_INTERVAL = max(0.02, float(os.getenv("TP_LIVE_SIM_SCAN_INTERVAL", "0.05")))
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0.08"))
 MAX_PRICE = float(os.getenv("MAX_PRICE", "0.95"))
 MAX_BOOK_AGE_MS = int(os.getenv("MAX_BOOK_AGE_MS", "1000"))
@@ -231,8 +237,8 @@ except Exception:
     DATA_DIR = Path("./data")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-DB_PATH = DATA_DIR / "prejump_lab_multi7.db"
-REPORT_DIR = DATA_DIR / "prejump_lab_multi7_reports"
+DB_PATH = DATA_DIR / "prejump_lab_live_sim_v17.db"
+REPORT_DIR = DATA_DIR / "prejump_lab_live_sim_v17_reports"
 REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
@@ -241,10 +247,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("prejump-lab")
 
-# Keep the four existing PAPER controls, PRE_LEAD, and PRE_LEAD_SAFE unchanged.
-# PRE_LEAD_CONFIRM is a seventh independent account that waits 125ms (default)
-# after the first SAFE candidate and only proceeds if the same-side impulse persists.
-STRATEGY_CODES = ("PRE_JUMP", "PRE_JUMP42", "PRE_JUMP10", "PRE_JUMP42_10", "PRE_LEAD", "PRE_LEAD_SAFE", "PRE_LEAD_CONFIRM")
+# v1.7 is intentionally slim: keep only the branch that best matched LIVE-like
+# entry execution in forward testing. PRE_LEAD was noisy/negative and the extra
+# 125ms PRE_LEAD_CONFIRM filter did not improve the SAFE candidate quality.
+STRATEGY_CODES = ("PRE_LEAD_SAFE",)
 STRATEGIES = [
     {"symbol": symbol, "code": code, "name": f"{symbol}_{code}"}
     for symbol in SYMBOLS
@@ -270,6 +276,8 @@ fast_pm_history = defaultdict(lambda: defaultdict(lambda: deque(maxlen=512)))
 lead_feature_history = defaultdict(lambda: deque(maxlen=256))
 lead_pm_history = defaultdict(lambda: defaultdict(lambda: deque(maxlen=512)))
 lead_exec_tasks = set()
+tp_exec_tasks = set()
+tp_pending = set()
 strategy_state = {}
 settle_lock = asyncio.Lock()
 
@@ -602,6 +610,27 @@ def init_db():
             note TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS tp_live_sim_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trigger_ms INTEGER,
+            exec_ms INTEGER,
+            condition_id TEXT,
+            symbol TEXT,
+            variant TEXT,
+            outcome TEXT,
+            asset TEXT,
+            target_pnl REAL,
+            trigger_pnl REAL,
+            trigger_limit REAL,
+            exec_best_bid REAL,
+            intended_delay_ms INTEGER,
+            actual_delay_ms INTEGER,
+            status TEXT,
+            filled_shares REAL,
+            realized_pnl REAL,
+            note TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS state (
             key TEXT PRIMARY KEY,
             value TEXT
@@ -617,9 +646,10 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_health_ms ON source_health_log(sample_ms);
         CREATE INDEX IF NOT EXISTS idx_lead_exec_ms ON lead_exec_events(signal_ms);
         CREATE INDEX IF NOT EXISTS idx_prelead_confirm_ms ON prelead_confirm_events(candidate_ms);
+        CREATE INDEX IF NOT EXISTS idx_tp_live_sim_trigger ON tp_live_sim_events(trigger_ms);
         """)
 
-        defaults = {"trading_enabled": "1"}
+        defaults = {"trading_enabled": "1", "take_profit_usdc": str(TAKE_PROFIT_DEFAULT_USDC)}
         for strategy in STRATEGIES:
             defaults[f"paper_initial:{strategy['name']}"] = str(PAPER_START_BALANCE)
             defaults[f"paper_cash:{strategy['name']}"] = str(PAPER_START_BALANCE)
@@ -655,6 +685,18 @@ def set_paper_cash(strategy_name, value):
 
 def trading_enabled():
     return state_get("trading_enabled", "1") == "1"
+
+
+def take_profit_usdc():
+    value = sf(state_get("take_profit_usdc", TAKE_PROFIT_DEFAULT_USDC), TAKE_PROFIT_DEFAULT_USDC)
+    return max(TAKE_PROFIT_MIN_USDC, min(TAKE_PROFIT_MAX_USDC, value))
+
+
+def set_take_profit_usdc(value):
+    value = max(TAKE_PROFIT_MIN_USDC, min(TAKE_PROFIT_MAX_USDC, sf(value, TAKE_PROFIT_DEFAULT_USDC)))
+    value = round(value + 1e-12, 2)
+    state_set("take_profit_usdc", value)
+    return value
 
 
 # ============================================================
@@ -786,6 +828,27 @@ def simulate_sell(asset, wanted):
     remaining = wanted
     fills = []
     for p in sorted(b["bids"], reverse=True):
+        q = b["bids"][p]
+        take = min(q, remaining)
+        if take > 0:
+            fills.append((p, take))
+            remaining -= take
+        if remaining <= 1e-12:
+            break
+    return fills, wanted - remaining
+
+
+def simulate_sell_min_price(asset, wanted, min_price):
+    """FAK-style SELL snapshot: consume only bids at/above the frozen limit."""
+    b = books.get(asset)
+    if not b or not b.get("bids"):
+        return [], 0.0
+    remaining = wanted
+    fills = []
+    floor = sf(min_price)
+    for p in sorted(b["bids"], reverse=True):
+        if p + 1e-12 < floor:
+            break
         q = b["bids"][p]
         take = min(q, remaining)
         if take > 0:
@@ -1780,54 +1843,198 @@ async def execute_paper_entry(market, strategy, asset, outcome, feature, max_pri
     return True
 
 
-async def maybe_take_profit(market, strategy):
-    st = get_strategy_state(market["condition_id"], strategy)
-    if not st["started"] or st["closed"]:
-        return False
-    candidate = projected_full_exit(market["condition_id"], strategy["name"])
-    if not candidate or candidate["total_pnl"] + 1e-12 < TAKE_PROFIT_USDC:
-        return False
-
-    await ensure_book(candidate["asset"], "bids")
-    candidate = projected_full_exit(market["condition_id"], strategy["name"])
-    if not candidate or candidate["total_pnl"] + 1e-12 < TAKE_PROFIT_USDC:
-        return False
-
-    pos = candidate["pos"]
-    outcome = pos["primary_outcome"]
-    cash_before = paper_cash(strategy["name"])
-    cash_after = cash_before + candidate["net"]
+async def _record_tp_live_sim_event(
+    trigger_ms, exec_ms, market, strategy, outcome, asset, target, trigger_pnl,
+    trigger_limit, exec_best_bid, status, filled_shares=0.0, realized_pnl=None, note="",
+):
     with db() as conn:
         conn.execute("""
-            INSERT INTO paper_exits(
-                exit_ms,condition_id,symbol,variant,asset,outcome,reason,requested_shares,
-                filled_shares,avg_price,gross_proceeds,fee,net_proceeds,fills_json
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            INSERT INTO tp_live_sim_events(
+                trigger_ms,exec_ms,condition_id,symbol,variant,outcome,asset,
+                target_pnl,trigger_pnl,trigger_limit,exec_best_bid,
+                intended_delay_ms,actual_delay_ms,status,filled_shares,realized_pnl,note
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
-            now_ms(), market["condition_id"], market_symbol(market), strategy["name"],
-            candidate["asset"], outcome, "TAKE_PROFIT", candidate["remaining"],
-            candidate["filled"], candidate["avg"], candidate["gross"], candidate["fee"],
-            candidate["net"], jd([{"price": p, "shares": q} for p, q in candidate["fills"]]),
-        ))
-        conn.execute(
-            "INSERT INTO state(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (f"paper_cash:{strategy['name']}", str(cash_after)),
-        )
-        pnl = candidate["total_pnl"]
-        conn.execute("""
-            INSERT OR IGNORE INTO market_results(
-                condition_id,symbol,variant,winning_asset,winning_outcome,buy_cost,
-                exit_proceeds,payout,pnl,buy_trades,exit_trades,settled_ms
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            market["condition_id"], market_symbol(market), strategy["name"], "", "TAKE_PROFIT",
-            pos["buy_cost"], pos["exit_net"] + candidate["net"], 0.0, pnl,
-            len(pos["buys"]), len(pos["exits"]) + 1, now_ms(),
+            trigger_ms, exec_ms, market["condition_id"], market_symbol(market), strategy["name"],
+            outcome, asset, target, trigger_pnl, trigger_limit, exec_best_bid,
+            TP_LIVE_SIM_DELAY_MS, max(0, exec_ms - trigger_ms), status,
+            filled_shares, realized_pnl, note,
         ))
         conn.commit()
-    st["closed"] = True
-    log.info("TAKE PROFIT %-4s %-11s | NET=%+.3f target=%.2f", market_symbol(market), strategy["code"], candidate["total_pnl"], TAKE_PROFIT_USDC)
+
+
+async def _execute_tp_live_sim_after_delay(
+    market, strategy, asset, outcome, trigger_ms, target, trigger_pnl,
+    trigger_limit, remaining,
+):
+    """Simulate LIVE SELL FAK after Polymarket's taker hold.
+
+    The limit is frozen at the worst bid needed to liquidate the full position
+    at trigger time. After the delay, the simulated FAK may only consume bids
+    at/above that frozen limit. A partial visible amount is treated as NO_MATCH
+    for this research account (conservative full-size exit); the position stays
+    open and can trigger again on a later book.
+    """
+    key = (market["condition_id"], strategy["name"])
+    try:
+        await asyncio.sleep(TP_LIVE_SIM_DELAY_MS / 1000.0)
+        exec_ms = now_ms()
+        st = get_strategy_state(market["condition_id"], strategy)
+        if st.get("closed"):
+            await _record_tp_live_sim_event(
+                trigger_ms, exec_ms, market, strategy, outcome, asset, target,
+                trigger_pnl, trigger_limit, best_bid(asset), "CANCELLED_CLOSED",
+                note="market/strategy closed before delayed TP execution",
+            )
+            return False
+
+        current = position_totals(market["condition_id"], strategy["name"])
+        current_remaining = sf(current.get("remaining"))
+        if current_remaining <= 1e-8:
+            await _record_tp_live_sim_event(
+                trigger_ms, exec_ms, market, strategy, outcome, asset, target,
+                trigger_pnl, trigger_limit, best_bid(asset), "CANCELLED_FLAT",
+                note="position already flat",
+            )
+            return False
+
+        fills, filled = simulate_sell_min_price(asset, current_remaining, trigger_limit)
+        exec_best = best_bid(asset)
+        if filled < current_remaining - 1e-8:
+            await _record_tp_live_sim_event(
+                trigger_ms, exec_ms, market, strategy, outcome, asset, target,
+                trigger_pnl, trigger_limit, exec_best, "NO_MATCH",
+                filled_shares=filled,
+                note=f"visible_at_or_above_limit={filled:.4f}sh required={current_remaining:.4f}sh",
+            )
+            log.info(
+                "TP LIVE-SIM NO_MATCH %-4s %-13s | target=%+.2f triggerPnL=%+.3f limit=%.3f bestNow=%s visible=%.3f/%.3f delay=%dms",
+                market_symbol(market), strategy["code"], target, trigger_pnl, trigger_limit,
+                f"{exec_best:.3f}" if exec_best is not None else "n/a", filled, current_remaining,
+                max(0, exec_ms-trigger_ms),
+            )
+            return False
+
+        gross = sum(p * q for p, q in fills)
+        fee = sum(fee_usdc(q, p) for p, q in fills)
+        net = gross - fee
+        avg = gross / filled if filled > 1e-9 else None
+        cash_before = paper_cash(strategy["name"])
+        cash_after = cash_before + net
+        realized_pnl = current["exit_net"] + net - current["buy_cost"]
+
+        with db() as conn:
+            conn.execute("""
+                INSERT INTO paper_exits(
+                    exit_ms,condition_id,symbol,variant,asset,outcome,reason,requested_shares,
+                    filled_shares,avg_price,gross_proceeds,fee,net_proceeds,fills_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                exec_ms, market["condition_id"], market_symbol(market), strategy["name"],
+                asset, outcome, "TAKE_PROFIT_LIVE_SIM", current_remaining,
+                filled, avg, gross, fee, net,
+                jd([{"price": p, "shares": q} for p, q in fills]),
+            ))
+            conn.execute(
+                "INSERT INTO state(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (f"paper_cash:{strategy['name']}", str(cash_after)),
+            )
+            conn.execute("""
+                INSERT OR IGNORE INTO market_results(
+                    condition_id,symbol,variant,winning_asset,winning_outcome,buy_cost,
+                    exit_proceeds,payout,pnl,buy_trades,exit_trades,settled_ms
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                market["condition_id"], market_symbol(market), strategy["name"], "", "TAKE_PROFIT",
+                current["buy_cost"], current["exit_net"] + net, 0.0, realized_pnl,
+                len(current["buys"]), len(current["exits"]) + 1, exec_ms,
+            ))
+            conn.commit()
+
+        st["closed"] = True
+        await _record_tp_live_sim_event(
+            trigger_ms, exec_ms, market, strategy, outcome, asset, target,
+            trigger_pnl, trigger_limit, exec_best, "FILLED",
+            filled_shares=filled, realized_pnl=realized_pnl,
+            note=f"full-size delayed SELL simulation avg={avg:.4f}",
+        )
+        log.info(
+            "TP LIVE-SIM FILLED %-4s %-13s | target=%+.2f triggerPnL=%+.3f realized=%+.3f limit=%.3f avg=%.3f delay=%dms",
+            market_symbol(market), strategy["code"], target, trigger_pnl, realized_pnl,
+            trigger_limit, avg, max(0, exec_ms-trigger_ms),
+        )
+        return True
+    except Exception:
+        log.exception("TP LIVE-SIM delayed execution failed")
+        return False
+    finally:
+        tp_pending.discard(key)
+
+
+async def maybe_take_profit(market, strategy):
+    """LIVE-like PAPER TP: 2s balance hold + frozen-limit 250ms delayed SELL FAK."""
+    cid = market["condition_id"]
+    st = get_strategy_state(cid, strategy)
+    if not st["started"] or st["closed"]:
+        return False
+
+    key = (cid, strategy["name"])
+    if key in tp_pending:
+        return False
+
+    pos = position_totals(cid, strategy["name"])
+    if not pos["buys"] or pos["remaining"] <= 1e-8:
+        return False
+    latest_buy_ms = max(si(r["trade_ms"]) for r in pos["buys"])
+    if now_ms() - latest_buy_ms < TP_LIVE_SIM_MIN_HOLD_MS:
+        return False
+
+    candidate = projected_full_exit(cid, strategy["name"])
+    target = take_profit_usdc()
+    if not candidate or candidate["total_pnl"] + 1e-12 < target:
+        return False
+
+    # Trigger only from a fresh in-memory BID book. This avoids inserting an
+    # extra REST RTT that the event-driven LIVE v20.12 path normally avoids.
+    b = books.get(candidate["asset"]) or {}
+    age = now_ms() - si(b.get("received_ms")) if b.get("received_ms") else 999999
+    if age > MAX_BOOK_AGE_MS:
+        return False
+
+    trigger_limit = min(p for p, q in candidate["fills"] if q > 0)
+    trigger_ms = now_ms()
+    outcome = pos["primary_outcome"]
+    tp_pending.add(key)
+    task = asyncio.create_task(_execute_tp_live_sim_after_delay(
+        market, strategy, candidate["asset"], outcome, trigger_ms, target,
+        candidate["total_pnl"], trigger_limit, candidate["remaining"],
+    ))
+    tp_exec_tasks.add(task)
+    task.add_done_callback(tp_exec_tasks.discard)
+    log.info(
+        "TP LIVE-SIM TRIGGER %-4s %-13s | PnL=%+.3f target=%+.2f limit=%.3f hold=%dms delay=%dms",
+        market_symbol(market), strategy["code"], candidate["total_pnl"], target,
+        trigger_limit, now_ms()-latest_buy_ms, TP_LIVE_SIM_DELAY_MS,
+    )
     return True
+
+
+async def tp_live_sim_loop():
+    """Fast fallback scanner for open SAFE positions; LIVE itself is book-event driven."""
+    while True:
+        started = time.monotonic()
+        try:
+            t_s = time.time()
+            for symbol in SYMBOLS:
+                market = current_market_for_symbol(symbol, t_s)
+                if not market:
+                    continue
+                strategy = STRATEGIES_BY_SYMBOL[symbol][0]
+                await maybe_take_profit(market, strategy)
+        except Exception:
+            log.exception("TP LIVE-SIM loop failed")
+        spent = time.monotonic() - started
+        await asyncio.sleep(max(0.01, TP_LIVE_SIM_SCAN_INTERVAL - spent))
 
 
 # ============================================================
@@ -2471,11 +2678,8 @@ async def prelead_loop():
                         if ask is not None:
                             lead_pm_history[market["condition_id"]][asset].append((t_ms, ask))
                     if trading_enabled() and 0 <= elapsed <= TRADE_WINDOW_SECONDS:
-                        # Evaluate all LEAD branches from the exact same 100ms feature snapshot.
-                        # PRE_LEAD and PRE_LEAD_SAFE remain untouched controls; CONFIRM is independent.
-                        await evaluate_prelead(market, elapsed, feature)
+                        # v1.7: only the forward-selected PRE_LEAD_SAFE branch remains active.
                         await evaluate_prelead_safe(market, elapsed, feature)
-                        await evaluate_prelead_confirm(market, elapsed, feature)
         except Exception:
             log.exception("PRE_LEAD loop failed")
 
@@ -2626,7 +2830,7 @@ def update_trial_horizons():
             for sec, col in ((3, "max_net_3s"), (5, "max_net_5s"), (10, "max_net_10s"), (20, "max_net_20s")):
                 if age <= sec + FAST_INTERVAL:
                     updates[col] = max(sf(row[col], -1e9), pnl)
-                    if pnl + 1e-12 >= TAKE_PROFIT_USDC:
+                    if pnl + 1e-12 >= take_profit_usdc():
                         updates[f"hit_tp_{sec}s"] = 1
         if age >= 20:
             updates["complete_20s"] = 1
@@ -2664,10 +2868,8 @@ async def fast_lab_loop():
                             if elapsed >= 0:
                                 detect_jump(market, asset, outcome, elapsed)
 
-                    if trading_enabled() and 0 <= elapsed <= TRADE_WINDOW_SECONDS:
-                        await evaluate_prejump(market, elapsed)
-
-                    # PAPER TP protection remains active even if new entries are STOPped.
+                    # PRE_JUMP family disabled in v1.7. TP has its own 50ms live-sim loop;
+                    # this slower call is a harmless fallback protected by tp_pending.
                     for strategy in STRATEGIES_BY_SYMBOL[symbol]:
                         await maybe_take_profit(market, strategy)
 
@@ -3097,8 +3299,9 @@ def make_report(start_ts, end_ts):
             "SELECT * FROM lead_exec_events WHERE signal_ms>=? AND signal_ms<? ORDER BY signal_ms",
             (sm, em),
         ).fetchall()
-        confirm_checks = conn.execute(
-            "SELECT * FROM prelead_confirm_events WHERE candidate_ms>=? AND candidate_ms<? ORDER BY candidate_ms",
+        confirm_checks = []
+        tp_live_sim_events = conn.execute(
+            "SELECT * FROM tp_live_sim_events WHERE trigger_ms>=? AND trigger_ms<? ORDER BY trigger_ms",
             (sm, em),
         ).fetchall()
 
@@ -3125,32 +3328,25 @@ def make_report(start_ts, end_ts):
     path = REPORT_DIR / f"prejump_lab_{d1:%Y-%m-%d_%H-%M}_{d2:%H-%M}_UTC.zip"
 
     lines = [
-        "MULTI7 PRE-JUMP LAB",
+        "MULTI7 PRE_LEAD_SAFE LIVE-SIM LAB",
         "=" * 72,
         f"Version: {VERSION}",
         f"Period UTC: {utc_iso(start_ts)} -> {utc_iso(end_ts)}",
         f"Symbols: {', '.join(SYMBOLS)}",
         f"Feature persistence: {FEATURE_PERSIST_INTERVAL:.2f}s | base fast loop {FAST_INTERVAL:.2f}s | LEAD loop {LEAD_INTERVAL:.2f}s",
         f"Jump detector: +{JUMP_MOVE:.2f} within {JUMP_WINDOW_SEC:g}s",
-        f"PAPER TP: +${TAKE_PROFIT_USDC:.2f} NET",
+        f"PAPER TP now: +${take_profit_usdc():.2f} NET | live-sim hold {TP_LIVE_SIM_MIN_HOLD_MS}ms + delayed SELL FAK {TP_LIVE_SIM_DELAY_MS}ms",
         "",
-        "ACTIVE PAPER STRATEGIES",
-        f"PRE_JUMP = score >= {PREJUMP_SCORE:.2f}, elapsed {PREJUMP_MIN_ELAPSED:g}..{PREJUMP_MAX_ELAPSED:g}s",
-        f"PRE_JUMP42 = score >= {PREJUMP_HIGH_SCORE:.2f}, elapsed {PREJUMP_MIN_ELAPSED:g}..{PREJUMP_MAX_ELAPSED:g}s",
-        f"PRE_JUMP10 = score >= {PREJUMP_SCORE:.2f}, elapsed {PREJUMP_TEST_MIN_ELAPSED:g}..{PREJUMP_TEST_MAX_ELAPSED:g}s",
-        f"PRE_JUMP42_10 = score >= {PREJUMP_HIGH_SCORE:.2f}, elapsed {PREJUMP_TEST_MIN_ELAPSED:g}..{PREJUMP_TEST_MAX_ELAPSED:g}s",
-        f"PRE_LEAD = score {PRELEAD_MIN_SCORE:.3f}..< {PRELEAD_TARGET_SCORE:.2f}, rising >= {PRELEAD_MIN_DELTA:.3f} over ~{PRELEAD_LOOKBACK_MS}ms, projected {PRELEAD_HORIZON_MS}ms >= {PRELEAD_TARGET_SCORE:.2f}",
-        f"PRE_LEAD_SAFE = exact PRE_LEAD candidate + projected >= {PRELEAD_SAFE_PROJECTED_SCORE:.2f} + signal ask <= {PRELEAD_SAFE_PRICE_MAX:.2f}",
-        f"PRE_LEAD_CONFIRM = first SAFE candidate + wait {PRELEAD_CONFIRM_MS}ms + same-direction score may fade <= {PRELEAD_CONFIRM_MAX_SCORE_FADE:.3f} + confirm ask <= {PRELEAD_CONFIRM_PRICE_MAX:.2f}",
-        f"All accepted LEAD submissions then wait {PRELEAD_SIM_DELAY_MS}ms, cap submit ask +{PRELEAD_SIM_MAX_SLIPPAGE:.2f} and <= {PRELEAD_PRICE_MAX:.2f}",
-        f"Base 4: PM ask {PREJUMP_PRICE_MIN:.2f}..{PREJUMP_PRICE_MAX:.2f}, >= {PREJUMP_MIN_VENUES} venue votes",
-        "Legacy BASE / EXT_CONFIRM / EXT_VETO / PRE_JUMP35 disabled",
+        "ACTIVE PAPER STRATEGY",
+        f"PRE_LEAD_SAFE only: score {PRELEAD_MIN_SCORE:.3f}..< {PRELEAD_TARGET_SCORE:.2f}, rising >= {PRELEAD_MIN_DELTA:.3f} over ~{PRELEAD_LOOKBACK_MS}ms, projected >= {PRELEAD_SAFE_PROJECTED_SCORE:.2f}, signal ask <= {PRELEAD_SAFE_PRICE_MAX:.2f}",
+        f"ENTRY live-sim: wait {PRELEAD_SIM_DELAY_MS}ms then full-size FAK-style fill capped at signal ask +{PRELEAD_SIM_MAX_SLIPPAGE:.2f} and <= {PRELEAD_PRICE_MAX:.2f}",
+        f"TP live-sim: trigger at current whole-position NET target, minimum hold {TP_LIVE_SIM_MIN_HOLD_MS}ms, freeze worst visible SELL limit, wait {TP_LIVE_SIM_DELAY_MS}ms, require full size still executable at/above frozen limit",
+        "PRE_JUMP x4, raw PRE_LEAD and PRE_LEAD_CONFIRM are disabled to keep this run focused on the LIVE candidate.",
         "",
         f"Detected Polymarket jumps: {len(jumps)}",
-        f"Signals: {len(signals)} | PAPER entries: {len(trades)} | TP exits: {len(exits)}",
-        f"PRE_LEAD signals: {len(lead_alignment)} | later same-direction PRE_JUMP: {len(lead_with_base)} | median lead: {lead_median_ms if lead_median_ms is not None else 'n/a'} ms",
-        f"PRE_LEAD_SAFE signals: {len(lead_safe_alignment)} | later same-direction PRE_JUMP: {len(safe_with_base)} | median lead: {safe_median_ms if safe_median_ms is not None else 'n/a'} ms",
-        f"PRE_LEAD_CONFIRM passed signals: {len(lead_confirm_alignment)} | candidate checks: {len(confirm_checks)} | later same-direction PRE_JUMP: {len(confirm_with_base)} | median lead from confirm: {confirm_median_ms if confirm_median_ms is not None else 'n/a'} ms",
+        f"Signals: {len(signals)} | PAPER entries: {len(trades)} | exits: {len(exits)} | TP live-sim attempts: {len(tp_live_sim_events)}",
+        f"PRE_LEAD_SAFE signals: {len(lead_safe_alignment)} | delayed entry events: {len(lead_execs_safe)}",
+        f"TP live-sim: {sum(1 for x in tp_live_sim_events if str(x['status']) == 'FILLED')} filled / {sum(1 for x in tp_live_sim_events if str(x['status']) == 'NO_MATCH')} no-match",
         "",
     ]
     for symbol in SYMBOLS:
@@ -3173,13 +3369,9 @@ def make_report(start_ts, end_ts):
         z.writestr("trials_3_5_10_20s.csv", csv_bytes(trials))
         z.writestr("market_results.csv", csv_bytes(results))
         z.writestr("source_health.csv", csv_bytes(health))
-        z.writestr("prelead_execution.csv", csv_bytes(lead_execs_regular))
-        z.writestr("prelead_alignment.csv", csv_bytes(lead_alignment))
         z.writestr("prelead_safe_execution.csv", csv_bytes(lead_execs_safe))
         z.writestr("prelead_safe_alignment.csv", csv_bytes(lead_safe_alignment))
-        z.writestr("prelead_confirm_checks.csv", csv_bytes(confirm_checks))
-        z.writestr("prelead_confirm_execution.csv", csv_bytes(lead_execs_confirm))
-        z.writestr("prelead_confirm_alignment.csv", csv_bytes(lead_confirm_alignment))
+        z.writestr("tp_live_sim_execution.csv", csv_bytes(tp_live_sim_events))
     return path, summaries
 
 
@@ -3264,6 +3456,7 @@ def keyboard():
             [{"text": "▶️ START"}, {"text": "⏹ STOP"}],
             [{"text": "📊 STATISTICS"}, {"text": "🌐 SOURCES"}],
             [{"text": "📈 POSITIONS"}, {"text": "📜 TRADES"}],
+            [{"text": "➖ TP"}, {"text": "🎯 TAKE PROFIT"}, {"text": "➕ TP"}],
             [{"text": "🧪 LAB INFO"}],
         ],
         "resize_keyboard": True,
@@ -3286,7 +3479,7 @@ async def tg_send_keyboard(text):
 
 
 async def send_statistics():
-    lines = ["📊 PRE-JUMP LAB STATISTICS", f"Trading entries: {'ON' if trading_enabled() else 'OFF'}"]
+    lines = ["📊 PRE_LEAD_SAFE LIVE-SIM STATISTICS", f"Trading entries: {'ON' if trading_enabled() else 'OFF'} | TP +${take_profit_usdc():.2f}"]
     for symbol in SYMBOLS:
         lines.append(f"\n[{symbol}]")
         for strategy in STRATEGIES_BY_SYMBOL[symbol]:
@@ -3381,33 +3574,51 @@ async def send_trades():
 
 async def send_lab_info():
     await tg_send(
-        "🧪 PRE-JUMP LAB — 4 controls + PRE_LEAD + PRE_LEAD_SAFE + PRE_LEAD_CONFIRM\n"
+        "🧪 PRE_LEAD_SAFE LIVE-SIM v1.7\n"
         "PAPER ONLY — no real orders.\n\n"
-        f"PRE_JUMP: score >= {PREJUMP_SCORE:.2f}, {PREJUMP_MIN_ELAPSED:g}–{PREJUMP_MAX_ELAPSED:g}s.\n"
-        f"PRE_JUMP42: score >= {PREJUMP_HIGH_SCORE:.2f}, {PREJUMP_MIN_ELAPSED:g}–{PREJUMP_MAX_ELAPSED:g}s.\n"
-        f"PRE_JUMP10: score >= {PREJUMP_SCORE:.2f}, {PREJUMP_TEST_MIN_ELAPSED:g}–{PREJUMP_TEST_MAX_ELAPSED:g}s.\n"
-        f"PRE_JUMP42_10: score >= {PREJUMP_HIGH_SCORE:.2f}, {PREJUMP_TEST_MIN_ELAPSED:g}–{PREJUMP_TEST_MAX_ELAPSED:g}s.\n"
-        f"PRE_LEAD: score {PRELEAD_MIN_SCORE:.3f}..< {PRELEAD_TARGET_SCORE:.2f}, rising >= {PRELEAD_MIN_DELTA:.3f} over ~{PRELEAD_LOOKBACK_MS}ms, projected {PRELEAD_HORIZON_MS}ms ahead >= {PRELEAD_TARGET_SCORE:.2f}.\n"
-        f"PRE_LEAD_SAFE: same candidate + projected >= {PRELEAD_SAFE_PROJECTED_SCORE:.2f} + signal ask <= {PRELEAD_SAFE_PRICE_MAX:.2f}.\n"
-        f"PRE_LEAD_CONFIRM: first SAFE candidate, wait {PRELEAD_CONFIRM_MS}ms; same-side score may fade at most {PRELEAD_CONFIRM_MAX_SCORE_FADE:.3f}, confirm ask <= {PRELEAD_CONFIRM_PRICE_MAX:.2f}; first candidate is binding.\n"
-        f"After CONFIRM passes, it still simulates the full {PRELEAD_SIM_DELAY_MS}ms taker hold, so total candidate→execution is about {PRELEAD_CONFIRM_MS + PRELEAD_SIM_DELAY_MS}ms plus loop jitter.\n"
-        f"LEAD fills are capped at submit ask +{PRELEAD_SIM_MAX_SLIPPAGE:.2f} (hard max {PRELEAD_PRICE_MAX:.2f}).\n"
-        f"The original four keep PM ask {PREJUMP_PRICE_MIN:.2f}–{PREJUMP_PRICE_MAX:.2f} and >= {PREJUMP_MIN_VENUES} same-side venues unchanged.\n"
-        "BASE / EXT_CONFIRM / EXT_VETO / PRE_JUMP35 are disabled.\n\n"
-        f"TP simulation: +${TAKE_PROFIT_USDC:.2f} NET.\n"
-        f"Jump label: +{JUMP_MOVE:.2f} in {JUMP_WINDOW_SEC:g}s.\n"
-        "Hourly ZIP contains separate PRE_LEAD / SAFE / CONFIRM files; CONFIRM also exports prelead_confirm_checks.csv with every pass/reject."
+        f"ENTRY: first early candidate, projected >= {PRELEAD_SAFE_PROJECTED_SCORE:.2f}, signal ask <= {PRELEAD_SAFE_PRICE_MAX:.2f}; then {PRELEAD_SIM_DELAY_MS}ms taker hold and FAK-style cap +{PRELEAD_SIM_MAX_SLIPPAGE:.2f}.\n"
+        f"TP now: +${take_profit_usdc():.2f} NET.\n"
+        f"TP LIVE simulation: minimum hold {TP_LIVE_SIM_MIN_HOLD_MS}ms, then freeze current worst full-size SELL limit, wait {TP_LIVE_SIM_DELAY_MS}ms and require the full position still executable at/above that limit.\n"
+        "Change TP with buttons ➖ TP / ➕ TP or type: TP 0.90\n"
+        f"Allowed TP: ${TAKE_PROFIT_MIN_USDC:.2f}..${TAKE_PROFIT_MAX_USDC:.2f}, step ${TAKE_PROFIT_STEP_USDC:.2f}.\n\n"
+        "Only PRE_LEAD_SAFE is active. The four PRE_JUMP controls, raw PRE_LEAD and PRE_LEAD_CONFIRM are disabled.\n"
+        "Hourly ZIP includes prelead_safe_execution.csv and tp_live_sim_execution.csv."
     )
 
 
 async def handle_tg(text):
-    cmd = str(text or "").strip().upper()
+    raw = str(text or "").strip()
+    cmd = raw.upper()
     if cmd in {"/START", "START", "▶️ START"}:
         state_set("trading_enabled", "1")
-        await tg_send("▶️ PRE-JUMP PAPER entries ON. External data collection is always ON.")
+        await tg_send("▶️ PRE_LEAD_SAFE PAPER entries ON. External data collection and TP monitoring are always ON.")
     elif cmd in {"/STOP", "STOP", "⏹ STOP"}:
         state_set("trading_enabled", "0")
-        await tg_send("⏹ New PAPER entries OFF. Data collection and TP monitoring continue.")
+        await tg_send("⏹ New PAPER entries OFF. Existing positions, TP simulation and data collection continue.")
+    elif cmd in {"➕ TP", "TP+", "+TP"}:
+        value = set_take_profit_usdc(take_profit_usdc() + TAKE_PROFIT_STEP_USDC)
+        await tg_send(f"🎯 TAKE PROFIT = +${value:.2f} NET")
+    elif cmd in {"➖ TP", "TP-", "-TP"}:
+        value = set_take_profit_usdc(take_profit_usdc() - TAKE_PROFIT_STEP_USDC)
+        await tg_send(f"🎯 TAKE PROFIT = +${value:.2f} NET")
+    elif cmd in {"🎯 TAKE PROFIT", "TP", "/TP"}:
+        await tg_send(
+            f"🎯 TAKE PROFIT = +${take_profit_usdc():.2f} NET\n"
+            f"Use ➖ TP / ➕ TP (step ${TAKE_PROFIT_STEP_USDC:.2f}) or type e.g. TP 0.90.\n"
+            "Changing TP applies immediately to currently open PAPER positions too."
+        )
+    elif cmd.startswith("TP ") or cmd.startswith("/TP "):
+        part = raw.split(None, 1)[1].strip().replace(",", ".")
+        try:
+            value = float(part)
+        except Exception:
+            await tg_send("TP format: TP 0.90")
+            return
+        if value < TAKE_PROFIT_MIN_USDC or value > TAKE_PROFIT_MAX_USDC:
+            await tg_send(f"TP must be between ${TAKE_PROFIT_MIN_USDC:.2f} and ${TAKE_PROFIT_MAX_USDC:.2f}.")
+            return
+        value = set_take_profit_usdc(value)
+        await tg_send(f"🎯 TAKE PROFIT changed to +${value:.2f} NET")
     elif cmd in {"STATISTICS", "/STATS", "📊 STATISTICS"}:
         await send_statistics()
     elif cmd in {"SOURCES", "🌐 SOURCES"}:
@@ -3431,6 +3642,7 @@ async def telegram_loop():
         f"🤖 {VERSION} online\n"
         f"Assets: {', '.join(SYMBOLS)}\n"
         f"Strategies: {len(STRATEGIES)} PAPER accounts\n"
+        f"TP: +${take_profit_usdc():.2f} NET | exit hold={TP_LIVE_SIM_MIN_HOLD_MS}ms + taker delay={TP_LIVE_SIM_DELAY_MS}ms\n"
         f"Entries: {'ON' if trading_enabled() else 'OFF'}\n"
         f"Sources: Binance={'ON' if ENABLE_BINANCE else 'OFF'}, "
         f"Bybit={'ON' if ENABLE_BYBIT else 'OFF'}, Coinbase={'ON' if ENABLE_COINBASE else 'OFF'}\n"
@@ -3482,7 +3694,7 @@ async def health(request):
         "trading_entries": trading_enabled(),
         "symbols": SYMBOLS,
         "strategies": STRATEGY_CODES,
-        "take_profit_usdc_net": TAKE_PROFIT_USDC,
+        "take_profit_usdc_net": take_profit_usdc(),
         "fast_interval": FAST_INTERVAL,
         "feature_persist_interval": FEATURE_PERSIST_INTERVAL,
         "sources": source_status,
@@ -3518,6 +3730,7 @@ async def main():
         asyncio.create_task(polymarket_ws_loop()),
         asyncio.create_task(fast_lab_loop()),
         asyncio.create_task(prelead_loop()),
+        asyncio.create_task(tp_live_sim_loop()),
         asyncio.create_task(resolution_fallback_loop()),
         asyncio.create_task(report_loop()),
         asyncio.create_task(telegram_loop()),
@@ -3533,7 +3746,7 @@ async def main():
     log.info(
         "%s started | symbols=%s | accounts=%d | fast=%.2fs | lead=%.2fs | persist=%.2fs | TP=%.2f | entries=%s",
         VERSION, ",".join(SYMBOLS), len(STRATEGIES), FAST_INTERVAL, LEAD_INTERVAL,
-        FEATURE_PERSIST_INTERVAL, TAKE_PROFIT_USDC, "ON" if trading_enabled() else "OFF",
+        FEATURE_PERSIST_INTERVAL, take_profit_usdc(), "ON" if trading_enabled() else "OFF",
     )
     try:
         await asyncio.gather(*tasks)
@@ -3541,6 +3754,8 @@ async def main():
         for task in tasks:
             task.cancel()
         for task in list(lead_exec_tasks):
+            task.cancel()
+        for task in list(tp_exec_tasks):
             task.cancel()
         if session:
             await session.close()
