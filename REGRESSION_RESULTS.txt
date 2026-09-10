@@ -1,0 +1,18 @@
+Polymarket UltraFast Wallet CopyBot v1.1 regression results
+Generated: 2026-09-10
+
+PASS: python -m py_compile main.py
+PASS: price/slippage tick math
+PASS: cross-feed RTDS dedupe invariant
+PASS: source USD notional (price*size + usdcSize override)
+PASS: FIXED USD sizing
+PASS: SAME USD 1:1 sizing
+PASS: SAME SHARES 1:1 sizing
+PASS: SCALE % sizing
+PASS: MAX COPY USD cap in all four BUY sizing modes
+PASS: v1.1 SQLite sizing columns/defaults
+PASS: copy-position buy/sell accounting
+PASS: SAME USD copy_trade integration + DB record
+PASS: fake LIVE FAK build/post/fill path
+
+No external network calls were used by regression tests. Real RTDS/CLOB connectivity must be verified on deployment, initially in PAPER/STOP-safe mode.
