@@ -47,7 +47,7 @@ load_dotenv()
 # Telegram confirmation before the mode changes to LIVE.
 # ============================================================
 
-VERSION = "1.1-ultrafast-rtds-copy-sizing"
+VERSION = "1.2-ultrafast-rtds-copy-audit"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -129,10 +129,16 @@ rt_stats = {
     "connected": False,
     "last_message_ms": 0,
     "messages": 0,
+    "matched_wallet_raw_events": 0,
     "matched_wallet_events": 0,
+    "duplicate_events": 0,
     "reconnects": 0,
     "last_error": "",
 }
+
+# Trade-notification queue keeps Telegram completely off the execution hot path
+# while preserving FOUND -> RESULT message order.
+trade_notice_queue: asyncio.Queue = asyncio.Queue(maxsize=2000)
 
 ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 
@@ -1017,6 +1023,111 @@ async def paper_fak(asset, side, shares, limit_price):
 
 
 # ============================================================
+# TRADE AUDIT NOTIFICATIONS
+# ============================================================
+
+def queue_trade_notice(text):
+    if not notify_trades():
+        return
+    try:
+        trade_notice_queue.put_nowait(str(text)[:4090])
+    except asyncio.QueueFull:
+        log.warning("Trade notice queue full; notification dropped")
+
+
+async def trade_notice_loop():
+    while True:
+        text = await trade_notice_queue.get()
+        try:
+            await tg_send(text)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Trade notice send failed")
+        finally:
+            trade_notice_queue.task_done()
+
+
+def compact_tx(payload):
+    tx = str(payload.get("transactionHash") or payload.get("transaction_hash") or "")
+    return f"{tx[:10]}…{tx[-6:]}" if len(tx) > 20 else tx
+
+
+def source_detect_message(wallet, info, payload, source):
+    side = str(payload.get("side") or "").upper()
+    asset = str(payload.get("asset") or payload.get("asset_id") or "")
+    before = shadow_cache.get((wallet, asset))
+    if side == "BUY":
+        if before is not None and sf(before) <= 1e-12:
+            head = "🆕 НОВАЯ ПОЗИЦИЯ НАЙДЕНА"
+        elif before is not None:
+            head = "➕ ДОБОР ПОЗИЦИИ НАЙДЕН"
+        else:
+            head = "🔎 BUY СДЕЛКА НАЙДЕНА"
+    else:
+        head = "➖ SELL ПОЗИЦИИ НАЙДЕН"
+    label = safe_label(info.get("label"), wallet)
+    price = sf(payload.get("price"))
+    size = sf(payload.get("size"))
+    usdc = source_trade_usdc(payload)
+    title = payload.get("title") or payload.get("slug") or asset
+    outcome = payload.get("outcome") or ""
+    tx = compact_tx(payload)
+    fallback = "\n⚠️ Найдено через REST fallback — RTDS не был первым источником этой сделки." if str(source).startswith("rest:") else ""
+    return (
+        f"{head}\n"
+        f"👛 {label} ({short_addr(wallet)})\n"
+        f"{title}\n{outcome}\n"
+        f"Источник: {side} {size:.4f}sh @ {price:.4f} ≈ ${usdc:.2f}\n"
+        f"feed: {source}"
+        + (f" | tx {tx}" if tx else "")
+        + fallback
+    )
+
+
+def human_copy_reason(status, error=""):
+    st = str(status or "").upper()
+    er = str(error or "")
+    if st == "REJECTED_NO_MATCH":
+        return "FAK NO_MATCH: по допустимой цене не нашлось исполняемого объёма; рынок мог уйти быстрее нашего slippage-limit."
+    if st == "PAPER_NO_MATCH":
+        return "PAPER NO_MATCH: в текущем стакане не было объёма по нашей limit-цене или лучше."
+    if st == "PAPER_NO_BOOK":
+        return "Не удалось получить стакан для PAPER-проверки."
+    if st == "PAPER_INSUFFICIENT_CASH":
+        return "Недостаточно PAPER-баланса."
+    if st == "REJECTED_BALANCE_ALLOWANCE":
+        return "Недостаточно balance/allowance для SELL после безопасной повторной попытки."
+    if st == "LIVE_MASTER_OFF":
+        return "LIVE_MASTER_ENABLE=0."
+    if st == "WALLET_NOT_READY":
+        return "LIVE-кошелёк/подпись не готовы."
+    if st == "INVALID_SIZE":
+        return "Размер ордера вне разрешённого диапазона."
+    if st == "REJECTED_LOCAL":
+        return "Ордер не удалось собрать/подписать локально."
+    if st == "AMBIGUOUS" or st == "DELAYED_AMBIGUOUS":
+        return "Ответ после отправки неоднозначен; бот fail-closed и не дублирует ордер вслепую."
+    if st == "REJECTED":
+        return f"CLOB отклонил ордер: {er}" if er else "CLOB отклонил ордер."
+    if st == "SKIPPED":
+        if er == "BOT_STOPPED":
+            return "Сделка источника увидена, но COPY был STOP."
+        if er == "RATE_GUARD":
+            return "Сработала защита от аномально частого потока (>120 source actions/min)."
+        if er == "SELL_COPY_OFF":
+            return "SELL-копирование отключено."
+        if er == "NO_COPIED_POSITION":
+            return "У бота нет своей скопированной позиции для этого SELL."
+        if er == "LIVE_NOT_READY":
+            return "LIVE запрошен, но master/кошелёк не готовы."
+        if er.startswith("ORDER_TOO_SMALL"):
+            return f"Расчётный размер меньше минимального ордера: {er.split(':',1)[-1]}."
+        return er or "Сделка пропущена правилами бота."
+    return er or st or "Причина не определена."
+
+
+# ============================================================
 # WALLET SHADOW / COPY ENGINE
 # ============================================================
 
@@ -1084,19 +1195,29 @@ async def ingest_trade(payload, source="rtds"):
     if not info or not si(info.get("enabled"), 1):
         return
 
+    rt_stats["matched_wallet_raw_events"] += 1
     key = event_key(payload)
     if not hot_seen_add(key):
+        rt_stats["duplicate_events"] += 1
         return
 
     detected_ms = now_ms()
     rt_stats["matched_wallet_events"] += 1
+    # FOUND notification is queued immediately but Telegram is never awaited here,
+    # so it cannot delay signing/submission.
+    queue_trade_notice(source_detect_message(wallet, info, payload, source))
     # Persistence is intentionally off the critical path.
     asyncio.create_task(asyncio.to_thread(persist_seen, key, wallet, source, payload, detected_ms))
 
     if not bot_running():
+        asyncio.create_task(log_skipped(
+            key, wallet, info, payload, source, detected_ms, copy_mode(), copy_usdc(), copy_slippage(), "BOT_STOPPED"
+        ))
         return
     if not wallet_rate_allowed(wallet):
-        asyncio.create_task(tg_send(f"⚠️ RATE GUARD {safe_label(info.get('label'), wallet)}: >120 source actions/min. New copies temporarily skipped."))
+        asyncio.create_task(log_skipped(
+            key, wallet, info, payload, source, detected_ms, copy_mode(), copy_usdc(), copy_slippage(), "RATE_GUARD"
+        ))
         return
 
     asyncio.create_task(copy_trade(key, wallet, info, payload, source, detected_ms))
@@ -1232,30 +1353,41 @@ async def copy_trade(key, wallet, info, payload, source, detected_ms):
 
         if notify_trades():
             label = safe_label(info.get("label"), wallet)
-            icon = "✅" if filled > 0 else "❌"
-            target_line = f"Target {side} {target_size:.4f}sh @ {target_price:.4f} (${source_usdc:.2f})"
+            ambiguous = str(row["status"]).upper() in {"AMBIGUOUS", "DELAYED_AMBIGUOUS"}
+            full_fill = filled > 1e-12 and filled + 1e-9 >= requested
+            if full_fill:
+                head = "✅ ПОЗИЦИЯ ИСПОЛНЕНА"
+            elif filled > 1e-12:
+                head = "⚠️ ПОЗИЦИЯ ЧАСТИЧНО ИСПОЛНЕНА"
+            elif ambiguous:
+                head = "⚠️ РЕЗУЛЬТАТ ОРДЕРА НЕОДНОЗНАЧЕН"
+            else:
+                head = "❌ ПОЗИЦИЯ НЕ ИСПОЛНЕНА"
+            target_line = f"Источник {side} {target_size:.4f}sh @ {target_price:.4f} (${source_usdc:.2f})"
             if side == "BUY":
-                sizing_line = f"Size {size_mode}" + (f" {scale_pct:.0f}%" if size_mode == "SCALE" else "")
-                sizing_line += f" | planned <=${planned_usdc:.2f}" + (" | MAX cap" if size_capped else "")
+                sizing_line = f"Размер {size_mode}" + (f" {scale_pct:.0f}%" if size_mode == "SCALE" else "")
+                sizing_line += f" | план <=${planned_usdc:.2f}" + (" | MAX cap" if size_capped else "")
             else:
                 sizing_line = f"SELL {smode}"
             if filled > 0:
-                our_line = f"Copy {filled:.4f}sh @ {avg:.4f} (${gross:.2f}) | limit {limit_price:.4f}"
+                our_line = f"Наш fill {filled:.4f}/{requested:.4f}sh @ {avg:.4f} (${gross:.2f}) | limit {limit_price:.4f}"
             else:
-                our_line = f"No fill | limit {limit_price:.4f} | {row['status']}"
+                our_line = f"Fill 0/{requested:.4f}sh | limit {limit_price:.4f} | {row['status']}"
             latency = []
             if row.get("detect_to_submit_ms") is not None:
                 latency.append(f"detect→submit {si(row['detect_to_submit_ms'])}ms")
             if row.get("api_ms") is not None:
                 latency.append(f"API {si(row['api_ms'])}ms")
-            asyncio.create_task(tg_send(
-                f"{icon} COPY {label}\n"
+            reason = "" if filled > 0 else "\nПричина: " + human_copy_reason(row["status"], row["error"])
+            queue_trade_notice(
+                f"{head}\n"
+                f"👛 {label}\n"
                 f"{payload.get('title') or payload.get('slug') or asset}\n"
                 f"{payload.get('outcome') or ''}\n"
-                f"{target_line}\n{sizing_line}\n{our_line}\n"
+                f"{target_line}\n{sizing_line}\n{our_line}{reason}\n"
                 f"mode {mode} | source {source}"
                 + (f"\n⏱ {' | '.join(latency)}" if latency else "")
-            ))
+            )
 
 
 def base_order_row(key, wallet, info, payload, source, detected_ms, mode, amount, slip):
@@ -1307,10 +1439,14 @@ async def log_skipped(key, wallet, info, payload, source, detected_ms, mode, amo
     })
     await asyncio.to_thread(record_order, row)
     if notify_trades():
-        asyncio.create_task(tg_send(
-            f"⏭ COPY SKIPPED {safe_label(info.get('label'), wallet)}\n"
-            f"{payload.get('side')} {payload.get('outcome') or ''} @ {sf(payload.get('price')):.4f}\n{reason}"
-        ))
+        queue_trade_notice(
+            f"❌ ПОЗИЦИЯ НЕ ИСПОЛНЕНА\n"
+            f"👛 {safe_label(info.get('label'), wallet)}\n"
+            f"{payload.get('title') or payload.get('slug') or payload.get('asset') or ''}\n"
+            f"{payload.get('side')} {payload.get('outcome') or ''} {sf(payload.get('size')):.4f}sh @ {sf(payload.get('price')):.4f}\n"
+            f"Причина: {human_copy_reason('SKIPPED', reason)}\n"
+            f"source {source}"
+        )
 
 
 # ============================================================
@@ -1493,7 +1629,7 @@ def status_text():
         + (f" | fixed ${copy_usdc():.2f}" if copy_size_mode() == "FIXED" else "")
         + f" | MAX ${max_copy_usdc():.2f}\n"
         f"Slippage: {copy_slippage():.3f} | SELL: {sell_mode()} | Wallets: {len(watched_wallets)}/{MAX_WALLETS}\n"
-        f"RTDS: {'CONNECTED' if rt_stats['connected'] else 'DISCONNECTED'} | matched events {rt_stats['matched_wallet_events']}\n"
+        f"RTDS: {'CONNECTED' if rt_stats['connected'] else 'DISCONNECTED'} | unique {rt_stats['matched_wallet_events']} | raw {rt_stats['matched_wallet_raw_events']} | dup {rt_stats['duplicate_events']}\n"
         f"LIVE master: {'ON' if LIVE_MASTER_ENABLE else 'OFF'} | wallet {live}"
     )
 
@@ -1619,6 +1755,10 @@ def wallet_report_text(wallet):
     skipped = sum(1 for r in orders if r["status"] == "SKIPPED")
     rejected = sum(1 for r in orders if sf(r["filled_shares"]) <= 0 and r["status"] not in {"SKIPPED"})
     capped_buys = sum(1 for r in orders if r["target_side"] == "BUY" and si(r["size_capped"]) == 1)
+    rtds_events = sum(1 for r in orders if str(r["source"] or "").startswith("rtds:"))
+    rest_events = sum(1 for r in orders if str(r["source"] or "").startswith("rest:"))
+    stopped_seen = sum(1 for r in orders if r["status"] == "SKIPPED" and str(r["error"] or "") == "BOT_STOPPED")
+    last_event_ms = max((si(r["created_ms"]) for r in orders), default=0)
     lat_submit = [r["detect_to_submit_ms"] for r in orders if r["detect_to_submit_ms"] is not None and r["mode"] == "LIVE"]
     api = [r["api_ms"] for r in orders if r["api_ms"] is not None and r["mode"] == "LIVE"]
     with db() as conn:
@@ -1632,9 +1772,12 @@ def wallet_report_text(wallet):
         wallet,
         f"Events/orders: {total} | fills {len(filled_rows)} | BUY {len(buys)} | SELL {len(sells)}",
         f"Skipped {skipped} | no-fill/rejected {rejected} | MAX-capped BUY {capped_buys}",
+        f"Feed audit: RTDS {rtds_events} | REST fallback {rest_events} | seen while STOP {stopped_seen}",
         f"Current sizing: {copy_size_mode()}" + (f" {copy_scale_pct():.0f}%" if copy_size_mode() == "SCALE" else "") + f" | MAX ${max_copy_usdc():.2f}",
         f"Tracked realized GROSS PnL: PAPER {pnl.get('PAPER',0):+.2f} | LIVE {pnl.get('LIVE',0):+.2f}",
     ]
+    if last_event_ms:
+        lines.append(f"Last detected/copy decision: {utc_iso(last_event_ms / 1000.0)}")
     if lat_submit:
         lines.append(
             f"LIVE detect→submit: avg {sum(lat_submit)/len(lat_submit):.0f}ms | p50 {percentile(lat_submit,.5):.0f} | p95 {percentile(lat_submit,.95):.0f}"
@@ -1984,6 +2127,7 @@ async def main():
         asyncio.create_task(rtds_loop(), name="rtds"),
         asyncio.create_task(rest_fallback_loop(), name="rest-fallback"),
         asyncio.create_task(telegram_loop(), name="telegram"),
+        asyncio.create_task(trade_notice_loop(), name="trade-notices"),
         asyncio.create_task(prewarm_loop(), name="prewarm"),
         asyncio.create_task(seed_all_wallet_shadows(), name="seed-shadows"),
     ]

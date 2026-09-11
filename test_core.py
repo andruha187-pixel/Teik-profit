@@ -185,6 +185,25 @@ def test_fake_live_fak():
     asyncio.run(go())
 
 
+
+def test_audit_messages_and_reasons():
+    wallet = '0x' + '2' * 40
+    info = {'label': 'Watcher'}
+    payload = {
+        'proxyWallet': wallet, 'transactionHash': '0xabcdef1234567890abcdef1234567890',
+        'asset': 'asset-audit', 'side': 'BUY', 'price': 0.54, 'size': 10,
+        'title': 'Audit market', 'outcome': 'YES',
+    }
+    bot.shadow_cache[(wallet, 'asset-audit')] = 0.0
+    msg = bot.source_detect_message(wallet, info, payload, 'rtds:trades')
+    assert 'НОВАЯ ПОЗИЦИЯ НАЙДЕНА' in msg
+    assert 'rtds:trades' in msg
+    msg2 = bot.source_detect_message(wallet, info, payload, 'rest:fallback')
+    assert 'REST fallback' in msg2
+    assert 'NO_MATCH' in bot.human_copy_reason('REJECTED_NO_MATCH', '')
+    assert 'STOP' in bot.human_copy_reason('SKIPPED', 'BOT_STOPPED')
+
+
 if __name__ == '__main__':
     test_price_math()
     test_cross_feed_dedupe()
@@ -194,4 +213,5 @@ if __name__ == '__main__':
     test_db_position_accounting_and_v11_schema()
     test_copy_trade_same_usd_integration()
     test_fake_live_fak()
-    print('PASS: v1.1 core regression tests')
+    test_audit_messages_and_reasons()
+    print('PASS: v1.2 core regression tests')

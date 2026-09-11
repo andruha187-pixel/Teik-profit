@@ -1,18 +1,23 @@
-Polymarket UltraFast Wallet CopyBot v1.1 regression results
-Generated: 2026-09-10
+Polymarket UltraFast CopyBot v1.2 — regression results
 
 PASS: python -m py_compile main.py
-PASS: price/slippage tick math
-PASS: cross-feed RTDS dedupe invariant
-PASS: source USD notional (price*size + usdcSize override)
-PASS: FIXED USD sizing
-PASS: SAME USD 1:1 sizing
-PASS: SAME SHARES 1:1 sizing
-PASS: SCALE % sizing
-PASS: MAX COPY USD cap in all four BUY sizing modes
-PASS: v1.1 SQLite sizing columns/defaults
-PASS: copy-position buy/sell accounting
-PASS: SAME USD copy_trade integration + DB record
-PASS: fake LIVE FAK build/post/fill path
+PASS: test_core.py
 
-No external network calls were used by regression tests. Real RTDS/CLOB connectivity must be verified on deployment, initially in PAPER/STOP-safe mode.
+Covered:
+- price/tick/slippage math
+- RTDS cross-feed transaction dedupe
+- source USD notional
+- FIXED / SAME_USD / SAME_SHARES / SCALE sizing
+- MAX COPY caps
+- SQLite copy-position accounting and v1.1 schema compatibility
+- SAME USD copy integration
+- fake LIVE signed FAK path
+- v1.2 source FOUND notification text
+- REST fallback audit warning text
+- human-readable NO_MATCH / BOT_STOPPED reasons
+
+Runtime safety retained:
+- fresh process = STOP
+- LIVE requires master + Telegram confirmation + START
+- Telegram notifications are queued off the execution hot path
+- ambiguous post-submit results remain fail-closed

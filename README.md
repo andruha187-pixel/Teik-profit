@@ -1,4 +1,24 @@
-# Polymarket UltraFast Wallet CopyBot v1.1
+# Polymarket UltraFast Wallet CopyBot v1.2
+
+
+## What changed in v1.2 — source visibility / missed-trade audit
+
+v1.2 adds a two-stage Telegram audit for every **unique watched-wallet trade that the bot actually sees**:
+
+1. `🆕 НОВАЯ ПОЗИЦИЯ НАЙДЕНА` / `➕ ДОБОР ПОЗИЦИИ НАЙДЕН` / `➖ SELL ПОЗИЦИИ НАЙДЕН` is queued immediately when the source event is accepted. Telegram is intentionally kept off the order hot path.
+2. A second message reports the copy result: `✅ ПОЗИЦИЯ ИСПОЛНЕНА`, `⚠️ ЧАСТИЧНО ИСПОЛНЕНА`, `❌ ПОЗИЦИЯ НЕ ИСПОЛНЕНА`, or `⚠️ РЕЗУЛЬТАТ ОРДЕРА НЕОДНОЗНАЧЕН`.
+
+A failed/skipped copy includes a human-readable reason such as FAK `NO_MATCH`, no visible PAPER liquidity, order below minimum size, bot STOP, LIVE wallet not ready, SELL copy disabled, no copied position, balance/allowance failure, or an ambiguous API/transport result.
+
+If the primary RTDS stream did not win the race and the REST fallback discovers the trade, the FOUND message explicitly says:
+
+`⚠️ Найдено через REST fallback — RTDS не был первым источником этой сделки.`
+
+STATUS now shows `unique / raw / dup` watched-wallet event counters. Per-wallet REPORT shows how many decisions came from RTDS versus REST fallback and how many source trades were seen while the bot was STOPPED. Source trades seen while STOP are now persisted as `SKIPPED / BOT_STOPPED` instead of disappearing silently.
+
+The FOUND and RESULT notices are sent through a single FIFO notification queue. This preserves their order without waiting on Telegram before signing/submitting the copy order.
+
+The original cross-feed dedupe protection is intentionally retained unchanged so two RTDS representations of the same transaction cannot create duplicate real orders.
 
 ## What changed in v1.1
 
@@ -64,7 +84,7 @@ If `MAX COPY = $20`, each of those modes is clipped so the BUY cannot be sized a
 - Unknown errors after POST begins are fail-closed (`AMBIGUOUS`) and are not blindly retried.
 - Deterministic FAK NO_MATCH may receive one retry at the exact same slippage cap.
 - SELL balance/allowance rejection may receive one delayed retry.
-- Per-wallet reports show bot-tracked gross realized PnL and latency. v1.1 also tracks whether BUYs were clipped by MAX COPY.
+- Per-wallet reports show bot-tracked gross realized PnL and latency. v1.2 also tracks whether BUYs were clipped by MAX COPY and adds RTDS/REST feed-audit counters.
 
 ## Coolify
 
