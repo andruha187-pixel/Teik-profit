@@ -1,6 +1,6 @@
-# UltraFast CopyBot v2.1 — wallet-feed audit fix
+# UltraFast CopyBot v2.2 — wallet-feed audit fix
 
-**Important v2.1 fix:** v2.0 could silently miss a wallet trade when RTDS did not deliver it first and the Data API exposed the trade more than 4 seconds after the trade timestamp. The old REST fallback used timestamp age as a discovery gate. v2.1 primes existing history once, then treats any newly appearing event key as a new event. Timestamp age now only controls whether a late REST event is still safe to COPY. It is always audited/notified within the audit lookback.
+**Important v2.2 fix:** v2.0 could silently miss a wallet trade when RTDS did not deliver it first and the Data API exposed the trade more than 4 seconds after the trade timestamp. The old REST fallback used timestamp age as a discovery gate. v2.2 primes existing history once, then treats any newly appearing event key as a new event. Timestamp age now only controls whether a late REST event is still safe to COPY. It is always audited/notified within the audit lookback.
 
 Additional feed hardening:
 - resolves any entered user/profile address through `/public-profile` to the canonical `proxyWallet`;
@@ -171,3 +171,10 @@ PAPER_START_BALANCE=500
 After the first launch these BUY sizing values can be changed with Telegram buttons and are persisted in SQLite.
 
 For real copying: set `LIVE_MASTER_ENABLE=1`, redeploy, use MODE -> LIVE -> CONFIRM LIVE, then START.
+
+
+## v2.2 shadow inventory fix
+
+- Current-position seeding now counts only positive non-redeemable sizes.
+- A successful refresh clears stale target-shadow rows before reseeding.
+- Closed/zero-size positions are no longer reported as open assets.

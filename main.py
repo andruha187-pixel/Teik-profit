@@ -47,7 +47,7 @@ load_dotenv()
 # Telegram confirmation before the mode changes to LIVE.
 # ============================================================
 
-VERSION = "2.1-ultrafast-wallet-feed-audit"
+VERSION = "2.2-ultrafast-wallet-feed-audit"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -625,6 +625,22 @@ def _shadow_persist(wallet, asset, shares, updated):
             conn.commit()
     except Exception:
         log.exception("shadow persist failed")
+
+
+def shadow_reset_wallet(wallet):
+    """Clear every cached/persisted source-position shadow for one wallet."""
+    wallet = normalize_address(wallet)
+    if not wallet:
+        return
+    stale = [key for key in list(shadow_cache) if key[0] == wallet]
+    for key in stale:
+        shadow_cache.pop(key, None)
+    try:
+        with db() as conn:
+            conn.execute("DELETE FROM target_shadow WHERE wallet=?", (wallet,))
+            conn.commit()
+    except Exception:
+        log.exception("shadow reset failed %s", wallet)
 
 
 def shadow_set(wallet, asset, shares):
@@ -1554,22 +1570,38 @@ def human_copy_reason(status, error=""):
 # ============================================================
 
 async def warm_target_positions(wallet):
-    """Seed target inventory for proportional SELL copying. Existing target
-    positions are NOT copied; they are only used as the denominator for exits."""
+    """Replace the target-wallet shadow with CURRENT positive inventory only.
+
+    Existing target positions are never copied.  The shadow is used solely as
+    the denominator for proportional future SELL copying.  A successful refresh
+    is authoritative: stale assets from an earlier run are cleared first, and
+    zero-size/redeemable rows are not counted as open inventory.
+    """
     data = await get_json(
         f"{DATA_API}/positions",
-        params={"user": wallet, "limit": 500, "sizeThreshold": 0},
+        params={
+            "user": wallet,
+            "limit": 500,
+            "sizeThreshold": 0,
+            "redeemable": "false",
+        },
         timeout=10,
     )
     if not isinstance(data, list):
         return 0
+
+    # Only clear the previous shadow AFTER a successful API response.  This
+    # prevents a transient API failure from erasing useful state.
+    shadow_reset_wallet(wallet)
+
     count = 0
     for p in data:
         asset = str(p.get("asset") or "")
         sh = max(0.0, sf(p.get("size")))
-        if asset:
-            shadow_set(wallet, asset, sh)
-            count += 1
+        if not asset or sh <= 1e-6 or bool(p.get("redeemable")):
+            continue
+        shadow_set(wallet, asset, sh)
+        count += 1
     return count
 
 
@@ -2557,7 +2589,7 @@ async def handle_text(text):
 
 async def _warm_wallet_notify(addr, label):
     n = await warm_target_positions(addr)
-    await tg_send(f"👛 {label}: target inventory seeded for {n} open assets. Only NEW trades are eligible for copying.")
+    await tg_send(f"👛 {label}: target inventory seeded for {n} active assets. Only NEW trades are eligible for copying.")
 
 
 async def telegram_loop():
