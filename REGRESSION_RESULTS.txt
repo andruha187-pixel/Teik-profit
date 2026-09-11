@@ -1,23 +1,24 @@
-Polymarket UltraFast CopyBot v1.2 — regression results
+UltraFast CopyBot v2.1 regression results
+Date: 2026-09-11
 
-PASS: python -m py_compile main.py
 PASS: test_core.py
+- price/slippage Decimal math
+- cross-feed dedupe
+- SAME USD / SAME SHARES / SCALE / MAX COPY
+- SQLite/accounting
+- LIVE FAK safety paths
 
-Covered:
-- price/tick/slippage math
-- RTDS cross-feed transaction dedupe
-- source USD notional
-- FIXED / SAME_USD / SAME_SHARES / SCALE sizing
-- MAX COPY caps
-- SQLite copy-position accounting and v1.1 schema compatibility
-- SAME USD copy integration
-- fake LIVE signed FAK path
-- v1.2 source FOUND notification text
-- REST fallback audit warning text
-- human-readable NO_MATCH / BOT_STOPPED reasons
+PASS: test_v2_fastlane.py
+- BTC15 current/next market discovery
+- warm UP/DOWN assets
+- local signer prewarm
+- fast-lane metadata/book path
 
-Runtime safety retained:
-- fresh process = STOP
-- LIVE requires master + Telegram confirmation + START
-- Telegram notifications are queued off the execution hot path
-- ambiguous post-submit results remain fail-closed
+PASS: test_v2_1_feed.py
+- mixed-case address normalization
+- public-profile -> canonical proxyWallet resolution
+- REST trade first appearing ~10s after exchange timestamp is still detected/copy-eligible
+- very-late REST event is surfaced/audited but not copied blindly
+
+Critical fixed regression from v2.0:
+REST fallback no longer discards a newly appearing trade solely because its exchange timestamp is older than 4 seconds.

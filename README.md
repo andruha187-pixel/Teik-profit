@@ -1,3 +1,61 @@
+# UltraFast CopyBot v2.1 — wallet-feed audit fix
+
+**Important v2.1 fix:** v2.0 could silently miss a wallet trade when RTDS did not deliver it first and the Data API exposed the trade more than 4 seconds after the trade timestamp. The old REST fallback used timestamp age as a discovery gate. v2.1 primes existing history once, then treats any newly appearing event key as a new event. Timestamp age now only controls whether a late REST event is still safe to COPY. It is always audited/notified within the audit lookback.
+
+Additional feed hardening:
+- resolves any entered user/profile address through `/public-profile` to the canonical `proxyWallet`;
+- polls `/trades` every 0.5s by default;
+- independently audits `/activity?type=TRADE` every 1s;
+- late REST events are reported with an explicit `REST_LATE` reason instead of disappearing;
+- STATUS shows REST poll/error/late counters.
+
+
+## What v2.0 adds
+
+This version keeps all v1.2 wallet-copy controls and audit messages, but adds a dedicated **BTC 15-minute acceleration lane**. It does **not** pre-copy or predict the watched wallet. No order is posted until a watched-wallet BUY/SELL event is actually detected.
+
+Before that event arrives, the bot continuously prepares the deterministic `btc-updown-15m-<slot>` markets:
+
+- discovers the **current and next** 15-minute BTC windows;
+- keeps both current `UP` and `DOWN` CLOB token books live over the Polymarket market WebSocket (and preloads the next window for rollover);
+- keeps the authenticated client transport warm;
+- runs `create_limit_order()` locally once for each discovered outcome token to warm token/market metadata and the signer path, then discards the signed object **without posting it**;
+- keeps all sizing, watched-wallet filtering and slippage math in memory;
+- on the real watched-wallet event, goes directly to build/sign -> FAK submit with **no REST book/discovery request in front of the LIVE order**.
+
+The exact copy order itself cannot be safely pre-signed ahead of the watched-wallet event because its side, source price and copied size/slippage limit are not known yet. v2.0 therefore warms the expensive/cold dependencies but creates a fresh signed FAK only after the real source event is seen.
+
+### Latency audit
+
+For BTC15 source events, Telegram result messages now include:
+
+`🚀 BTC15 FAST LANE | book fresh ...ms | signer WARM/COLD`
+
+LIVE results also measure `detect→submit` with a high-resolution monotonic clock, so sub-millisecond/millisecond differences are visible rather than rounded away by the old integer millisecond timer. SQLite stores `detect_to_submit_us`, `build_sign_us`, fast-lane book age/price and signer-warm status for later reports.
+
+`STATUS` shows BTC15 market-WS connectivity, number of prepared assets, warmed signer assets and fast-lane hits. `/health` exposes the same diagnostics.
+
+### Important limitation
+
+The fast lane removes **our own** avoidable work after detection; it does not create a guaranteed 250 ms advance notice of another wallet's taker order. If Polymarket only exposes the wallet identity at/after the match event, v2.0 reacts at the first event it can see. There is deliberately **no PRE-COPY** mode in this build.
+
+### Recommended variables for the accelerator
+
+```text
+BTC15_FASTLANE_ENABLE=1
+BTC15_SLUG_PREFIX=btc-updown-15m
+BTC15_DISCOVERY_INTERVAL_SEC=2
+BTC15_BOOK_MAX_AGE_MS=1500
+BTC15_SIGNER_PREWARM_ENABLE=1
+BTC15_SIGNER_PREWARM_SIZE=5
+BTC15_SIGNER_PREWARM_PRICE=0.50
+BTC15_WS_MAX_AGE_SEC=240
+```
+
+All existing v1.2 Telegram controls remain unchanged: wallet add/remove, START/STOP, FIXED/SAME USD/SAME SHARES/SCALE, MAX COPY, slippage, SELL mode, PAPER/LIVE, balance and per-wallet reports.
+
+---
+
 # Polymarket UltraFast Wallet CopyBot v1.2
 
 

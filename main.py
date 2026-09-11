@@ -47,7 +47,7 @@ load_dotenv()
 # Telegram confirmation before the mode changes to LIVE.
 # ============================================================
 
-VERSION = "1.2-ultrafast-rtds-copy-audit"
+VERSION = "2.1-ultrafast-wallet-feed-audit"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -68,6 +68,8 @@ DB_PATH = DATA_DIR / "ultrafast_copybot.db"
 RTDS_URL = os.getenv("RTDS_URL", "wss://ws-live-data.polymarket.com").strip()
 DATA_API = "https://data-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
+GAMMA_API = "https://gamma-api.polymarket.com"
+MARKET_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 POLYMARKET_PRIVATE_KEY = os.getenv("POLYMARKET_PRIVATE_KEY", "").strip()
 POLYMARKET_WALLET_ADDRESS = os.getenv("POLYMARKET_WALLET_ADDRESS", "").strip()
@@ -88,8 +90,13 @@ MAX_ORDER_SHARES = float(os.getenv("MAX_ORDER_SHARES", "10000"))
 LIVE_PRICE_TICK_FALLBACK = float(os.getenv("LIVE_PRICE_TICK_FALLBACK", "0.01"))
 
 REST_FALLBACK_ENABLE = os.getenv("REST_FALLBACK_ENABLE", "1").strip().lower() in {"1", "true", "yes", "on"}
-REST_FALLBACK_INTERVAL = max(0.5, float(os.getenv("REST_FALLBACK_INTERVAL", "1.0")))
-REST_MAX_COPY_AGE_SEC = max(1.0, float(os.getenv("REST_MAX_COPY_AGE_SEC", "4")))
+REST_FALLBACK_INTERVAL = max(0.25, float(os.getenv("REST_FALLBACK_INTERVAL", "0.5")))
+# A new record is considered NEW by event-key appearance, not by its exchange timestamp.
+# Timestamp age only decides whether a late REST discovery is still safe to copy.
+REST_MAX_COPY_AGE_SEC = max(1.0, float(os.getenv("REST_MAX_COPY_AGE_SEC", "30")))
+REST_AUDIT_LOOKBACK_SEC = max(REST_MAX_COPY_AGE_SEC, float(os.getenv("REST_AUDIT_LOOKBACK_SEC", "300")))
+REST_ACTIVITY_ENABLE = os.getenv("REST_ACTIVITY_ENABLE", "1").strip().lower() in {"1", "true", "yes", "on"}
+REST_ACTIVITY_INTERVAL = max(0.5, float(os.getenv("REST_ACTIVITY_INTERVAL", "1.0")))
 MAX_WALLETS = max(1, min(50, int(os.getenv("MAX_WALLETS", "20"))))
 SEEN_CACHE_SIZE = max(1000, int(os.getenv("SEEN_CACHE_SIZE", "20000")))
 
@@ -100,6 +107,18 @@ LIVE_NO_MATCH_RETRY_DELAY_MS = max(0, int(os.getenv("LIVE_NO_MATCH_RETRY_DELAY_M
 LIVE_SELL_BALANCE_RETRY_MS = max(100, int(os.getenv("LIVE_SELL_BALANCE_RETRY_MS", "600")))
 
 TELEGRAM_NOTIFY_TRADES_DEFAULT = os.getenv("TELEGRAM_NOTIFY_TRADES", "1").strip().lower() in {"1", "true", "yes", "on"}
+
+# BTC 15-minute acceleration. This is NOT pre-copy: no order is posted until a
+# watched-wallet trade is actually detected. We only keep current/next BTC15
+# outcome tokens, market books, authenticated transport and local signer path warm.
+BTC15_FASTLANE_ENABLE = os.getenv("BTC15_FASTLANE_ENABLE", "1").strip().lower() in {"1", "true", "yes", "on"}
+BTC15_SLUG_PREFIX = os.getenv("BTC15_SLUG_PREFIX", "btc-updown-15m").strip().lower()
+BTC15_DISCOVERY_INTERVAL_SEC = max(0.5, float(os.getenv("BTC15_DISCOVERY_INTERVAL_SEC", "2")))
+BTC15_BOOK_MAX_AGE_MS = max(50, int(os.getenv("BTC15_BOOK_MAX_AGE_MS", "1500")))
+BTC15_SIGNER_PREWARM_ENABLE = os.getenv("BTC15_SIGNER_PREWARM_ENABLE", "1").strip().lower() in {"1", "true", "yes", "on"}
+BTC15_SIGNER_PREWARM_SIZE = max(MIN_ORDER_SHARES, float(os.getenv("BTC15_SIGNER_PREWARM_SIZE", "5")))
+BTC15_SIGNER_PREWARM_PRICE = min(0.95, max(0.05, float(os.getenv("BTC15_SIGNER_PREWARM_PRICE", "0.50"))))
+BTC15_WS_MAX_AGE_SEC = max(30, int(os.getenv("BTC15_WS_MAX_AGE_SEC", "240")))
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -134,11 +153,38 @@ rt_stats = {
     "duplicate_events": 0,
     "reconnects": 0,
     "last_error": "",
+    "invalid_messages": 0,
+}
+
+feed_stats = {
+    "rest_trades_last_ms": 0,
+    "rest_trades_polls": 0,
+    "rest_trades_errors": 0,
+    "rest_activity_last_ms": 0,
+    "rest_activity_polls": 0,
+    "rest_activity_errors": 0,
+    "rest_late_detected": 0,
 }
 
 # Trade-notification queue keeps Telegram completely off the execution hot path
 # while preserving FOUND -> RESULT message order.
 trade_notice_queue: asyncio.Queue = asyncio.Queue(maxsize=2000)
+
+# BTC15 fast-lane hot state. Nothing here is required for correctness of generic
+# copy trading; it only removes discovery/book/signer cold-start work for BTC15.
+btc15_markets = {}          # condition_id -> market dict
+btc15_asset_meta = {}       # token_id -> market/outcome metadata
+btc15_books = {}            # token_id -> {bids,asks,received_ms,tick_size}
+btc15_assets = set()
+btc15_ws_send_queue: asyncio.Queue = asyncio.Queue()
+btc15_prewarm_lock = asyncio.Lock()
+btc15_signer_warmed = set()
+btc15_signer_warm_ms = {}
+btc15_stats = {
+    "ws_connected": False, "ws_messages": 0, "ws_reconnects": 0,
+    "discovered_markets": 0, "warmed_assets": 0, "fastlane_events": 0,
+    "last_error": "", "last_book_ms": 0,
+}
 
 ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 
@@ -177,6 +223,33 @@ def clamp(v, lo, hi):
 
 def jd(v):
     return json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+
+
+def parse_jsonish(v):
+    if isinstance(v, list):
+        return v
+    if v is None:
+        return []
+    try:
+        x = json.loads(v)
+        return x if isinstance(x, list) else []
+    except Exception:
+        return []
+
+
+def level_map(rows):
+    out = {}
+    for row in rows or []:
+        if isinstance(row, dict):
+            price = sf(row.get("price") if row.get("price") is not None else row.get("price_level"), math.nan)
+            size = sf(row.get("size") if row.get("size") is not None else row.get("new_quantity"), 0)
+        elif isinstance(row, (list, tuple)) and len(row) >= 2:
+            price, size = sf(row[0], math.nan), sf(row[1], 0)
+        else:
+            continue
+        if not math.isnan(price) and size > 0:
+            out[price] = size
+    return out
 
 
 def normalize_address(v):
@@ -373,7 +446,13 @@ def init_db():
             requested_shares REAL,
             limit_price REAL,
             build_sign_ms INTEGER,
+            build_sign_us REAL,
             detect_to_submit_ms INTEGER,
+            detect_to_submit_us REAL,
+            fast_lane INTEGER NOT NULL DEFAULT 0,
+            fast_book_age_ms INTEGER,
+            fast_book_price REAL,
+            fast_signer_warm INTEGER NOT NULL DEFAULT 0,
             api_ms INTEGER,
             total_reaction_ms INTEGER,
             status TEXT NOT NULL,
@@ -397,6 +476,12 @@ def init_db():
             "scale_pct": "REAL",
             "max_copy_usdc": "REAL",
             "size_capped": "INTEGER NOT NULL DEFAULT 0",
+            "build_sign_us": "REAL",
+            "detect_to_submit_us": "REAL",
+            "fast_lane": "INTEGER NOT NULL DEFAULT 0",
+            "fast_book_age_ms": "INTEGER",
+            "fast_book_price": "REAL",
+            "fast_signer_warm": "INTEGER NOT NULL DEFAULT 0",
         }.items():
             if col not in existing_cols:
                 conn.execute(f"ALTER TABLE copy_orders ADD COLUMN {col} {ddl}")
@@ -643,8 +728,8 @@ def record_order(row):
         "event_key","wallet","wallet_label","source","detected_ms","target_timestamp","target_tx_hash",
         "condition_id","asset","title","slug","outcome","target_side","target_price","target_size",
         "mode","copy_amount_usdc","size_mode","source_amount_usdc","scale_pct","max_copy_usdc","size_capped",
-        "slippage","requested_shares","limit_price","build_sign_ms",
-        "detect_to_submit_ms","api_ms","total_reaction_ms","status","filled_shares","avg_price",
+        "slippage","requested_shares","limit_price","build_sign_ms","build_sign_us",
+        "detect_to_submit_ms","detect_to_submit_us","fast_lane","fast_book_age_ms","fast_book_price","fast_signer_warm","api_ms","total_reaction_ms","status","filled_shares","avg_price",
         "gross_amount","fee_estimate","order_id","response_json","error","created_ms",
     ]
     vals = [row.get(c) for c in cols]
@@ -668,6 +753,20 @@ async def get_json(url, params=None, timeout=8):
             return await r.json(content_type=None)
     except Exception:
         return None
+
+
+async def resolve_proxy_wallet(address):
+    """Resolve either a profile/user address or proxy address to canonical proxyWallet."""
+    addr = normalize_address(address)
+    if not addr:
+        return "", ""
+    data = await get_json(f"{GAMMA_API}/public-profile", params={"address": addr}, timeout=4)
+    if isinstance(data, dict):
+        proxy = normalize_address(data.get("proxyWallet"))
+        name = str(data.get("name") or data.get("pseudonym") or "").strip()
+        if proxy:
+            return proxy, name[:40]
+    return addr, ""
 
 
 async def init_live_client():
@@ -817,7 +916,7 @@ def buy_copy_sizing(target_price, target_size, limit_price, size_mode=None, fixe
     return requested, planned_usdc, source_usdc, mode, capped
 
 
-async def submit_live_fak(asset, side, shares, limit_price, detected_ms):
+async def submit_live_fak(asset, side, shares, limit_price, detected_ms, detected_perf_ns=None):
     """Fast CLOB FAK. No REST orderbook round-trip before the first submission."""
     if not LIVE_MASTER_ENABLE:
         return {"ok": False, "status": "LIVE_MASTER_OFF", "filled": 0.0, "error": "LIVE_MASTER_ENABLE=0"}
@@ -832,6 +931,7 @@ async def submit_live_fak(asset, side, shares, limit_price, detected_ms):
     size_str = format(Decimal(str(round(shares, 4))), "f")
 
     build_start = now_ms()
+    build_start_ns = time.perf_counter_ns()
     try:
         signed = await live_client.create_limit_order(
             token_id=str(asset),
@@ -845,11 +945,12 @@ async def submit_live_fak(asset, side, shares, limit_price, detected_ms):
         return {
             "ok": False, "status": "REJECTED_LOCAL", "filled": 0.0,
             "error": f"{type(e).__name__}: {e}",
-            "build_sign_ms": now_ms() - build_start,
+            "build_sign_ms": now_ms() - build_start, "build_sign_us": (time.perf_counter_ns() - build_start_ns) / 1000.0,
             "detect_to_submit_ms": None, "api_ms": None,
         }
 
     build_end = now_ms()
+    build_sign_us = (time.perf_counter_ns() - build_start_ns) / 1000.0
     attempts = 0
     last = None
     while attempts <= LIVE_NO_MATCH_RETRIES:
@@ -857,6 +958,7 @@ async def submit_live_fak(asset, side, shares, limit_price, detected_ms):
             await asyncio.sleep(LIVE_NO_MATCH_RETRY_DELAY_MS / 1000.0)
             # New nonce/order hash for deterministic FAK retry.
             build_start_retry = now_ms()
+            build_start_retry_ns = time.perf_counter_ns()
             try:
                 signed = await live_client.create_limit_order(
                     token_id=str(asset), price=limit_str, size=size_str, side=side, post_only=False,
@@ -864,15 +966,19 @@ async def submit_live_fak(asset, side, shares, limit_price, detected_ms):
                 fak_order = replace(signed, order_type="FAK", post_only=False)
                 build_end = now_ms()
                 build_start = build_start_retry
+                build_sign_us = (time.perf_counter_ns() - build_start_retry_ns) / 1000.0
             except Exception as e:
                 return {
                     "ok": False, "status": "REJECTED_LOCAL", "filled": 0.0,
                     "error": f"{type(e).__name__}: {e}",
-                    "build_sign_ms": build_end - build_start,
-                    "detect_to_submit_ms": None, "api_ms": None,
+                    "build_sign_ms": now_ms() - build_start_retry,
+                    "build_sign_us": (time.perf_counter_ns() - build_start_retry_ns) / 1000.0,
+                    "detect_to_submit_ms": None, "detect_to_submit_us": None, "api_ms": None,
                 }
 
         submit_ms = now_ms()
+        submit_ns = time.perf_counter_ns()
+        detect_to_submit_us = ((submit_ns - detected_perf_ns) / 1000.0) if detected_perf_ns else float(max(0, submit_ms - detected_ms) * 1000)
         try:
             if sdk_post_order_with_allowance_recovery is not None:
                 response = await sdk_post_order_with_allowance_recovery(live_client, fak_order)
@@ -886,8 +992,8 @@ async def submit_live_fak(asset, side, shares, limit_price, detected_ms):
                 if is_definite_fak_no_match_error(error):
                     last = {
                         "ok": False, "status": "REJECTED_NO_MATCH", "filled": 0.0, "error": error,
-                        "build_sign_ms": build_end - build_start,
-                        "detect_to_submit_ms": submit_ms - detected_ms,
+                        "build_sign_ms": build_end - build_start, "build_sign_us": build_sign_us,
+                        "detect_to_submit_ms": submit_ms - detected_ms, "detect_to_submit_us": detect_to_submit_us,
                         "api_ms": response_ms - submit_ms,
                         "response_json": response_json(response),
                     }
@@ -898,15 +1004,15 @@ async def submit_live_fak(asset, side, shares, limit_price, detected_ms):
                 if side == "SELL" and is_definite_balance_allowance_rejection(error):
                     return {
                         "ok": False, "status": "REJECTED_BALANCE_ALLOWANCE", "filled": 0.0, "error": error,
-                        "build_sign_ms": build_end - build_start,
-                        "detect_to_submit_ms": submit_ms - detected_ms,
+                        "build_sign_ms": build_end - build_start, "build_sign_us": build_sign_us,
+                        "detect_to_submit_ms": submit_ms - detected_ms, "detect_to_submit_us": detect_to_submit_us,
                         "api_ms": response_ms - submit_ms,
                         "response_json": response_json(response),
                     }
                 return {
                     "ok": False, "status": "REJECTED", "filled": 0.0, "error": error,
-                    "build_sign_ms": build_end - build_start,
-                    "detect_to_submit_ms": submit_ms - detected_ms,
+                    "build_sign_ms": build_end - build_start, "build_sign_us": build_sign_us,
+                    "detect_to_submit_ms": submit_ms - detected_ms, "detect_to_submit_us": detect_to_submit_us,
                     "api_ms": response_ms - submit_ms,
                     "response_json": response_json(response),
                 }
@@ -929,8 +1035,8 @@ async def submit_live_fak(asset, side, shares, limit_price, detected_ms):
                 "fee": fee_estimate_generic(filled, avg),
                 "order_id": str(getattr(response, "order_id", "")),
                 "response_json": response_json(response), "error": "",
-                "build_sign_ms": build_end - build_start,
-                "detect_to_submit_ms": submit_ms - detected_ms,
+                "build_sign_ms": build_end - build_start, "build_sign_us": build_sign_us,
+                "detect_to_submit_ms": submit_ms - detected_ms, "detect_to_submit_us": detect_to_submit_us,
                 "api_ms": response_ms - submit_ms,
             }
         except Exception as e:
@@ -939,8 +1045,8 @@ async def submit_live_fak(asset, side, shares, limit_price, detected_ms):
             if is_definite_fak_no_match_error(e):
                 last = {
                     "ok": False, "status": "REJECTED_NO_MATCH", "filled": 0.0, "error": error,
-                    "build_sign_ms": build_end - build_start,
-                    "detect_to_submit_ms": submit_ms - detected_ms,
+                    "build_sign_ms": build_end - build_start, "build_sign_us": build_sign_us,
+                    "detect_to_submit_ms": submit_ms - detected_ms, "detect_to_submit_us": detect_to_submit_us,
                     "api_ms": response_ms - submit_ms,
                     "response_json": "{}",
                 }
@@ -951,8 +1057,8 @@ async def submit_live_fak(asset, side, shares, limit_price, detected_ms):
             if side == "SELL" and is_definite_balance_allowance_rejection(e):
                 return {
                     "ok": False, "status": "REJECTED_BALANCE_ALLOWANCE", "filled": 0.0, "error": error,
-                    "build_sign_ms": build_end - build_start,
-                    "detect_to_submit_ms": submit_ms - detected_ms,
+                    "build_sign_ms": build_end - build_start, "build_sign_us": build_sign_us,
+                    "detect_to_submit_ms": submit_ms - detected_ms, "detect_to_submit_us": detect_to_submit_us,
                     "api_ms": response_ms - submit_ms,
                     "response_json": "{}",
                 }
@@ -960,13 +1066,327 @@ async def submit_live_fak(asset, side, shares, limit_price, detected_ms):
             # mean the order was accepted. Never duplicate it automatically.
             return {
                 "ok": False, "status": "AMBIGUOUS", "filled": 0.0, "error": error,
-                "build_sign_ms": build_end - build_start,
-                "detect_to_submit_ms": submit_ms - detected_ms,
+                "build_sign_ms": build_end - build_start, "build_sign_us": build_sign_us,
+                "detect_to_submit_ms": submit_ms - detected_ms, "detect_to_submit_us": detect_to_submit_us,
                 "api_ms": response_ms - submit_ms,
                 "response_json": "{}",
             }
 
     return last or {"ok": False, "status": "REJECTED_NO_MATCH", "filled": 0.0, "error": "no_match"}
+
+
+
+# ============================================================
+# BTC 15M PREWARMED FAST LANE (NO PRE-COPY)
+# ============================================================
+
+def btc15_slot_start(ts=None):
+    t = int(time.time() if ts is None else ts)
+    return (t // 900) * 900
+
+
+def btc15_slot_from_slug(slug):
+    try:
+        return int(str(slug).rstrip("/").split("-")[-1])
+    except Exception:
+        return None
+
+
+async def btc15_fetch_event(slug):
+    for url, params in (
+        (f"{GAMMA_API}/events/slug/{slug}", None),
+        (f"{GAMMA_API}/events", {"slug": slug}),
+    ):
+        data = await get_json(url, params=params, timeout=5)
+        if isinstance(data, dict):
+            return data
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            return data[0]
+    return None
+
+
+def btc15_parse_market(raw, event):
+    if not isinstance(raw, dict):
+        return None
+    slug = str(raw.get("slug") or event.get("slug") or "").lower()
+    if not slug.startswith(BTC15_SLUG_PREFIX + "-"):
+        return None
+    cid = str(raw.get("conditionId") or raw.get("condition_id") or "")
+    if not cid:
+        return None
+    tokens = [str(x) for x in parse_jsonish(raw.get("clobTokenIds"))]
+    outcomes = [str(x).strip().upper() for x in parse_jsonish(raw.get("outcomes"))]
+    if len(tokens) < 2:
+        return None
+    up = down = None
+    for i, o in enumerate(outcomes):
+        if i >= len(tokens):
+            break
+        if o in {"UP", "YES"}:
+            up = tokens[i]
+        elif o in {"DOWN", "NO"}:
+            down = tokens[i]
+    up = up or tokens[0]
+    down = down or tokens[1]
+    start = btc15_slot_from_slug(slug)
+    if not start:
+        return None
+    return {
+        "condition_id": cid,
+        "slug": slug,
+        "question": str(raw.get("question") or raw.get("title") or event.get("title") or "BTC 15m"),
+        "start_ts": int(start), "end_ts": int(start) + 900,
+        "up_asset": str(up), "down_asset": str(down),
+    }
+
+
+async def btc15_discover_slot(slot_start):
+    slug = f"{BTC15_SLUG_PREFIX}-{int(slot_start)}"
+    event = await btc15_fetch_event(slug)
+    if not event or not isinstance(event.get("markets"), list):
+        return None
+    for raw in event["markets"]:
+        m = btc15_parse_market(raw, event)
+        if m:
+            return m
+    return None
+
+
+def btc15_best(asset, side):
+    b = btc15_books.get(str(asset)) or {}
+    levels = b.get("asks") if str(side).upper() == "BUY" else b.get("bids")
+    if not levels:
+        return None
+    return min(levels) if str(side).upper() == "BUY" else max(levels)
+
+
+def btc15_book_age(asset):
+    b = btc15_books.get(str(asset)) or {}
+    recv = si(b.get("received_ms"), 0)
+    return now_ms() - recv if recv else None
+
+
+def btc15_apply_book(asset, payload):
+    asset = str(asset or "")
+    if not asset:
+        return
+    prior = btc15_books.get(asset) or {}
+    tick = sf(payload.get("tick_size") if isinstance(payload, dict) else None, sf(prior.get("tick_size"), LIVE_PRICE_TICK_FALLBACK))
+    if tick <= 0:
+        tick = LIVE_PRICE_TICK_FALLBACK
+    btc15_books[asset] = {
+        "bids": level_map(payload.get("bids")),
+        "asks": level_map(payload.get("asks")),
+        "received_ms": now_ms(), "tick_size": tick,
+    }
+    btc15_stats["last_book_ms"] = now_ms()
+
+
+def btc15_apply_price_change(payload):
+    changes = payload.get("price_changes") or payload.get("priceChanges") or []
+    recv = now_ms()
+    for ch in changes:
+        if not isinstance(ch, dict):
+            continue
+        asset = str(ch.get("asset_id") or ch.get("token_id") or ch.get("tokenId") or "")
+        if not asset or asset not in btc15_assets:
+            continue
+        b = btc15_books.setdefault(asset, {"bids": {}, "asks": {}, "received_ms": recv, "tick_size": LIVE_PRICE_TICK_FALLBACK})
+        price = sf(ch.get("price"), math.nan)
+        size = sf(ch.get("size"), 0)
+        side = str(ch.get("side") or "").upper()
+        if math.isnan(price):
+            continue
+        levels = b["bids"] if side == "BUY" else b["asks"]
+        if size <= 0:
+            levels.pop(price, None)
+        else:
+            levels[price] = size
+        b["received_ms"] = recv
+        btc15_stats["last_book_ms"] = recv
+
+
+async def btc15_signer_prewarm(market, asset, outcome):
+    asset = str(asset or "")
+    if not BTC15_SIGNER_PREWARM_ENABLE or not asset or asset in btc15_signer_warmed:
+        return asset in btc15_signer_warmed
+    if not live_client_ready or live_client is None:
+        return False
+    # Opportunistic local-only warming; never post an order and never wait for it
+    # in the real copy path. Skip while any copy action is already using its lock.
+    if any(lock.locked() for lock in list(asset_locks.values())):
+        return False
+    async with btc15_prewarm_lock:
+        if asset in btc15_signer_warmed:
+            return True
+        started = time.perf_counter_ns()
+        try:
+            price = format(normalize_limit(BTC15_SIGNER_PREWARM_PRICE, "BUY"), "f")
+            size = format(Decimal(str(round(BTC15_SIGNER_PREWARM_SIZE, 4))), "f")
+            signed = await live_client.create_limit_order(token_id=asset, price=price, size=size, side="BUY", post_only=False)
+            _ = replace(signed, order_type="FAK", post_only=False)
+            elapsed = (time.perf_counter_ns() - started) / 1_000_000.0
+            btc15_signer_warmed.add(asset)
+            btc15_signer_warm_ms[asset] = elapsed
+            btc15_stats["warmed_assets"] = len(btc15_signer_warmed)
+            log.info("BTC15 SIGNER WARM %s %s | token=%s | %.2fms | LOCAL ONLY", market.get("slug"), outcome, asset[-10:], elapsed)
+            return True
+        except Exception as e:
+            log.warning("BTC15 signer warm failed %s %s: %s", market.get("slug"), outcome, e)
+            return False
+
+
+async def btc15_register_market(market):
+    cid = str(market.get("condition_id") or "")
+    if not cid:
+        return
+    is_new = cid not in btc15_markets
+    btc15_markets[cid] = market
+    for outcome, asset in (("Up", market.get("up_asset")), ("Down", market.get("down_asset"))):
+        asset = str(asset or "")
+        if not asset:
+            continue
+        btc15_asset_meta[asset] = {**market, "outcome": outcome}
+        if asset not in btc15_assets:
+            btc15_assets.add(asset)
+            await btc15_ws_send_queue.put({"operation": "subscribe", "assets_ids": [asset]})
+        if BTC15_SIGNER_PREWARM_ENABLE:
+            asyncio.create_task(btc15_signer_prewarm(market, asset, outcome))
+    if is_new:
+        btc15_stats["discovered_markets"] = len(btc15_markets)
+        log.info("BTC15 MARKET READY %s | UP=%s DOWN=%s", market.get("slug"), str(market.get("up_asset"))[-10:], str(market.get("down_asset"))[-10:])
+
+
+async def btc15_discovery_loop():
+    while True:
+        try:
+            if not BTC15_FASTLANE_ENABLE:
+                await asyncio.sleep(2)
+                continue
+            cur = btc15_slot_start()
+            # Current + next are the important warm pair. Previous is retained for
+            # a few seconds around rollover so a late source event still maps cleanly.
+            known_slots = {si(m.get("start_ts")) for m in btc15_markets.values()}
+            for slot in (cur, cur + 900, cur - 900):
+                if slot in known_slots:
+                    continue
+                m = await btc15_discover_slot(slot)
+                if m:
+                    await btc15_register_market(m)
+                    known_slots.add(slot)
+            cutoff = time.time() - 930
+            stale_cids = [cid for cid, m in btc15_markets.items() if sf(m.get("end_ts")) < cutoff]
+            for cid in stale_cids:
+                btc15_markets.pop(cid, None)
+            keep_assets = set()
+            for m in btc15_markets.values():
+                keep_assets.update({str(m.get("up_asset") or ""), str(m.get("down_asset") or "")})
+            keep_assets.discard("")
+            stale_assets = set(btc15_assets) - keep_assets
+            for asset in stale_assets:
+                btc15_assets.discard(asset)
+                btc15_asset_meta.pop(asset, None)
+                btc15_books.pop(asset, None)
+                btc15_signer_warmed.discard(asset)
+                btc15_signer_warm_ms.pop(asset, None)
+                await btc15_ws_send_queue.put({"operation": "unsubscribe", "assets_ids": [asset]})
+            btc15_stats["warmed_assets"] = len(btc15_signer_warmed)
+            await asyncio.sleep(BTC15_DISCOVERY_INTERVAL_SEC)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            btc15_stats["last_error"] = f"discovery:{type(e).__name__}:{e}"
+            log.warning("BTC15 discovery: %s", e)
+            await asyncio.sleep(1)
+
+
+async def btc15_ws_sender(ws):
+    while True:
+        msg = await btc15_ws_send_queue.get()
+        try:
+            await ws.send_str(jd(msg))
+        except Exception:
+            await btc15_ws_send_queue.put(msg)
+            return
+        finally:
+            btc15_ws_send_queue.task_done()
+
+
+async def btc15_ws_ping(ws):
+    while True:
+        await asyncio.sleep(10)
+        try:
+            await ws.send_str("PING")
+        except Exception:
+            return
+
+
+async def btc15_market_ws_loop():
+    while True:
+        try:
+            if not BTC15_FASTLANE_ENABLE or not btc15_assets:
+                await asyncio.sleep(0.5)
+                continue
+            timeout = aiohttp.ClientTimeout(total=None, sock_connect=10, sock_read=None)
+            async with session.ws_connect(MARKET_WS, heartbeat=None, timeout=timeout, max_msg_size=20_000_000) as ws:
+                btc15_stats["ws_connected"] = True
+                btc15_stats["ws_reconnects"] += 1
+                btc15_stats["last_error"] = ""
+                await ws.send_str(jd({"assets_ids": list(btc15_assets), "type": "market", "custom_feature_enabled": True}))
+                sender = asyncio.create_task(btc15_ws_sender(ws))
+                ping = asyncio.create_task(btc15_ws_ping(ws))
+                started = time.monotonic()
+                log.info("BTC15 BOOK WS connected | assets=%d", len(btc15_assets))
+                try:
+                    async for msg in ws:
+                        if time.monotonic() - started >= BTC15_WS_MAX_AGE_SEC:
+                            break
+                        if msg.type != aiohttp.WSMsgType.TEXT:
+                            if msg.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR}:
+                                break
+                            continue
+                        btc15_stats["ws_messages"] += 1
+                        for ev in iter_ws_messages(msg.data):
+                            if not isinstance(ev, dict):
+                                continue
+                            et = str(ev.get("event_type") or ev.get("type") or "")
+                            payload = ev.get("payload") if isinstance(ev.get("payload"), dict) else ev
+                            if et == "book":
+                                asset = str(payload.get("asset_id") or payload.get("token_id") or "")
+                                if asset in btc15_assets:
+                                    btc15_apply_book(asset, payload)
+                            elif et == "price_change":
+                                btc15_apply_price_change(payload)
+                finally:
+                    sender.cancel(); ping.cancel()
+                    btc15_stats["ws_connected"] = False
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            btc15_stats["ws_connected"] = False
+            btc15_stats["last_error"] = f"ws:{type(e).__name__}:{e}"
+            log.warning("BTC15 book WS reconnect: %s", e)
+            await asyncio.sleep(0.5)
+
+
+def btc15_fastlane_snapshot(payload):
+    if not BTC15_FASTLANE_ENABLE:
+        return {"fast_lane": False}
+    asset = str(payload.get("asset") or payload.get("asset_id") or "")
+    slug = str(payload.get("slug") or payload.get("marketSlug") or "").lower()
+    meta = btc15_asset_meta.get(asset)
+    eligible = bool(meta) or slug.startswith(BTC15_SLUG_PREFIX + "-")
+    if not eligible:
+        return {"fast_lane": False}
+    side = str(payload.get("side") or "BUY").upper()
+    age = btc15_book_age(asset)
+    best = btc15_best(asset, side)
+    warm = asset in btc15_signer_warmed
+    return {
+        "fast_lane": True, "book_age_ms": age, "book_price": best,
+        "book_fresh": age is not None and age <= BTC15_BOOK_MAX_AGE_MS,
+        "signer_warm": warm, "slug": str((meta or {}).get("slug") or slug),
+    }
 
 
 # ============================================================
@@ -1121,6 +1541,8 @@ def human_copy_reason(status, error=""):
             return "У бота нет своей скопированной позиции для этого SELL."
         if er == "LIVE_NOT_READY":
             return "LIVE запрошен, но master/кошелёк не готовы."
+        if er.startswith("REST_LATE:"):
+            return f"Сделка найдена резервным REST слишком поздно для безопасного копирования ({er.split(':',1)[1]}). Событие записано, но ордер не отправлен."
         if er.startswith("ORDER_TOO_SMALL"):
             return f"Расчётный размер меньше минимального ордера: {er.split(':',1)[-1]}."
         return er or "Сделка пропущена правилами бота."
@@ -1187,8 +1609,11 @@ def wallet_rate_allowed(wallet):
     return True
 
 
-async def ingest_trade(payload, source="rtds"):
+async def ingest_trade(payload, source="rtds", force_skip_reason=None):
+    detected_perf_ns = time.perf_counter_ns()
     if not valid_trade_payload(payload):
+        if str(source).startswith("rtds:"):
+            rt_stats["invalid_messages"] += 1
         return
     wallet = target_wallet_from_payload(payload)
     info = watched_wallets.get(wallet)
@@ -1209,6 +1634,11 @@ async def ingest_trade(payload, source="rtds"):
     # Persistence is intentionally off the critical path.
     asyncio.create_task(asyncio.to_thread(persist_seen, key, wallet, source, payload, detected_ms))
 
+    if force_skip_reason:
+        asyncio.create_task(log_skipped(
+            key, wallet, info, payload, source, detected_ms, copy_mode(), copy_usdc(), copy_slippage(), force_skip_reason
+        ))
+        return
     if not bot_running():
         asyncio.create_task(log_skipped(
             key, wallet, info, payload, source, detected_ms, copy_mode(), copy_usdc(), copy_slippage(), "BOT_STOPPED"
@@ -1220,11 +1650,14 @@ async def ingest_trade(payload, source="rtds"):
         ))
         return
 
-    asyncio.create_task(copy_trade(key, wallet, info, payload, source, detected_ms))
+    asyncio.create_task(copy_trade(key, wallet, info, payload, source, detected_ms, detected_perf_ns))
 
 
-async def copy_trade(key, wallet, info, payload, source, detected_ms):
+async def copy_trade(key, wallet, info, payload, source, detected_ms, detected_perf_ns=None):
     asset = str(payload.get("asset") or payload.get("asset_id") or "")
+    fast = btc15_fastlane_snapshot(payload)
+    if fast.get("fast_lane"):
+        btc15_stats["fastlane_events"] += 1
     async with asset_locks[(wallet, asset)]:
         side = str(payload.get("side") or "").upper()
         target_price = sf(payload.get("price"))
@@ -1291,12 +1724,12 @@ async def copy_trade(key, wallet, info, payload, source, detected_ms):
                     "LIVE_NOT_READY", requested, limit_price,
                 )
                 return
-            result = await submit_live_fak(asset, side, requested, limit_dec, detected_ms)
+            result = await submit_live_fak(asset, side, requested, limit_dec, detected_ms, detected_perf_ns)
             # Explicit balance rejection is safe to retry once on SELL after the
             # short CLOB balance-cache propagation window.
             if side == "SELL" and result.get("status") == "REJECTED_BALANCE_ALLOWANCE":
                 await asyncio.sleep(LIVE_SELL_BALANCE_RETRY_MS / 1000.0)
-                result = await submit_live_fak(asset, side, requested, limit_dec, detected_ms)
+                result = await submit_live_fak(asset, side, requested, limit_dec, detected_ms, detected_perf_ns)
         else:
             # PAPER deliberately checks the actual current book instead of
             # pretending a fill at the target wallet's historical trade price.
@@ -1336,7 +1769,13 @@ async def copy_trade(key, wallet, info, payload, source, detected_ms):
             "requested_shares": requested,
             "limit_price": limit_price,
             "build_sign_ms": result.get("build_sign_ms"),
+            "build_sign_us": result.get("build_sign_us"),
             "detect_to_submit_ms": result.get("detect_to_submit_ms"),
+            "detect_to_submit_us": result.get("detect_to_submit_us"),
+            "fast_lane": 1 if fast.get("fast_lane") else 0,
+            "fast_book_age_ms": fast.get("book_age_ms"),
+            "fast_book_price": fast.get("book_price"),
+            "fast_signer_warm": 1 if fast.get("signer_warm") else 0,
             "api_ms": result.get("api_ms"),
             "total_reaction_ms": total_reaction,
             "status": str(result.get("status") or ("FILLED" if filled else "REJECTED")),
@@ -1374,7 +1813,10 @@ async def copy_trade(key, wallet, info, payload, source, detected_ms):
             else:
                 our_line = f"Fill 0/{requested:.4f}sh | limit {limit_price:.4f} | {row['status']}"
             latency = []
-            if row.get("detect_to_submit_ms") is not None:
+            if row.get("detect_to_submit_us") is not None:
+                us = sf(row.get("detect_to_submit_us"))
+                latency.append(f"detect→submit {us/1000.0:.2f}ms")
+            elif row.get("detect_to_submit_ms") is not None:
                 latency.append(f"detect→submit {si(row['detect_to_submit_ms'])}ms")
             if row.get("api_ms") is not None:
                 latency.append(f"API {si(row['api_ms'])}ms")
@@ -1386,6 +1828,12 @@ async def copy_trade(key, wallet, info, payload, source, detected_ms):
                 f"{payload.get('outcome') or ''}\n"
                 f"{target_line}\n{sizing_line}\n{our_line}{reason}\n"
                 f"mode {mode} | source {source}"
+                + (
+                    f"\n🚀 BTC15 FAST LANE | book "
+                    f"{('fresh '+str(fast.get('book_age_ms'))+'ms') if fast.get('book_fresh') else ('age '+str(fast.get('book_age_ms'))+'ms' if fast.get('book_age_ms') is not None else 'not ready')}"
+                    f" | signer {'WARM' if fast.get('signer_warm') else 'COLD'}"
+                    if fast.get("fast_lane") else ""
+                )
                 + (f"\n⏱ {' | '.join(latency)}" if latency else "")
             )
 
@@ -1415,6 +1863,8 @@ def base_order_row(key, wallet, info, payload, source, detected_ms, mode, amount
         "max_copy_usdc": max_copy_usdc(),
         "size_capped": 0,
         "slippage": slip,
+        "build_sign_us": None, "detect_to_submit_us": None,
+        "fast_lane": 0, "fast_book_age_ms": None, "fast_book_price": None, "fast_signer_warm": 0,
     }
 
 
@@ -1528,47 +1978,122 @@ async def rtds_loop():
             await asyncio.sleep(0.5)
 
 
+async def _prime_rest_wallet(wallet):
+    """Seed current REST history as already-seen so startup never copies old trades."""
+    collected = []
+    trades = await get_json(
+        f"{DATA_API}/trades",
+        params={"user": wallet, "limit": 100, "takerOnly": "false"},
+        timeout=4,
+    )
+    if isinstance(trades, list):
+        feed_stats["rest_trades_last_ms"] = now_ms()
+        feed_stats["rest_trades_polls"] += 1
+        collected.extend((p, "rest:prime:trades") for p in trades if isinstance(p, dict))
+    else:
+        feed_stats["rest_trades_errors"] += 1
+
+    if REST_ACTIVITY_ENABLE:
+        activity = await get_json(
+            f"{DATA_API}/activity",
+            params={"user": wallet, "type": "TRADE", "limit": 100},
+            timeout=4,
+        )
+        if isinstance(activity, list):
+            feed_stats["rest_activity_last_ms"] = now_ms()
+            feed_stats["rest_activity_polls"] += 1
+            collected.extend((p, "rest:prime:activity") for p in activity if isinstance(p, dict))
+        else:
+            feed_stats["rest_activity_errors"] += 1
+
+    primed = 0
+    for p, src in collected:
+        p.setdefault("proxyWallet", wallet)
+        if str(p.get("type") or "").upper() not in {"", "TRADE"}:
+            continue
+        k = event_key(p)
+        if hot_seen_add(k):
+            primed += 1
+            asyncio.create_task(asyncio.to_thread(persist_seen, k, wallet, src, p, now_ms()))
+    return primed
+
+
+async def _poll_rest_wallet(wallet, use_activity=False):
+    if use_activity:
+        data = await get_json(
+            f"{DATA_API}/activity",
+            params={"user": wallet, "type": "TRADE", "limit": 50},
+            timeout=4,
+        )
+        source = "rest:activity"
+        if isinstance(data, list):
+            feed_stats["rest_activity_last_ms"] = now_ms()
+            feed_stats["rest_activity_polls"] += 1
+        else:
+            feed_stats["rest_activity_errors"] += 1
+            return
+    else:
+        data = await get_json(
+            f"{DATA_API}/trades",
+            params={"user": wallet, "limit": 50, "takerOnly": "false"},
+            timeout=4,
+        )
+        source = "rest:trades"
+        if isinstance(data, list):
+            feed_stats["rest_trades_last_ms"] = now_ms()
+            feed_stats["rest_trades_polls"] += 1
+        else:
+            feed_stats["rest_trades_errors"] += 1
+            return
+
+    # Oldest first so target-shadow and proportional SELL tracking remain ordered.
+    data = sorted((p for p in data if isinstance(p, dict)), key=lambda x: si(x.get("timestamp"), 0))
+    for p in data:
+        p.setdefault("proxyWallet", wallet)
+        if str(p.get("type") or "").upper() not in {"", "TRADE"}:
+            continue
+        ts = si(p.get("timestamp"), 0)
+        age = max(0.0, time.time() - ts) if ts else 999999.0
+        if age > REST_AUDIT_LOOKBACK_SEC:
+            continue
+        k = event_key(p)
+        # Do not pre-add k here: ingest_trade owns dedupe and FOUND/result auditing.
+        if k in seen_hot:
+            continue
+        if age > REST_MAX_COPY_AGE_SEC:
+            feed_stats["rest_late_detected"] += 1
+            await ingest_trade(p, source=source, force_skip_reason=f"REST_LATE:{age:.1f}s > {REST_MAX_COPY_AGE_SEC:.1f}s")
+        else:
+            await ingest_trade(p, source=source)
+
+
 async def rest_fallback_loop():
+    # Priming is per runtime/wallet: existing history is marked seen once; any record
+    # that APPEARS afterwards is new even if the Data API publishes it several seconds late.
     primed = set()
+    last_activity = 0.0
     while True:
         try:
             if not REST_FALLBACK_ENABLE or not watched_wallets:
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
                 continue
             wallets = list(watched_wallets)
             for wallet in wallets:
-                data = await get_json(
-                    f"{DATA_API}/trades",
-                    params={"user": wallet, "limit": 20, "takerOnly": "false"},
-                    timeout=4,
-                )
-                if not isinstance(data, list):
-                    continue
-                # Oldest first so shadow/position logic sees source actions in order.
-                data = sorted(data, key=lambda x: si(x.get("timestamp"), 0))
-                first = wallet not in primed
-                for p in data:
-                    if not isinstance(p, dict):
-                        continue
-                    # Data API response should already contain proxyWallet, but
-                    # normalize defensively if an endpoint revision omits it.
-                    p.setdefault("proxyWallet", wallet)
-                    ts = si(p.get("timestamp"), 0)
-                    age = time.time() - ts if ts else 999999
-                    k = event_key(p)
-                    if first and age > REST_MAX_COPY_AGE_SEC:
-                        hot_seen_add(k)
-                        asyncio.create_task(asyncio.to_thread(persist_seen, k, wallet, "rest:prime", p, now_ms()))
-                        continue
-                    if age <= REST_MAX_COPY_AGE_SEC:
-                        await ingest_trade(p, source="rest:fallback")
-                primed.add(wallet)
+                if wallet not in primed:
+                    await _prime_rest_wallet(wallet)
+                    primed.add(wallet)
+            await asyncio.gather(*(_poll_rest_wallet(w, use_activity=False) for w in wallets))
+            if REST_ACTIVITY_ENABLE and (time.monotonic() - last_activity >= REST_ACTIVITY_INTERVAL):
+                await asyncio.gather(*(_poll_rest_wallet(w, use_activity=True) for w in wallets))
+                last_activity = time.monotonic()
+            # If a wallet is removed and later re-added, prime it again to avoid historical copies.
+            primed.intersection_update(watched_wallets.keys())
             await asyncio.sleep(REST_FALLBACK_INTERVAL)
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("REST fallback loop")
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)
 
 
 # ============================================================
@@ -1630,6 +2155,8 @@ def status_text():
         + f" | MAX ${max_copy_usdc():.2f}\n"
         f"Slippage: {copy_slippage():.3f} | SELL: {sell_mode()} | Wallets: {len(watched_wallets)}/{MAX_WALLETS}\n"
         f"RTDS: {'CONNECTED' if rt_stats['connected'] else 'DISCONNECTED'} | unique {rt_stats['matched_wallet_events']} | raw {rt_stats['matched_wallet_raw_events']} | dup {rt_stats['duplicate_events']}\n"
+        f"REST audit: trades polls {feed_stats['rest_trades_polls']} err {feed_stats['rest_trades_errors']} | activity polls {feed_stats['rest_activity_polls']} err {feed_stats['rest_activity_errors']} | late {feed_stats['rest_late_detected']}\n"
+        f"BTC15 FAST: {'ON' if BTC15_FASTLANE_ENABLE else 'OFF'} | bookWS {'UP' if btc15_stats['ws_connected'] else 'DOWN'} | assets {len(btc15_assets)} | signer warm {len(btc15_signer_warmed)} | hits {btc15_stats['fastlane_events']}\n"
         f"LIVE master: {'ON' if LIVE_MASTER_ENABLE else 'OFF'} | wallet {live}"
     )
 
@@ -1951,18 +2478,23 @@ async def handle_text(text):
     if pending_input.get("type") == "add_wallet":
         pending_input["type"] = None
         parts = raw.split(maxsplit=1)
-        addr = normalize_address(parts[0] if parts else "")
+        entered_addr = normalize_address(parts[0] if parts else "")
         label = parts[1].strip() if len(parts) > 1 else ""
-        if not addr:
+        if not entered_addr:
             await tg_send("Invalid address. Format: 0x... Label")
             return
-        if addr == normalize_address(POLYMARKET_WALLET_ADDRESS):
+        addr, profile_name = await resolve_proxy_wallet(entered_addr)
+        if not addr:
+            await tg_send("Invalid/unresolvable wallet address.")
+            return
+        own = normalize_address(POLYMARKET_WALLET_ADDRESS)
+        if addr == own or entered_addr == own:
             await tg_send("⛔ You cannot watch/copy your own execution wallet (self-copy loop protection).")
             return
         if addr not in watched_wallets and len(watched_wallets) >= MAX_WALLETS:
             await tg_send(f"Wallet limit reached: {MAX_WALLETS}")
             return
-        label = safe_label(label, addr)
+        label = safe_label(label or profile_name, addr)
         with db() as conn:
             conn.execute(
                 """INSERT INTO watched_wallets(address,label,enabled,added_ms) VALUES(?,?,1,?)
@@ -1971,7 +2503,8 @@ async def handle_text(text):
             )
             conn.commit()
         load_wallets()
-        await tg_send(f"✅ Added {label}\n{addr}\nExisting positions will NOT be copied. I am only seeding target inventory for proportional future SELLs.")
+        resolved_note = f"\nResolved proxyWallet: {addr}" if entered_addr != addr else ""
+        await tg_send(f"✅ Added {label}\nEntered: {entered_addr}{resolved_note}\nExisting positions will NOT be copied. I am only seeding target inventory for proportional future SELLs.")
         asyncio.create_task(_warm_wallet_notify(addr, label))
         return
 
@@ -2081,6 +2614,7 @@ async def health(request):
         "sell_mode": sell_mode(),
         "wallets": len(watched_wallets),
         "rtds": rt_stats,
+        "btc15_fastlane": {**btc15_stats, "enabled": BTC15_FASTLANE_ENABLE, "assets": len(btc15_assets), "signer_warm": len(btc15_signer_warmed)},
         "live_master": LIVE_MASTER_ENABLE,
         "live_client_ready": live_client_ready,
         "live_client_error": live_client_error,
@@ -2129,6 +2663,8 @@ async def main():
         asyncio.create_task(telegram_loop(), name="telegram"),
         asyncio.create_task(trade_notice_loop(), name="trade-notices"),
         asyncio.create_task(prewarm_loop(), name="prewarm"),
+        asyncio.create_task(btc15_discovery_loop(), name="btc15-discovery"),
+        asyncio.create_task(btc15_market_ws_loop(), name="btc15-book-ws"),
         asyncio.create_task(seed_all_wallet_shadows(), name="seed-shadows"),
     ]
     log.info(
