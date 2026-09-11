@@ -178,3 +178,44 @@ For real copying: set `LIVE_MASTER_ENABLE=1`, redeploy, use MODE -> LIVE -> CONF
 - Current-position seeding now counts only positive non-redeemable sizes.
 - A successful refresh clears stale target-shadow rows before reseeding.
 - Closed/zero-size positions are no longer reported as open assets.
+
+## v2.3 — durable delivery recovery
+
+v2.3 keeps the first-copy hot path unchanged, but a failed or uncertain LIVE
+copy is no longer abandoned after the first FAK.
+
+- `REJECTED_NO_MATCH`, a partial fill, or a transient server/rate-limit failure
+  creates a durable SQLite recovery job for the unfilled remainder.
+- `AMBIGUOUS` is **not proof of zero fill**. The POST may have reached the CLOB
+  even though the response was lost. Therefore v2.3 first reconciles the bot's
+  own wallet trade history before it is allowed to send another order.
+- Recovery always uses the original event's slippage limit. It does not silently
+  chase a worse price.
+- For BTC15, the warmed WebSocket book is used to wait for marketable liquidity
+  before another FAK is sent. This avoids hammering guaranteed `NO_MATCH` orders.
+- Recovery state is persisted in SQLite and survives redeploy/restart. Startup
+  remains STOP; queued jobs resume only after explicit START.
+- BTC15 recovery expires at the end of that market's trading window (or the
+  configured maximum age, whichever comes first). A fill can never be literally
+  guaranteed if price/liquidity never returns inside the user's slippage cap.
+
+The found/result notices now also print `source→detect ≈...ms` when the public
+source timestamp is available. This is an estimate because Data API activity
+timestamps are normally second-resolution. `detect→submit` remains the precise
+local hot-path measurement.
+
+Feed counters were also corrected: RTDS counters now contain RTDS-only events;
+REST detections have separate `REST detected unique/raw` counters. A `📡 STATUS`
+button is included on the Telegram keyboard.
+
+Default recovery settings:
+
+```text
+RECOVERY_ENABLE=1
+RECOVERY_BOOK_POLL_MS=50
+RECOVERY_FAK_RETRY_MS=250
+RECOVERY_AMBIGUOUS_GRACE_MS=2500
+RECOVERY_RECONCILE_INTERVAL_MS=250
+RECOVERY_MAX_AGE_SEC=900
+RECOVERY_OWN_TRADES_LIMIT=200
+```

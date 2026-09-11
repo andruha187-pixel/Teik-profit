@@ -1,4 +1,4 @@
-UltraFast CopyBot v2.1 regression results
+UltraFast CopyBot v2.3 regression results
 Date: 2026-09-11
 
 PASS: test_core.py
@@ -17,8 +17,18 @@ PASS: test_v2_fastlane.py
 PASS: test_v2_1_feed.py
 - mixed-case address normalization
 - public-profile -> canonical proxyWallet resolution
-- REST trade first appearing ~10s after exchange timestamp is still detected/copy-eligible
+- REST trade appearing ~10s after exchange timestamp is still detected/copy-eligible
 - very-late REST event is surfaced/audited but not copied blindly
 
-Critical fixed regression from v2.0:
-REST fallback no longer discards a newly appearing trade solely because its exchange timestamp is older than 4 seconds.
+PASS: test_v2_3_recovery.py
+- public source timestamp -> approximate source-to-detect audit
+- AMBIGUOUS reconciles own-wallet fills before any new POST
+- confirmed ambiguous fill completes without blind duplicate
+- deterministic NO_MATCH creates durable recovery
+- recovery retries remaining shares at the exact original limit and accounts the fill
+- upgrade backfill converts a still-live pre-v2.3 AMBIGUOUS audit row into exactly one recovery job
+
+Critical v2.3 behavior:
+The first LIVE FAK remains on the same fast path. Recovery only starts after its
+result, persists in SQLite, pauses on STOP, and never raises the original
+slippage limit automatically.

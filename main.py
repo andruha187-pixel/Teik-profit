@@ -47,7 +47,7 @@ load_dotenv()
 # Telegram confirmation before the mode changes to LIVE.
 # ============================================================
 
-VERSION = "2.2-ultrafast-wallet-feed-audit"
+VERSION = "2.3-ultrafast-delivery-recovery"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -106,6 +106,19 @@ LIVE_NO_MATCH_RETRIES = max(0, min(2, int(os.getenv("LIVE_NO_MATCH_RETRIES", "1"
 LIVE_NO_MATCH_RETRY_DELAY_MS = max(0, int(os.getenv("LIVE_NO_MATCH_RETRY_DELAY_MS", "25")))
 LIVE_SELL_BALANCE_RETRY_MS = max(100, int(os.getenv("LIVE_SELL_BALANCE_RETRY_MS", "600")))
 
+# Persistent delivery recovery. The first LIVE copy remains the same ultra-fast FAK.
+# If that FAK is a deterministic NO_MATCH, partial fill, or AMBIGUOUS result, a
+# durable recovery job keeps trying the REMAINING size at the SAME user slippage
+# cap. AMBIGUOUS is reconciled against our own wallet trade history before any
+# new real order is allowed, to avoid blind duplicate orders.
+RECOVERY_ENABLE = os.getenv("RECOVERY_ENABLE", "1").strip().lower() in {"1", "true", "yes", "on"}
+RECOVERY_BOOK_POLL_MS = max(25, int(os.getenv("RECOVERY_BOOK_POLL_MS", "50")))
+RECOVERY_FAK_RETRY_MS = max(100, int(os.getenv("RECOVERY_FAK_RETRY_MS", "250")))
+RECOVERY_AMBIGUOUS_GRACE_MS = max(500, int(os.getenv("RECOVERY_AMBIGUOUS_GRACE_MS", "2500")))
+RECOVERY_RECONCILE_INTERVAL_MS = max(100, int(os.getenv("RECOVERY_RECONCILE_INTERVAL_MS", "250")))
+RECOVERY_MAX_AGE_SEC = max(30, int(os.getenv("RECOVERY_MAX_AGE_SEC", "900")))
+RECOVERY_OWN_TRADES_LIMIT = max(20, min(500, int(os.getenv("RECOVERY_OWN_TRADES_LIMIT", "200"))))
+
 TELEGRAM_NOTIFY_TRADES_DEFAULT = os.getenv("TELEGRAM_NOTIFY_TRADES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 # BTC 15-minute acceleration. This is NOT pre-copy: no order is posted until a
@@ -141,6 +154,7 @@ shadow_cache = {}       # (wallet, asset) -> target shares
 position_cache = {}     # (wallet, asset, mode) -> bot-tracked position dict
 seen_hot = OrderedDict()
 asset_locks = defaultdict(asyncio.Lock)
+recovery_asset_locks = defaultdict(asyncio.Lock)
 wallet_rate = defaultdict(lambda: deque(maxlen=200))
 pending_input = {"type": None}
 
@@ -164,6 +178,19 @@ feed_stats = {
     "rest_activity_polls": 0,
     "rest_activity_errors": 0,
     "rest_late_detected": 0,
+    "rest_raw_events": 0,
+    "rest_unique_events": 0,
+}
+
+recovery_stats = {
+    "scheduled": 0,
+    "active": 0,
+    "completed": 0,
+    "reconciled": 0,
+    "retries": 0,
+    "expired": 0,
+    "blocked": 0,
+    "last_error": "",
 }
 
 # Trade-notification queue keeps Telegram completely off the execution hot path
@@ -274,6 +301,42 @@ def source_trade_usdc(payload):
     if exact >= 0:
         return exact
     return max(0.0, sf((payload or {}).get("price"))) * max(0.0, sf((payload or {}).get("size")))
+
+
+def source_timestamp_ms(payload):
+    raw = sf((payload or {}).get("timestamp"), 0.0)
+    if raw <= 0:
+        return 0
+    # Data API timestamps are normally seconds; tolerate millisecond feeds too.
+    return int(raw if raw > 10_000_000_000 else raw * 1000.0)
+
+
+def estimated_source_age_ms(payload, detected_ms):
+    tms = source_timestamp_ms(payload)
+    if not tms:
+        return None
+    # The public activity timestamp is commonly only second-resolution, so this
+    # is deliberately labelled an estimate in Telegram/reporting.
+    return max(0, int(detected_ms) - int(tms))
+
+
+def recovery_deadline_ms(payload, detected_ms):
+    slug = str((payload or {}).get("slug") or (payload or {}).get("marketSlug") or "").lower()
+    slot = btc15_slot_from_slug(slug) if slug.startswith(BTC15_SLUG_PREFIX + "-") else None
+    if slot:
+        # Do not keep sending after the 15m market's trading window is over.
+        return min(int(detected_ms) + RECOVERY_MAX_AGE_SEC * 1000, (slot + 900) * 1000 - 500)
+    return int(detected_ms) + RECOVERY_MAX_AGE_SEC * 1000
+
+
+def transient_recovery_status(status, error=""):
+    st = str(status or "").upper()
+    if st in {"REJECTED_NO_MATCH", "AMBIGUOUS", "DELAYED_AMBIGUOUS"}:
+        return True
+    text = str(error or "").lower()
+    return st == "REJECTED" and any(x in text for x in (
+        "429", "rate limit", "tempor", "timeout", "timed out", "internal error", "service unavailable", "502", "503", "504"
+    ))
 
 
 def percentile(values, p):
@@ -426,6 +489,7 @@ def init_db():
             source TEXT NOT NULL,
             detected_ms INTEGER NOT NULL,
             target_timestamp INTEGER,
+            source_age_ms_est INTEGER,
             target_tx_hash TEXT,
             condition_id TEXT,
             asset TEXT NOT NULL,
@@ -467,6 +531,35 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_orders_wallet ON copy_orders(wallet, created_ms);
         CREATE INDEX IF NOT EXISTS idx_orders_event ON copy_orders(event_key);
+
+        CREATE TABLE IF NOT EXISTS recovery_orders(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_key TEXT NOT NULL,
+            wallet TEXT NOT NULL,
+            wallet_label TEXT,
+            source TEXT NOT NULL,
+            asset TEXT NOT NULL,
+            side TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            requested_shares REAL NOT NULL,
+            accounted_shares REAL NOT NULL DEFAULT 0,
+            accounted_gross REAL NOT NULL DEFAULT 0,
+            limit_price REAL NOT NULL,
+            mode TEXT NOT NULL,
+            initial_status TEXT,
+            initial_error TEXT,
+            state TEXT NOT NULL DEFAULT 'PENDING',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            ambiguous_since_ms INTEGER,
+            detected_ms INTEGER NOT NULL,
+            deadline_ms INTEGER NOT NULL,
+            next_try_ms INTEGER NOT NULL,
+            last_error TEXT,
+            created_ms INTEGER NOT NULL,
+            updated_ms INTEGER NOT NULL,
+            UNIQUE(event_key, wallet, asset, side, mode)
+        );
+        CREATE INDEX IF NOT EXISTS idx_recovery_due ON recovery_orders(state,next_try_ms);
         """)
         # v1.1 migration for databases created by v1.0.
         existing_cols = {r[1] for r in conn.execute("PRAGMA table_info(copy_orders)").fetchall()}
@@ -482,6 +575,7 @@ def init_db():
             "fast_book_age_ms": "INTEGER",
             "fast_book_price": "REAL",
             "fast_signer_warm": "INTEGER NOT NULL DEFAULT 0",
+            "source_age_ms_est": "INTEGER",
         }.items():
             if col not in existing_cols:
                 conn.execute(f"ALTER TABLE copy_orders ADD COLUMN {col} {ddl}")
@@ -741,7 +835,7 @@ def position_apply_sell(wallet, asset, mode, sold, proceeds):
 
 def record_order(row):
     cols = [
-        "event_key","wallet","wallet_label","source","detected_ms","target_timestamp","target_tx_hash",
+        "event_key","wallet","wallet_label","source","detected_ms","target_timestamp","source_age_ms_est","target_tx_hash",
         "condition_id","asset","title","slug","outcome","target_side","target_price","target_size",
         "mode","copy_amount_usdc","size_mode","source_amount_usdc","scale_pct","max_copy_usdc","size_capped",
         "slippage","requested_shares","limit_price","build_sign_ms","build_sign_us",
@@ -755,6 +849,492 @@ def record_order(row):
             vals,
         )
         conn.commit()
+
+
+# ============================================================
+# DURABLE LIVE DELIVERY RECOVERY
+# ============================================================
+
+def recovery_active_count():
+    try:
+        with db() as conn:
+            r = conn.execute(
+                "SELECT COUNT(*) c FROM recovery_orders WHERE state IN ('RETRY','RECONCILE')"
+            ).fetchone()
+            return si(r["c"]) if r else 0
+    except Exception:
+        return 0
+
+
+def recovery_schedule_db(*, key, wallet, info, payload, source, requested, accounted, accounted_gross,
+                         limit_price, mode, initial_status, initial_error, detected_ms):
+    if not RECOVERY_ENABLE or str(mode).upper() != "LIVE":
+        return False
+    remaining = max(0.0, sf(requested) - sf(accounted))
+    if remaining <= 1e-9:
+        return False
+    # A sub-minimum remainder cannot be submitted as a new order. Keep it visible
+    # in the original partial-fill audit rather than creating an impossible loop.
+    if remaining < MIN_ORDER_SHARES - 1e-9:
+        return False
+    status = str(initial_status or "").upper()
+    state = "RECONCILE" if status in {"AMBIGUOUS", "DELAYED_AMBIGUOUS"} else "RETRY"
+    now = now_ms()
+    deadline = recovery_deadline_ms(payload, detected_ms)
+    ambiguous_since = now if state == "RECONCILE" else None
+    with db() as conn:
+        conn.execute(
+            """INSERT INTO recovery_orders(
+                event_key,wallet,wallet_label,source,asset,side,payload_json,requested_shares,
+                accounted_shares,accounted_gross,limit_price,mode,initial_status,initial_error,state,
+                attempts,ambiguous_since_ms,detected_ms,deadline_ms,next_try_ms,last_error,created_ms,updated_ms
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(event_key,wallet,asset,side,mode) DO UPDATE SET
+                requested_shares=MAX(recovery_orders.requested_shares,excluded.requested_shares),
+                accounted_shares=MAX(recovery_orders.accounted_shares,excluded.accounted_shares),
+                accounted_gross=MAX(recovery_orders.accounted_gross,excluded.accounted_gross),
+                limit_price=excluded.limit_price,initial_status=excluded.initial_status,
+                initial_error=excluded.initial_error,state=excluded.state,
+                ambiguous_since_ms=excluded.ambiguous_since_ms,deadline_ms=excluded.deadline_ms,
+                next_try_ms=excluded.next_try_ms,last_error=excluded.last_error,updated_ms=excluded.updated_ms
+            """,
+            (
+                key, wallet, safe_label(info.get("label"), wallet), source,
+                str(payload.get("asset") or payload.get("asset_id") or ""),
+                str(payload.get("side") or "").upper(), jd(payload), sf(requested), sf(accounted),
+                sf(accounted_gross), sf(limit_price), str(mode).upper(), status, str(initial_error or ""),
+                state, 0, ambiguous_since, int(detected_ms), int(deadline), now, str(initial_error or ""), now, now,
+            ),
+        )
+        conn.commit()
+    recovery_stats["scheduled"] += 1
+    recovery_stats["active"] = recovery_active_count()
+    return True
+
+
+def recovery_due_rows(limit=20):
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT * FROM recovery_orders
+               WHERE state IN ('RETRY','RECONCILE') AND next_try_ms<=?
+               ORDER BY next_try_ms ASC LIMIT ?""",
+            (now_ms(), int(limit)),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def recovery_update(job_id, **fields):
+    allowed = {
+        "accounted_shares", "accounted_gross", "state", "attempts", "ambiguous_since_ms",
+        "deadline_ms", "next_try_ms", "last_error", "updated_ms", "initial_status", "initial_error"
+    }
+    items = [(k, v) for k, v in fields.items() if k in allowed]
+    if not items:
+        return
+    if "updated_ms" not in dict(items):
+        items.append(("updated_ms", now_ms()))
+    sql = "UPDATE recovery_orders SET " + ",".join(f"{k}=?" for k, _ in items) + " WHERE id=?"
+    with db() as conn:
+        conn.execute(sql, [v for _, v in items] + [int(job_id)])
+        conn.commit()
+
+
+def recovery_payload(job):
+    try:
+        x = json.loads(job.get("payload_json") or "{}")
+        return x if isinstance(x, dict) else {}
+    except Exception:
+        return {}
+
+
+def own_reconcile_wallet():
+    # AsyncSecureClient resolves the actual trading wallet/proxy. Prefer it over
+    # the raw env value because the env may be a signer rather than proxy wallet.
+    w = normalize_address(getattr(live_client, "wallet", "") if live_client is not None else "")
+    return w or normalize_address(POLYMARKET_WALLET_ADDRESS)
+
+
+async def own_recent_matching_fills(job):
+    """Return cumulative own-wallet fills that can belong to this recovery job.
+
+    This is used only after an ambiguous submission. It never sits in front of the
+    first fast FAK. Data API timestamps are second-resolution, so we use a narrow
+    time/asset/side/price window and dedupe transaction-shaped rows.
+    """
+    wallet = own_reconcile_wallet()
+    if not wallet:
+        return None
+    data = await get_json(
+        f"{DATA_API}/trades",
+        params={"user": wallet, "limit": RECOVERY_OWN_TRADES_LIMIT, "takerOnly": "false"},
+        timeout=4,
+    )
+    if not isinstance(data, list):
+        return None
+    asset = str(job.get("asset") or "")
+    side = str(job.get("side") or "").upper()
+    limit_price = sf(job.get("limit_price"))
+    start_ms = int(job.get("detected_ms") or 0) - 1500
+    end_ms = now_ms() + 1500
+    seen = set()
+    total_shares = 0.0
+    total_gross = 0.0
+    matches = 0
+    for t in data:
+        if not isinstance(t, dict):
+            continue
+        if str(t.get("asset") or t.get("asset_id") or "") != asset:
+            continue
+        if str(t.get("side") or "").upper() != side:
+            continue
+        tsms = source_timestamp_ms(t)
+        if tsms and not (start_ms <= tsms <= end_ms):
+            continue
+        price = sf(t.get("price"), -1)
+        size = sf(t.get("size"), 0)
+        if size <= 0 or price <= 0:
+            continue
+        if side == "BUY" and price > limit_price + max(0.001, LIVE_PRICE_TICK_FALLBACK) + 1e-9:
+            continue
+        if side == "SELL" and price < limit_price - max(0.001, LIVE_PRICE_TICK_FALLBACK) - 1e-9:
+            continue
+        tx = str(t.get("transactionHash") or t.get("transaction_hash") or "").lower()
+        dkey = (tx, str(t.get("asset") or t.get("asset_id") or ""), side, round(price, 8), round(size, 8), si(t.get("timestamp"), 0))
+        if dkey in seen:
+            continue
+        seen.add(dkey)
+        total_shares += size
+        total_gross += size * price
+        matches += 1
+    return {"shares": total_shares, "gross": total_gross, "matches": matches}
+
+
+def recovery_book_ready(job):
+    """For BTC15, only spend a CLOB POST when the warmed book is marketable.
+
+    Generic markets return True because this bot does not keep all their books
+    subscribed. The user slippage cap is still enforced by the FAK itself.
+    """
+    asset = str(job.get("asset") or "")
+    book = btc15_books.get(asset)
+    if not book:
+        return True
+    age = now_ms() - si(book.get("received_ms"), 0) if book.get("received_ms") else None
+    if age is None or age > BTC15_BOOK_MAX_AGE_MS:
+        return True
+    side = str(job.get("side") or "").upper()
+    limit_price = sf(job.get("limit_price"))
+    levels = book.get("asks") if side == "BUY" else book.get("bids")
+    if not levels:
+        return False
+    if side == "BUY":
+        return any(sf(p) <= limit_price + 1e-12 and sf(q) > 0 for p, q in levels.items())
+    return any(sf(p) >= limit_price - 1e-12 and sf(q) > 0 for p, q in levels.items())
+
+
+def recovery_finish(job, state, message, *, accounted=None, gross=None, last_error=""):
+    recovery_update(
+        job["id"], state=state,
+        accounted_shares=sf(job.get("accounted_shares")) if accounted is None else sf(accounted),
+        accounted_gross=sf(job.get("accounted_gross")) if gross is None else sf(gross),
+        next_try_ms=2**62, last_error=last_error or message,
+    )
+    if state == "DONE":
+        recovery_stats["completed"] += 1
+    elif state == "EXPIRED":
+        recovery_stats["expired"] += 1
+    else:
+        recovery_stats["blocked"] += 1
+    recovery_stats["active"] = recovery_active_count()
+    queue_trade_notice(message)
+
+
+async def recovery_apply_fill(job, payload, filled, avg, gross):
+    if filled <= 1e-12:
+        return
+    side = str(job.get("side") or "").upper()
+    if side == "BUY":
+        position_apply_buy(job["wallet"], job["asset"], "LIVE", payload, filled, avg, gross)
+    else:
+        position_apply_sell(job["wallet"], job["asset"], "LIVE", filled, gross)
+
+
+def record_recovery_execution(job, payload, *, status, filled=0.0, avg=None, gross=0.0, error="", result=None, source_suffix="retry"):
+    result = result or {}
+    detected = now_ms()
+    row = base_order_row(
+        str(job.get("event_key") or "") + f":recovery:{si(job.get('attempts'),0)+1}:{detected}",
+        job.get("wallet"), {"label": job.get("wallet_label")}, payload,
+        f"recovery:{source_suffix}", detected, "LIVE", 0.0, copy_slippage(),
+    )
+    row.update({
+        "requested_shares": max(0.0, sf(job.get("requested_shares")) - sf(job.get("accounted_shares"))),
+        "limit_price": sf(job.get("limit_price")),
+        "build_sign_ms": result.get("build_sign_ms"),
+        "build_sign_us": result.get("build_sign_us"),
+        "detect_to_submit_ms": result.get("detect_to_submit_ms"),
+        "detect_to_submit_us": result.get("detect_to_submit_us"),
+        "fast_lane": 1 if btc15_fastlane_snapshot(payload).get("fast_lane") else 0,
+        "fast_book_age_ms": btc15_fastlane_snapshot(payload).get("book_age_ms"),
+        "fast_book_price": btc15_fastlane_snapshot(payload).get("book_price"),
+        "fast_signer_warm": 1 if btc15_fastlane_snapshot(payload).get("signer_warm") else 0,
+        "api_ms": result.get("api_ms"),
+        "total_reaction_ms": 0,
+        "status": str(status),
+        "filled_shares": sf(filled),
+        "avg_price": sf(avg) if avg is not None and sf(filled)>0 else None,
+        "gross_amount": sf(gross),
+        "fee_estimate": sf(result.get("fee")),
+        "order_id": str(result.get("order_id") or ""),
+        "response_json": str(result.get("response_json") or "{}"),
+        "error": str(error or ""),
+        "created_ms": now_ms(),
+    })
+    record_order(row)
+
+
+async def process_recovery_job(job):
+    now = now_ms()
+    payload = recovery_payload(job)
+    label = job.get("wallet_label") or short_addr(job.get("wallet"))
+    requested = sf(job.get("requested_shares"))
+    accounted = sf(job.get("accounted_shares"))
+    accounted_gross = sf(job.get("accounted_gross"))
+    remaining = max(0.0, requested - accounted)
+
+    if remaining <= 1e-8:
+        recovery_finish(
+            job, "DONE",
+            f"✅ RECOVERY ЗАВЕРШЁН\n👛 {label}\nИсполнено {accounted:.4f}/{requested:.4f}sh.",
+            accounted=accounted, gross=accounted_gross,
+        )
+        return
+    if now >= si(job.get("deadline_ms"), 0):
+        recovery_finish(
+            job, "EXPIRED",
+            f"⏱ RECOVERY ЗАВЕРШИЛСЯ ПО ВРЕМЕНИ\n👛 {label}\n"
+            f"Осталось {remaining:.4f}sh по limit {sf(job.get('limit_price')):.4f}. "
+            "Цена/ликвидность так и не вернулись в разрешённый slippage до конца окна.",
+            accounted=accounted, gross=accounted_gross, last_error="deadline",
+        )
+        return
+    # STOP remains an absolute user control. A durable job survives STOP/redeploy
+    # and resumes only after the user explicitly STARTs again.
+    if not bot_running() or copy_mode() != "LIVE" or not LIVE_MASTER_ENABLE or not live_client_ready:
+        recovery_update(job["id"], next_try_ms=now + 500)
+        return
+
+    state = str(job.get("state") or "RETRY").upper()
+    if state == "RECONCILE":
+        rec = await own_recent_matching_fills(job)
+        if rec is not None:
+            total_seen = min(requested, max(0.0, sf(rec.get("shares"))))
+            total_gross = max(0.0, sf(rec.get("gross")))
+            if total_seen > accounted + 1e-8:
+                delta = min(remaining, total_seen - accounted)
+                # Approximate the newly discovered fill at cumulative weighted avg.
+                avg = (total_gross / total_seen) if total_seen > 1e-12 else sf(job.get("limit_price"))
+                delta_gross = delta * avg
+                await recovery_apply_fill(job, payload, delta, avg, delta_gross)
+                await asyncio.to_thread(
+                    record_recovery_execution, job, payload, status="RECOVERED_AMBIGUOUS",
+                    filled=delta, avg=avg, gross=delta_gross, error="reconciled from own wallet trades", source_suffix="reconcile",
+                )
+                accounted += delta
+                accounted_gross += delta_gross
+                remaining = max(0.0, requested - accounted)
+                recovery_stats["reconciled"] += 1
+                queue_trade_notice(
+                    f"🔎 AMBIGUOUS СВЕРЕН\n👛 {label}\n"
+                    f"Нашёл подтверждённый fill +{delta:.4f}sh через собственную историю кошелька. "
+                    f"Итого {accounted:.4f}/{requested:.4f}sh."
+                )
+                if remaining <= 1e-8:
+                    recovery_finish(
+                        job, "DONE",
+                        f"✅ RECOVERY ЗАВЕРШЁН ПОСЛЕ СВЕРКИ\n👛 {label}\n"
+                        f"Исполнено {accounted:.4f}/{requested:.4f}sh без слепого дубля.",
+                        accounted=accounted, gross=accounted_gross,
+                    )
+                    return
+                recovery_update(job["id"], accounted_shares=accounted, accounted_gross=accounted_gross)
+
+        ambiguous_since = si(job.get("ambiguous_since_ms"), 0) or now
+        if now - ambiguous_since < RECOVERY_AMBIGUOUS_GRACE_MS:
+            recovery_update(
+                job["id"], accounted_shares=accounted, accounted_gross=accounted_gross,
+                next_try_ms=now + RECOVERY_RECONCILE_INTERVAL_MS,
+            )
+            return
+        # No additional fill became visible during the reconcile grace window.
+        # Only now may we create a fresh order for the remaining size.
+        recovery_update(
+            job["id"], state="RETRY", accounted_shares=accounted, accounted_gross=accounted_gross,
+            next_try_ms=now, last_error="ambiguous_reconcile_grace_complete",
+        )
+        job = {**job, "state": "RETRY", "accounted_shares": accounted, "accounted_gross": accounted_gross}
+        state = "RETRY"
+
+    if remaining < MIN_ORDER_SHARES - 1e-9:
+        recovery_finish(
+            job, "BLOCKED",
+            f"⚠️ RECOVERY ОСТАНОВЛЕН\n👛 {label}\n"
+            f"Остаток {remaining:.4f}sh меньше минимального ордера {MIN_ORDER_SHARES:g}sh.",
+            accounted=accounted, gross=accounted_gross, last_error="remaining_below_min_order",
+        )
+        return
+
+    if not recovery_book_ready(job):
+        # BTC15 hot book says our limit is not marketable yet. Wait in memory
+        # instead of hammering the CLOB with guaranteed NO_MATCH FAKs.
+        recovery_update(job["id"], next_try_ms=now + RECOVERY_BOOK_POLL_MS)
+        return
+
+    async with recovery_asset_locks[str(job.get("asset") or "")]:
+        result = await submit_live_fak(
+            str(job.get("asset") or ""), str(job.get("side") or ""), remaining,
+            sf(job.get("limit_price")), now, None,
+        )
+    attempts = si(job.get("attempts"), 0) + 1
+    recovery_stats["retries"] += 1
+    filled = max(0.0, sf(result.get("filled")))
+    avg = sf(result.get("avg"))
+    gross = sf(result.get("gross"))
+    await asyncio.to_thread(
+        record_recovery_execution, job, payload, status=str(result.get("status") or "RECOVERY_RETRY"),
+        filled=filled, avg=avg if filled > 0 else None, gross=gross, error=str(result.get("error") or ""),
+        result=result, source_suffix="retry",
+    )
+    if filled > 1e-12:
+        await recovery_apply_fill(job, payload, filled, avg, gross)
+        accounted += filled
+        accounted_gross += gross
+        remaining = max(0.0, requested - accounted)
+        queue_trade_notice(
+            f"🔁 RECOVERY FILL\n👛 {label}\n"
+            f"+{filled:.4f}sh @ {avg:.4f}; итого {accounted:.4f}/{requested:.4f}sh. "
+            f"Попытка recovery #{attempts}."
+        )
+        if remaining <= 1e-8:
+            recovery_finish(
+                job, "DONE",
+                f"✅ ПОЗИЦИЯ ДОИСПОЛНЕНА RECOVERY\n👛 {label}\n"
+                f"Итого {accounted:.4f}/{requested:.4f}sh по исходному slippage-limit.",
+                accounted=accounted, gross=accounted_gross,
+            )
+            return
+
+    status = str(result.get("status") or "").upper()
+    err = str(result.get("error") or "")
+    if status in {"AMBIGUOUS", "DELAYED_AMBIGUOUS"}:
+        recovery_update(
+            job["id"], state="RECONCILE", attempts=attempts, accounted_shares=accounted,
+            accounted_gross=accounted_gross, ambiguous_since_ms=now_ms(),
+            next_try_ms=now_ms() + RECOVERY_RECONCILE_INTERVAL_MS, last_error=err,
+        )
+        return
+    if status == "REJECTED_NO_MATCH" or (filled > 1e-12 and remaining >= MIN_ORDER_SHARES - 1e-9) or transient_recovery_status(status, err):
+        recovery_update(
+            job["id"], state="RETRY", attempts=attempts, accounted_shares=accounted,
+            accounted_gross=accounted_gross, next_try_ms=now_ms() + RECOVERY_FAK_RETRY_MS, last_error=err,
+        )
+        return
+
+    recovery_finish(
+        job, "BLOCKED",
+        f"⛔ RECOVERY ЗАБЛОКИРОВАН\n👛 {label}\n"
+        f"Осталось {remaining:.4f}sh. Причина: {human_copy_reason(status, err)}\ntech: {err[:500]}",
+        accounted=accounted, gross=accounted_gross, last_error=err or status,
+    )
+
+
+def backfill_recent_recovery_jobs():
+    """Create recovery jobs for still-live v2.2-era copy rows after an upgrade.
+
+    This is intentionally conservative: only original LIVE rows with a recoverable
+    result and a still-open recovery window are considered, and rows that already
+    have a recovery job are skipped.  The process still starts STOP, so backfilled
+    jobs cannot submit until the user explicitly presses START.
+    """
+    if not RECOVERY_ENABLE:
+        return 0
+    cutoff = now_ms() - RECOVERY_MAX_AGE_SEC * 1000
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT o.* FROM copy_orders o
+               WHERE o.mode='LIVE'
+                 AND o.created_ms>=?
+                 AND o.event_key NOT LIKE '%:recovery:%'
+                 AND (
+                      UPPER(COALESCE(o.status,'')) IN ('AMBIGUOUS','DELAYED_AMBIGUOUS','REJECTED_NO_MATCH')
+                      OR (COALESCE(o.filled_shares,0)>0 AND COALESCE(o.filled_shares,0)+1e-9<COALESCE(o.requested_shares,0))
+                 )
+                 AND NOT EXISTS (
+                     SELECT 1 FROM recovery_orders r
+                     WHERE r.event_key=o.event_key AND r.wallet=o.wallet AND r.asset=o.asset
+                       AND r.side=o.target_side AND r.mode=o.mode
+                 )
+               ORDER BY o.created_ms ASC""",
+            (cutoff,),
+        ).fetchall()
+    made = 0
+    for rr in rows:
+        r = dict(rr)
+        payload = {
+            'proxyWallet': r.get('wallet'),
+            'transactionHash': r.get('target_tx_hash') or '',
+            'asset': r.get('asset') or '',
+            'conditionId': r.get('condition_id') or '',
+            'side': r.get('target_side') or '',
+            'price': sf(r.get('target_price')),
+            'size': sf(r.get('target_size')),
+            'timestamp': si(r.get('target_timestamp'), 0),
+            'title': r.get('title') or '',
+            'slug': r.get('slug') or '',
+            'outcome': r.get('outcome') or '',
+        }
+        detected = si(r.get('detected_ms'), 0) or si(r.get('created_ms'), now_ms())
+        if recovery_deadline_ms(payload, detected) <= now_ms():
+            continue
+        if recovery_schedule_db(
+            key=str(r.get('event_key') or ''), wallet=str(r.get('wallet') or ''),
+            info={'label': r.get('wallet_label') or ''}, payload=payload, source=str(r.get('source') or 'upgrade-backfill'),
+            requested=sf(r.get('requested_shares')), accounted=sf(r.get('filled_shares')),
+            accounted_gross=sf(r.get('gross_amount')), limit_price=sf(r.get('limit_price')),
+            mode='LIVE', initial_status=str(r.get('status') or ''), initial_error=str(r.get('error') or ''),
+            detected_ms=detected,
+        ):
+            made += 1
+    if made:
+        log.warning('Backfilled %d still-live recovery job(s) from pre-v2.3 copy audit', made)
+    return made
+
+
+async def recovery_loop():
+    while True:
+        try:
+            if not RECOVERY_ENABLE:
+                await asyncio.sleep(1.0)
+                continue
+            rows = await asyncio.to_thread(recovery_due_rows, 20)
+            recovery_stats["active"] = recovery_active_count()
+            if not rows:
+                await asyncio.sleep(RECOVERY_BOOK_POLL_MS / 1000.0)
+                continue
+            for job in rows:
+                try:
+                    await process_recovery_job(job)
+                except Exception as e:
+                    recovery_stats["last_error"] = f"{type(e).__name__}: {e}"
+                    log.exception("Recovery job failed id=%s", job.get("id"))
+                    recovery_update(job["id"], next_try_ms=now_ms() + 500, last_error=recovery_stats["last_error"])
+            await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            recovery_stats["last_error"] = f"{type(e).__name__}: {e}"
+            log.exception("Recovery loop")
+            await asyncio.sleep(0.5)
 
 
 # ============================================================
@@ -1509,6 +2089,8 @@ def source_detect_message(wallet, info, payload, source):
     title = payload.get("title") or payload.get("slug") or asset
     outcome = payload.get("outcome") or ""
     tx = compact_tx(payload)
+    age_est = estimated_source_age_ms(payload, now_ms())
+    age_line = f"\n⏱ source→detect ≈{age_est}ms*" if age_est is not None else ""
     fallback = "\n⚠️ Найдено через REST fallback — RTDS не был первым источником этой сделки." if str(source).startswith("rest:") else ""
     return (
         f"{head}\n"
@@ -1517,6 +2099,8 @@ def source_detect_message(wallet, info, payload, source):
         f"Источник: {side} {size:.4f}sh @ {price:.4f} ≈ ${usdc:.2f}\n"
         f"feed: {source}"
         + (f" | tx {tx}" if tx else "")
+        + age_line
+        + ("\n* публичный timestamp обычно имеет точность до 1 секунды." if age_est is not None else "")
         + fallback
     )
 
@@ -1543,7 +2127,7 @@ def human_copy_reason(status, error=""):
     if st == "REJECTED_LOCAL":
         return "Ордер не удалось собрать/подписать локально."
     if st == "AMBIGUOUS" or st == "DELAYED_AMBIGUOUS":
-        return "Ответ после отправки неоднозначен; бот fail-closed и не дублирует ордер вслепую."
+        return "Ответ после отправки неоднозначен; recovery сначала сверяет собственные fills, и только потом разрешает новый ордер на остаток."
     if st == "REJECTED":
         return f"CLOB отклонил ордер: {er}" if er else "CLOB отклонил ордер."
     if st == "SKIPPED":
@@ -1652,14 +2236,22 @@ async def ingest_trade(payload, source="rtds", force_skip_reason=None):
     if not info or not si(info.get("enabled"), 1):
         return
 
-    rt_stats["matched_wallet_raw_events"] += 1
+    is_rtds = str(source).startswith("rtds:")
+    if is_rtds:
+        rt_stats["matched_wallet_raw_events"] += 1
+    elif str(source).startswith("rest:"):
+        feed_stats["rest_raw_events"] += 1
     key = event_key(payload)
     if not hot_seen_add(key):
-        rt_stats["duplicate_events"] += 1
+        if is_rtds:
+            rt_stats["duplicate_events"] += 1
         return
 
     detected_ms = now_ms()
-    rt_stats["matched_wallet_events"] += 1
+    if is_rtds:
+        rt_stats["matched_wallet_events"] += 1
+    elif str(source).startswith("rest:"):
+        feed_stats["rest_unique_events"] += 1
     # FOUND notification is queued immediately but Telegram is never awaited here,
     # so it cannot delay signing/submission.
     queue_trade_notice(source_detect_message(wallet, info, payload, source))
@@ -1822,6 +2414,29 @@ async def copy_trade(key, wallet, info, payload, source, detected_ms, detected_p
         })
         await asyncio.to_thread(record_order, row)
 
+        recovery_queued = False
+        if mode == "LIVE" and RECOVERY_ENABLE:
+            remaining_for_recovery = max(0.0, requested - filled)
+            recoverable = (
+                remaining_for_recovery >= MIN_ORDER_SHARES - 1e-9
+                and (filled > 1e-12 or transient_recovery_status(row["status"], row["error"]))
+            )
+            if recoverable:
+                recovery_queued = await asyncio.to_thread(
+                    recovery_schedule_db,
+                    key=key, wallet=wallet, info=info, payload=payload, source=source,
+                    requested=requested, accounted=filled, accounted_gross=gross,
+                    limit_price=limit_price, mode=mode, initial_status=row["status"],
+                    initial_error=row["error"], detected_ms=detected_ms,
+                )
+                if recovery_queued:
+                    queue_trade_notice(
+                        f"🔁 RECOVERY ПОСТАВЛЕН В ОЧЕРЕДЬ\n"
+                        f"👛 {safe_label(info.get('label'), wallet)}\n"
+                        f"Остаток {remaining_for_recovery:.4f}sh будет доисполняться автоматически "
+                        f"по тому же limit {limit_price:.4f}. STOP приостанавливает recovery; START возобновляет."
+                    )
+
         if notify_trades():
             label = safe_label(info.get("label"), wallet)
             ambiguous = str(row["status"]).upper() in {"AMBIGUOUS", "DELAYED_AMBIGUOUS"}
@@ -1853,6 +2468,13 @@ async def copy_trade(key, wallet, info, payload, source, detected_ms, detected_p
             if row.get("api_ms") is not None:
                 latency.append(f"API {si(row['api_ms'])}ms")
             reason = "" if filled > 0 else "\nПричина: " + human_copy_reason(row["status"], row["error"])
+            if (ambiguous or str(row["status"]).upper() in {"REJECTED", "REJECTED_NO_MATCH"}) and row.get("error"):
+                reason += f"\ntech: {str(row['error'])[:500]}"
+            age_est = row.get("source_age_ms_est")
+            if age_est is not None:
+                latency.insert(0, f"source→detect ≈{si(age_est)}ms*")
+            if recovery_queued:
+                reason += "\n🔁 Recovery: ON — остаток сохранён и будет доисполняться в фоне в пределах slippage."
             queue_trade_notice(
                 f"{head}\n"
                 f"👛 {label}\n"
@@ -1867,6 +2489,7 @@ async def copy_trade(key, wallet, info, payload, source, detected_ms, detected_p
                     if fast.get("fast_lane") else ""
                 )
                 + (f"\n⏱ {' | '.join(latency)}" if latency else "")
+                + ("\n* source→detect по публичному timestamp, обычно с точностью до 1 секунды." if age_est is not None else "")
             )
 
 
@@ -1878,6 +2501,7 @@ def base_order_row(key, wallet, info, payload, source, detected_ms, mode, amount
         "source": source,
         "detected_ms": detected_ms,
         "target_timestamp": si(payload.get("timestamp"), 0),
+        "source_age_ms_est": estimated_source_age_ms(payload, detected_ms),
         "target_tx_hash": str(payload.get("transactionHash") or payload.get("transaction_hash") or ""),
         "condition_id": str(payload.get("conditionId") or payload.get("condition_id") or ""),
         "asset": str(payload.get("asset") or payload.get("asset_id") or ""),
@@ -2142,7 +2766,7 @@ def main_keyboard():
             [{"text": "➕ ADD WALLET"}, {"text": "➖ REMOVE WALLET"}],
             [{"text": "📊 REPORT"}, {"text": "💰 BALANCE"}],
             [{"text": "⚙️ MODE"}, {"text": "🔁 SELL MODE"}],
-            [{"text": "🔔 NOTIFY"}],
+            [{"text": "📡 STATUS"}, {"text": "🔔 NOTIFY"}],
         ],
         "resize_keyboard": True,
         "is_persistent": True,
@@ -2187,7 +2811,9 @@ def status_text():
         + f" | MAX ${max_copy_usdc():.2f}\n"
         f"Slippage: {copy_slippage():.3f} | SELL: {sell_mode()} | Wallets: {len(watched_wallets)}/{MAX_WALLETS}\n"
         f"RTDS: {'CONNECTED' if rt_stats['connected'] else 'DISCONNECTED'} | unique {rt_stats['matched_wallet_events']} | raw {rt_stats['matched_wallet_raw_events']} | dup {rt_stats['duplicate_events']}\n"
-        f"REST audit: trades polls {feed_stats['rest_trades_polls']} err {feed_stats['rest_trades_errors']} | activity polls {feed_stats['rest_activity_polls']} err {feed_stats['rest_activity_errors']} | late {feed_stats['rest_late_detected']}\n"
+        f"REST detected: unique {feed_stats['rest_unique_events']} | raw {feed_stats['rest_raw_events']} | late {feed_stats['rest_late_detected']}\n"
+        f"REST polls: trades {feed_stats['rest_trades_polls']} err {feed_stats['rest_trades_errors']} | activity {feed_stats['rest_activity_polls']} err {feed_stats['rest_activity_errors']}\n"
+        f"RECOVERY: {'ON' if RECOVERY_ENABLE else 'OFF'} | active {recovery_active_count()} | done {recovery_stats['completed']} | reconciled {recovery_stats['reconciled']} | retries {recovery_stats['retries']}\n"
         f"BTC15 FAST: {'ON' if BTC15_FASTLANE_ENABLE else 'OFF'} | bookWS {'UP' if btc15_stats['ws_connected'] else 'DOWN'} | assets {len(btc15_assets)} | signer warm {len(btc15_signer_warmed)} | hits {btc15_stats['fastlane_events']}\n"
         f"LIVE master: {'ON' if LIVE_MASTER_ENABLE else 'OFF'} | wallet {live}"
     )
@@ -2581,7 +3207,7 @@ async def handle_text(text):
         new = "0" if notify_trades() else "1"
         set_setting("notify_trades", new)
         await tg_send(f"🔔 Trade notifications: {'ON' if new == '1' else 'OFF'}")
-    elif upper in {"STATUS", "/STATUS", "MENU", "/MENU", "HELP", "/HELP"}:
+    elif upper in {"📡 STATUS", "STATUS", "/STATUS", "MENU", "/MENU", "HELP", "/HELP"}:
         await tg_send(status_text(), main_keyboard())
     else:
         await tg_send(status_text(), main_keyboard())
@@ -2647,6 +3273,7 @@ async def health(request):
         "wallets": len(watched_wallets),
         "rtds": rt_stats,
         "btc15_fastlane": {**btc15_stats, "enabled": BTC15_FASTLANE_ENABLE, "assets": len(btc15_assets), "signer_warm": len(btc15_signer_warmed)},
+        "recovery": {**recovery_stats, "enabled": RECOVERY_ENABLE, "active": recovery_active_count()},
         "live_master": LIVE_MASTER_ENABLE,
         "live_client_ready": live_client_ready,
         "live_client_error": live_client_error,
@@ -2680,6 +3307,7 @@ async def main():
     load_runtime_caches()
     load_wallets()
     load_seen_hot()
+    backfill_recent_recovery_jobs()
     # Every process restart is fail-safe STOP. This is deliberately not persisted
     # as START across redeploys; the user must press START after inspecting status.
     set_setting("running", "0")
@@ -2697,6 +3325,7 @@ async def main():
         asyncio.create_task(prewarm_loop(), name="prewarm"),
         asyncio.create_task(btc15_discovery_loop(), name="btc15-discovery"),
         asyncio.create_task(btc15_market_ws_loop(), name="btc15-book-ws"),
+        asyncio.create_task(recovery_loop(), name="delivery-recovery"),
         asyncio.create_task(seed_all_wallet_shadows(), name="seed-shadows"),
     ]
     log.info(
