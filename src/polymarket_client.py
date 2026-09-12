@@ -1,8 +1,23 @@
 """
-Обёртка над официальным py-clob-client (Polymarket/py-clob-client).
+Обёртка над py-clob-client-v2 (Polymarket/py-clob-client-v2).
+
+ВАЖНО: Polymarket в 2026 мигрировал CLOB на V2 и архивировал старый пакет
+py-clob-client — он теперь отдаёт "invalid order version, please use the
+latest clob-client" на ЛЮБОЙ ордер. Актуальный пакет — py-clob-client-v2,
+с другим API (import прямо из py_clob_client_v2, create_and_post_order
+одним вызовом вместо create_order+post_order, Side.BUY вместо BUY).
+
 Инициализация клиента ленивая — если PRIVATE_KEY не задан (например, ты
 сначала хочешь погонять бота в DRY_RUN на паблик-данных), модуль всё
 равно позволяет читать orderbook без авторизации (Level 0 API).
+
+ВАЖНО #2: на момент миграции на V2 у Polymarket есть открытые баги в
+официальном SDK, из-за которых ордера отклоняются с "maker address not
+allowed, please use the deposit wallet flow" для части типов кошельков
+(EOA, Magic.link-прокси, V1-мигрированные Safe) — это подтверждённые
+issues в их репозитории, не что-то, что чинится на нашей стороне. Если
+ты логинился в Polymarket через email/Magic-ссылку — есть риск упереться
+именно в это. См. README, раздел про CLOB V2.
 """
 from __future__ import annotations
 import math
@@ -36,29 +51,36 @@ def _get_client():
     if _client is not None:
         return _client
 
-    from py_clob_client.client import ClobClient
+    from py_clob_client_v2 import ClobClient
 
     if not settings.POLY_PRIVATE_KEY:
         # Read-only режим — только публичные эндпоинты (orderbook, markets)
         _client = ClobClient(settings.POLY_HOST, chain_id=settings.POLY_CHAIN_ID)
         return _client
 
+    # L1 (подпись кошельком) — получаем/выводим API-ключ отдельным клиентом
+    l1_client = ClobClient(settings.POLY_HOST, chain_id=settings.POLY_CHAIN_ID, key=settings.POLY_PRIVATE_KEY)
+    creds = l1_client.create_or_derive_api_key()
+
     kwargs = dict(
         key=settings.POLY_PRIVATE_KEY,
         chain_id=settings.POLY_CHAIN_ID,
         signature_type=settings.POLY_SIGNATURE_TYPE,
+        creds=creds,
     )
     if settings.POLY_FUNDER_ADDRESS:
         kwargs["funder"] = settings.POLY_FUNDER_ADDRESS
 
+    # L1+L2 полностью авторизованный клиент — им и торгуем
     _client = ClobClient(settings.POLY_HOST, **kwargs)
-    _client.set_api_creds(_client.create_or_derive_api_creds())
     return _client
 
 
 def get_orderbook(token_id: str, depth_levels: int = 5) -> OrderBookSnapshot:
     """REST-фолбэк (Level 0 API, без авторизации). Используется, только если
-    живой WS-стакан ещё не прогрелся или устарел — см. get_orderbook_cached."""
+    живой WS-стакан ещё не прогрелся или устарел — см. get_orderbook_cached.
+    Чтение стакана не затронуто миграцией на V2 — ломались только форматы
+    самих ордеров, а не публичные read-эндпоинты."""
     client = _get_client()
     book = client.get_order_book(token_id)
 
@@ -134,24 +156,29 @@ def prewarm_transport() -> bool:
         return False
 
 
-def place_buy_order(token_id: str, price: float, size_shares: float) -> dict:
+def place_buy_order(token_id: str, price: float, size_shares: float, tick_size: float = 0.01) -> dict:
     """
     Лимитный BUY с исполнением FOK (Fill-Or-Kill) — либо забираем нужный
     объём по цене не хуже указанной прямо сейчас, либо ордер отменяется.
     Это осознанный выбор для входа в рынок с истекающим временем: не хотим
     зависший GTC-ордер, который исполнится в неподходящий момент.
+    create_and_post_order — это API py-clob-client-v2: строит, подписывает
+    и отправляет ордер одним вызовом (в v1 это были два отдельных метода).
     """
-    from py_clob_client.clob_types import OrderArgs, OrderType
-    from py_clob_client.order_builder.constants import BUY
+    from py_clob_client_v2 import OrderArgs, OrderType, Side, PartialCreateOrderOptions
 
     client = _get_client()
-    order_args = OrderArgs(token_id=token_id, price=price, size=size_shares, side=BUY)
-    signed = client.create_order(order_args)
-    return client.post_order(signed, OrderType.FOK)
+    order_args = OrderArgs(token_id=token_id, price=price, size=size_shares, side=Side.BUY)
+    return client.create_and_post_order(
+        order_args=order_args,
+        options=PartialCreateOrderOptions(tick_size=str(tick_size)),
+        order_type=OrderType.FOK,
+    )
 
 
 def get_market_resolution(condition_id: str) -> dict | None:
-    """Проверяем, зарезолвился ли рынок и с каким исходом (для учёта PnL)."""
+    """Не используется в текущем потоке (резолюцию берём через Gamma API в
+    market_discovery.get_resolution), оставлено как утилита на будущее."""
     client = _get_client()
     try:
         market = client.get_market(condition_id)

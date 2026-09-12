@@ -72,7 +72,7 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
     order_id = "dry-run"
     if not dry_run:
         try:
-            resp = polymarket_client.place_buy_order(token_id, execution_price, size_shares)
+            resp = polymarket_client.place_buy_order(token_id, execution_price, size_shares, tick)
             order_id = resp.get("orderID") or resp.get("order_id") or str(resp)
             status = resp.get("status", "SUBMITTED")
         except Exception as exc:  # noqa: BLE001 — любая ошибка биржи не должна ронять бота
