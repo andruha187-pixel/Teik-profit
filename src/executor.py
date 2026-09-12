@@ -57,7 +57,6 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
     dry_run = runtime_state.get("dry_run")
 
     token_id = market.up_token_id if decision.direction == "UP" else market.down_token_id
-    size_shares = round(trade_size / decision.entry_price, 2)
 
     # Между тем, как strategy.evaluate() прочитала ask, и моментом реальной
     # отправки ордера проходит какое-то время (сеть + подпись). Даём себе
@@ -72,9 +71,11 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
     order_id = "dry-run"
     if not dry_run:
         try:
-            resp = polymarket_client.place_buy_order(token_id, execution_price, size_shares, tick)
-            order_id = resp.get("orderID") or resp.get("order_id") or str(resp)
-            status = resp.get("status", "SUBMITTED")
+            # amount_usdc — это ДОЛЛАРОВАЯ сумма для BUY market-ордера, не
+            # количество акций: конвертация не нужна, SDK делает это сам.
+            resp = await polymarket_client.place_buy_order(token_id, execution_price, trade_size, tick)
+            order_id = polymarket_client.response_field(resp, "order_id") or polymarket_client.response_field(resp, "orderID") or str(resp)
+            status = polymarket_client.response_field(resp, "status") or "SUBMITTED"
         except Exception as exc:  # noqa: BLE001 — любая ошибка биржи не должна ронять бота
             await telegram_notify.notify(f"❌ Ошибка при выставлении ордера: {exc}")
             return

@@ -48,9 +48,10 @@ async def _tick():
     if settings.USE_LIVE_BOOK_STREAM:
         book_stream.subscribe([market.up_token_id, market.down_token_id])
 
-    # Периодический прогрев авторизованного HTTP-транспорта (не блокирует луп).
+    # Периодический прогрев авторизованного HTTP-транспорта — fire-and-forget,
+    # не блокирует основной цикл (метод асинхронный в polymarket-client SDK).
     if not runtime_state.get("dry_run"):
-        asyncio.get_event_loop().run_in_executor(None, polymarket_client.prewarm_transport)
+        asyncio.create_task(polymarket_client.prewarm_transport())
 
     klines = await binance_feed.get_klines(limit=max(100, settings.ATR_LOOKBACK_FOR_REGIME + settings.ATR_PERIOD + 5))
     ind = indicators.compute_indicator_snapshot(
@@ -61,8 +62,8 @@ async def _tick():
     minutes_left = max(0.0, (market.end_time - time.time()) / 60)
 
     get_book = polymarket_client.get_orderbook_cached if settings.USE_LIVE_BOOK_STREAM else polymarket_client.get_orderbook
-    up_book = get_book(market.up_token_id)
-    down_book = get_book(market.down_token_id)
+    up_book = await get_book(market.up_token_id)
+    down_book = await get_book(market.down_token_id)
 
     decision = strategy.evaluate(
         current_price=current_price,
