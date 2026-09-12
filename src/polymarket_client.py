@@ -76,22 +76,43 @@ def _get_client():
     return _client
 
 
+def _field(obj, key):
+    """Достаём поле независимо от того, dict это или объект с атрибутами —
+    py-clob-client-v2 в разных местах отдаёт то так, то так."""
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(key)
+    return getattr(obj, key, None)
+
+
+def _to_level(lvl) -> tuple[float, float] | None:
+    price = _field(lvl, "price")
+    size = _field(lvl, "size")
+    try:
+        return float(price), float(size)
+    except (TypeError, ValueError):
+        return None
+
+
 def get_orderbook(token_id: str, depth_levels: int = 5) -> OrderBookSnapshot:
     """REST-фолбэк (Level 0 API, без авторизации). Используется, только если
-    живой WS-стакан ещё не прогрелся или устарел — см. get_orderbook_cached.
-    Чтение стакана не затронуто миграцией на V2 — ломались только форматы
-    самих ордеров, а не публичные read-эндпоинты."""
+    живой WS-стакан ещё не прогрелся или устарел — см. get_orderbook_cached."""
     client = _get_client()
     book = client.get_order_book(token_id)
 
-    asks = sorted(book.asks, key=lambda l: float(l.price)) if book.asks else []
-    bids = sorted(book.bids, key=lambda l: float(l.price), reverse=True) if book.bids else []
+    raw_asks = _field(book, "asks") or []
+    raw_bids = _field(book, "bids") or []
 
-    best_ask = float(asks[0].price) if asks else None
-    best_bid = float(bids[0].price) if bids else None
+    asks = sorted((lv for lv in (_to_level(l) for l in raw_asks) if lv), key=lambda x: x[0])
+    bids = sorted((lv for lv in (_to_level(l) for l in raw_bids) if lv), key=lambda x: x[0], reverse=True)
 
-    ask_liquidity = sum(float(l.price) * float(l.size) for l in asks[:depth_levels])
-    tick = float(getattr(book, "tick_size", None) or 0.01)
+    best_ask = asks[0][0] if asks else None
+    best_bid = bids[0][0] if bids else None
+
+    ask_liquidity = sum(price * size for price, size in asks[:depth_levels])
+    tick_raw = _field(book, "tick_size") or _field(book, "tickSize")
+    tick = float(tick_raw) if tick_raw else 0.01
 
     return OrderBookSnapshot(best_bid=best_bid, best_ask=best_ask, ask_liquidity_usdc=ask_liquidity,
                               tick_size=tick, source="rest")
