@@ -47,7 +47,12 @@ class Settings:
     POLY_CHAIN_ID: int = _get_int("POLY_CHAIN_ID", 137)
     POLY_PRIVATE_KEY: str = os.getenv("POLY_PRIVATE_KEY", "")
     POLY_FUNDER_ADDRESS: str = os.getenv("POLY_FUNDER_ADDRESS", "")
-    # 0 = EOA/MetaMask, 1 = email/Magic wallet, 2 = browser wallet proxy
+    # CLOB V2: 0 = EOA (обычный MetaMask), 1 = POLY_PROXY (email/Magic-link
+    # кошелёк), 2 = POLY_GNOSIS_SAFE (старый V1 Safe-кошелёк), 3 = POLY_1271
+    # (новый "deposit wallet" — предпочтительный флоу Polymarket для V2).
+    # На момент миграции на V2 у Polymarket есть открытые баги, из-за которых
+    # часть этих комбинаций отклоняется с "maker address not allowed" —
+    # это известная проблема на их стороне, см. README.
     POLY_SIGNATURE_TYPE: int = _get_int("POLY_SIGNATURE_TYPE", 0)
 
     # --- Стратегия входа ---
