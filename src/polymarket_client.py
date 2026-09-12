@@ -175,14 +175,15 @@ async def place_buy_order(token_id: str, price_cap: float, amount_usdc: float, t
     Market-ордер BUY с исполнением FOK (Fill-Or-Kill) — либо полностью
     исполняется прямо сейчас, либо целиком отменяется. amount_usdc — это
     ДОЛЛАРОВАЯ сумма к трате (для BUY market-ордеров в этом SDK amount — это
-    USD-номинал, а не количество акций — конвертация не нужна). price_cap
-    задаёт худшую допустимую цену исполнения (защита от слиппеджа).
+    USD-номинал, а не количество акций — конвертация не нужна). max_price
+    задаёт худшую допустимую цену исполнения (защита от слиппеджа) —
+    именно так называется параметр в этом SDK, не "price".
     """
     client = await _get_client()
     return await client.place_market_order(
         token_id=token_id,
         side="BUY",
         amount=str(round(amount_usdc, 2)),
-        price=str(price_cap),
+        max_price=str(price_cap),
         order_type="FOK",
     )
