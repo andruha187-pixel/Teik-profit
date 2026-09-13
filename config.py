@@ -92,5 +92,9 @@ class Settings:
     # --- Storage ---
     DB_PATH: str = os.getenv("DB_PATH", "data/bot.db")
 
+    # --- Отчёты для анализа стратегии ---
+    REPORT_INTERVAL_HOURS: float = _get_float("REPORT_INTERVAL_HOURS", 4.0)
+    REPORTS_DIR: str = os.getenv("REPORTS_DIR", "data/reports")
+
 
 settings = Settings()
