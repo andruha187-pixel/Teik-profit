@@ -25,6 +25,13 @@ class Decision:
     minutes_left: float
     distance_atr: float
     reasons: list[str] = field(default_factory=list)
+    # Компоненты score — нужны отдельно, чтобы потом можно было проанализировать,
+    # какой фактор реально предсказывает исход, а какой просто шум.
+    time_score: float = 0.0
+    distance_score: float = 0.0
+    trend_score: float = 0.0
+    vol_score: float = 0.0
+    liq_score: float = 0.0
 
 
 def _score_time_window(minutes_left: float) -> float:
@@ -141,4 +148,9 @@ def evaluate(
         minutes_left=round(minutes_left, 2),
         distance_atr=round(distance_atr, 2),
         reasons=reasons,
+        time_score=round(time_score, 1),
+        distance_score=round(distance_score, 1),
+        trend_score=round(trend_score, 1),
+        vol_score=round(vol_score, 1),
+        liq_score=round(liq_score, 1),
     )

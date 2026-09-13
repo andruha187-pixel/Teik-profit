@@ -1,6 +1,11 @@
 """
 Лёгкое SQLite-хранилище: сигналы (для последующего бэктеста стратегии) и
 сделки (для учёта PnL). Никакой внешней БД не нужно для старта.
+
+Таблица signals пишет КАЖДЫЙ тик, вошёл бот или нет — это основной
+датасет для анализа: раз в 15 минут рынок резолвится, и мы можем
+подписать (label_signals_outcome) все тики этого рынка исходом,
+получая полноценные признаки + метку для последующего подбора формулы.
 """
 from __future__ import annotations
 import os
@@ -47,6 +52,27 @@ CREATE TABLE IF NOT EXISTS bot_settings (
 );
 """
 
+# Колонки, добавленные уже после первого релиза — через ALTER TABLE, чтобы
+# не терять историю на уже задеплоенных базах. (column_name, sql_type)
+_SIGNALS_MIGRATIONS = [
+    ("atr", "REAL"),
+    ("atr_ratio_to_avg", "REAL"),
+    ("ema_fast", "REAL"),
+    ("ema_slow", "REAL"),
+    ("ema_fast_slope", "REAL"),
+    ("trend_up", "INTEGER"),
+    ("time_score", "REAL"),
+    ("distance_score", "REAL"),
+    ("trend_score", "REAL"),
+    ("vol_score", "REAL"),
+    ("liq_score", "REAL"),
+    ("ask_liquidity_usdc", "REAL"),
+    ("up_best_ask", "REAL"),
+    ("down_best_ask", "REAL"),
+    ("book_source", "TEXT"),
+    ("outcome", "TEXT"),
+]
+
 
 @contextmanager
 def _conn():
@@ -62,21 +88,74 @@ def _conn():
 def init_db():
     with _conn() as conn:
         conn.executescript(_SCHEMA)
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(signals)")}
+        for col, sql_type in _SIGNALS_MIGRATIONS:
+            if col not in existing:
+                conn.execute(f"ALTER TABLE signals ADD COLUMN {col} {sql_type}")
 
 
-def log_signal(market_slug: str, current_price: float, strike_price: float, decision) -> None:
+def log_signal(market_slug: str, current_price: float, strike_price: float, decision,
+               indicators: dict | None = None, up_book=None, down_book=None) -> None:
+    """
+    indicators/up_book/down_book необязательны (обратная совместимость), но
+    без них отчёт для анализа будет неполным — main.py всегда должен их
+    передавать.
+    """
+    indicators = indicators or {}
     with _conn() as conn:
         conn.execute(
             """INSERT INTO signals
                (ts, market_slug, current_price, strike_price, direction, entry_price,
-                safety_score, minutes_left, distance_atr, should_enter, reasons)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                safety_score, minutes_left, distance_atr, should_enter, reasons,
+                atr, atr_ratio_to_avg, ema_fast, ema_slow, ema_fast_slope, trend_up,
+                time_score, distance_score, trend_score, vol_score, liq_score,
+                ask_liquidity_usdc, up_best_ask, down_best_ask, book_source)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 int(time.time()), market_slug, current_price, strike_price, decision.direction,
                 decision.entry_price, decision.safety_score, decision.minutes_left,
                 decision.distance_atr, int(decision.should_enter), "; ".join(decision.reasons),
+                indicators.get("atr"), indicators.get("atr_ratio_to_avg"),
+                indicators.get("ema_fast"), indicators.get("ema_slow"), indicators.get("ema_fast_slope"),
+                int(indicators.get("trend_up")) if indicators.get("trend_up") is not None else None,
+                decision.time_score, decision.distance_score, decision.trend_score,
+                decision.vol_score, decision.liq_score,
+                (up_book.ask_liquidity_usdc if decision.direction == "UP" else down_book.ask_liquidity_usdc)
+                if (up_book and down_book) else None,
+                up_book.best_ask if up_book else None,
+                down_book.best_ask if down_book else None,
+                (up_book.source if decision.direction == "UP" else down_book.source)
+                if (up_book and down_book) else None,
             ),
         )
+
+
+def label_signals_outcome(market_slug: str, outcome: str) -> int:
+    """Проставляет исход рынка всем ещё не подписанным тикам этого рынка.
+    Возвращает число обновлённых строк."""
+    with _conn() as conn:
+        cur = conn.execute(
+            "UPDATE signals SET outcome = ? WHERE market_slug = ? AND outcome IS NULL",
+            (outcome, market_slug),
+        )
+        return cur.rowcount
+
+
+def get_markets_needing_outcome(exclude_slug: str | None, limit: int = 50) -> list[str]:
+    """Слаги рынков, у которых есть сигналы без проставленного исхода —
+    кандидаты на то, чтобы спросить Gamma API, не зарезолвились ли они."""
+    with _conn() as conn:
+        if exclude_slug:
+            cur = conn.execute(
+                "SELECT DISTINCT market_slug FROM signals WHERE outcome IS NULL AND market_slug != ? "
+                "ORDER BY ts ASC LIMIT ?", (exclude_slug, limit),
+            )
+        else:
+            cur = conn.execute(
+                "SELECT DISTINCT market_slug FROM signals WHERE outcome IS NULL ORDER BY ts ASC LIMIT ?",
+                (limit,),
+            )
+        return [row[0] for row in cur.fetchall()]
 
 
 def log_trade(market_slug: str, condition_id: str, direction: str, entry_price: float,
@@ -128,6 +207,36 @@ def get_pnl_summary(since_ts: int = 0):
         )
         count, total_pnl, wins = cur.fetchone()
         return {"trades": count or 0, "pnl_usdc": total_pnl or 0.0, "wins": wins or 0}
+
+
+# --- Экспорт для периодических отчётов (см. src/reporting.py) ---
+
+SIGNALS_COLUMNS = [
+    "id", "ts", "market_slug", "current_price", "strike_price", "direction", "entry_price",
+    "safety_score", "minutes_left", "distance_atr", "should_enter", "reasons",
+    "atr", "atr_ratio_to_avg", "ema_fast", "ema_slow", "ema_fast_slope", "trend_up",
+    "time_score", "distance_score", "trend_score", "vol_score", "liq_score",
+    "ask_liquidity_usdc", "up_best_ask", "down_best_ask", "book_source", "outcome",
+]
+
+TRADES_COLUMNS = [
+    "id", "ts", "market_slug", "condition_id", "direction", "entry_price", "size_usdc",
+    "order_id", "status", "outcome", "pnl_usdc", "dry_run",
+]
+
+
+def get_signals_since(since_ts: int) -> list[tuple]:
+    with _conn() as conn:
+        cols = ", ".join(SIGNALS_COLUMNS)
+        cur = conn.execute(f"SELECT {cols} FROM signals WHERE ts >= ? ORDER BY ts ASC", (since_ts,))
+        return cur.fetchall()
+
+
+def get_trades_since(since_ts: int) -> list[tuple]:
+    with _conn() as conn:
+        cols = ", ".join(TRADES_COLUMNS)
+        cur = conn.execute(f"SELECT {cols} FROM trades WHERE ts >= ? ORDER BY ts ASC", (since_ts,))
+        return cur.fetchall()
 
 
 # --- Настройки, управляемые из Telegram (переживают рестарт процесса) ---

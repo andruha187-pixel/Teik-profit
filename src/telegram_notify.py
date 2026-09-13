@@ -11,14 +11,15 @@
 from __future__ import annotations
 import time
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
 from config import settings
 from src import storage, runtime_state
 
 _app: Application | None = None
 _state_ref: dict = {}  # заполняется из main.py: последний сигнал/статус для меню
+_pending_input: str | None = None  # "size" | "stoploss" | None — ждём ли текстовый ввод числа
 
 SIZE_PRESETS = [5, 10, 20, 50, 100]
 STOPLOSS_PRESETS = [20, 50, 100, 200]
@@ -85,6 +86,7 @@ def _size_menu_markup() -> InlineKeyboardMarkup:
             row = []
     if row:
         rows.append(row)
+    rows.append([InlineKeyboardButton("✏️ Свой размер", callback_data="size_custom")])
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="menu:main")])
     return InlineKeyboardMarkup(rows)
 
@@ -105,6 +107,7 @@ def _stoploss_menu_markup() -> InlineKeyboardMarkup:
         InlineKeyboardButton("−10", callback_data="sl_delta:-10"),
         InlineKeyboardButton("+10", callback_data="sl_delta:+10"),
     ])
+    rows.append([InlineKeyboardButton("✏️ Свой лимит", callback_data="sl_custom")])
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="menu:main")])
     return InlineKeyboardMarkup(rows)
 
@@ -125,6 +128,15 @@ def _settings_menu_markup() -> InlineKeyboardMarkup:
         InlineKeyboardButton("−5", callback_data="score_delta:-5"),
         InlineKeyboardButton("+5", callback_data="score_delta:+5"),
     ])
+    rows.append([
+        InlineKeyboardButton("−1", callback_data="score_delta:-1"),
+        InlineKeyboardButton("+1", callback_data="score_delta:+1"),
+    ])
+    scaling_on = runtime_state.get("size_scaling_enabled")
+    rows.append([InlineKeyboardButton(
+        "📉 Масштабировать размер по score" if not scaling_on else "💯 Входить полным размером",
+        callback_data="scaling_toggle",
+    )])
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="menu:main")])
     return InlineKeyboardMarkup(rows)
 
@@ -154,6 +166,20 @@ async def _cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(_stats_text())
 
 
+async def _cmd_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    s = _state_ref
+    if not s or not s.get("up_token_id"):
+        await update.message.reply_text("Пока нет данных о текущем рынке — подожди следующего тика бота.")
+        return
+    await update.message.reply_text(
+        f"Рынок: {s.get('market_slug', '—')}\n\n"
+        f"UP token_id:\n`{s.get('up_token_id')}`\n\n"
+        f"DOWN token_id:\n`{s.get('down_token_id')}`\n\n"
+        f"Долгий тап на число — скопировать.",
+        parse_mode="Markdown",
+    )
+
+
 def _stats_text() -> str:
     today_start = int(time.time() // 86400) * 86400
     today = storage.get_pnl_summary(today_start)
@@ -165,9 +191,36 @@ def _stats_text() -> str:
     )
 
 
+async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ловит обычный текст, когда мы ждём число после '✏️ Свой размер'/'✏️ Свой лимит'.
+    Вне этого режима ничего не делает — не мешает обычной переписке."""
+    global _pending_input
+    if _pending_input is None:
+        return
+
+    raw = (update.message.text or "").strip().replace(",", ".")
+    try:
+        value = float(raw)
+        if value <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Не похоже на положительное число, попробуй ещё раз (например: 15.5)")
+        return
+
+    if _pending_input == "size":
+        runtime_state.set("trade_size_usdc", value)
+        _pending_input = None
+        await update.message.reply_text(f"✅ Размер позиции: {value:.2f} USDC", reply_markup=_size_menu_markup())
+    elif _pending_input == "stoploss":
+        runtime_state.set("daily_loss_limit_usdc", value)
+        _pending_input = None
+        await update.message.reply_text(f"✅ Стоп-лосс: {value:.2f} USDC/день", reply_markup=_stoploss_menu_markup())
+
+
 # ------------------------------------------------------------- кнопки -----
 
 async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global _pending_input
     query = update.callback_query
     data = query.data
     await query.answer()
@@ -186,12 +239,17 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "menu:settings":
+        scaling_on = runtime_state.get("size_scaling_enabled")
+        scaling_line = (
+            f"Размер ставки масштабируется от порога: на пограничном score — "
+            f"{settings.SIZE_SCALING_MIN_FRACTION*100:.0f}% от размера позиции, "
+            f"на score {settings.SIZE_SCALING_MAX_SCORE:.0f}+ — полный размер."
+            if scaling_on else
+            "Масштабирование выключено — любая прошедшая порог сделка идёт полным размером."
+        )
         await query.edit_message_text(
             f"⚙️ Safety score порог: {runtime_state.get('safety_score_threshold'):.0f}\n"
-            "Чем выше — тем реже и осторожнее входы.\n\n"
-            "Размер ставки уже масштабируется от порога: на пограничном score — "
-            f"{settings.SIZE_SCALING_MIN_FRACTION*100:.0f}% от размера позиции, "
-            f"на score {settings.SIZE_SCALING_MAX_SCORE:.0f}+ — полный размер.",
+            "Чем выше — тем реже и осторожнее входы.\n\n" + scaling_line,
             reply_markup=_settings_menu_markup(),
         )
 
@@ -207,6 +265,13 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         runtime_state.set("trade_size_usdc", val)
         await query.edit_message_text(f"✅ Размер позиции: {val:.0f} USDC", reply_markup=_size_menu_markup())
 
+    elif data == "size_custom":
+        _pending_input = "size"
+        await query.edit_message_text(
+            "✏️ Напиши число (USDC) следующим сообщением, например: 15.5",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="menu:size")]]),
+        )
+
     elif data.startswith("sl_set:"):
         val = float(data.split(":", 1)[1])
         runtime_state.set("daily_loss_limit_usdc", val)
@@ -217,6 +282,13 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_val = max(5.0, runtime_state.get("daily_loss_limit_usdc") + delta)
         runtime_state.set("daily_loss_limit_usdc", new_val)
         await query.edit_message_text(f"✅ Стоп-лосс: {new_val:.0f} USDC/день", reply_markup=_stoploss_menu_markup())
+
+    elif data == "sl_custom":
+        _pending_input = "stoploss"
+        await query.edit_message_text(
+            "✏️ Напиши число (USDC/день) следующим сообщением, например: 75",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="menu:sl")]]),
+        )
 
     elif data.startswith("score_delta:"):
         delta = float(data.split(":", 1)[1])
@@ -232,6 +304,14 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f"⚙️ Safety score порог: {new_val:.0f}", reply_markup=_settings_menu_markup(),
         )
+
+    elif data == "scaling_toggle":
+        new_val = not runtime_state.get("size_scaling_enabled")
+        runtime_state.set("size_scaling_enabled", new_val)
+        msg = ("📉 Масштабирование включено — размер сделки зависит от score."
+               if new_val else
+               "💯 Масштабирование выключено — любая прошедшая порог сделка идёт полным размером.")
+        await query.edit_message_text(msg, reply_markup=_settings_menu_markup())
 
     elif data == "mode_toggle":
         if runtime_state.get("dry_run"):
@@ -262,8 +342,32 @@ def build_app() -> Application:
     _app.add_handler(CommandHandler("menu", _cmd_start_or_menu))
     _app.add_handler(CommandHandler("status", _cmd_status))
     _app.add_handler(CommandHandler("pnl", _cmd_pnl))
+    _app.add_handler(CommandHandler("token", _cmd_token))
     _app.add_handler(CallbackQueryHandler(_on_callback))
+    _app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text))
     return _app
+
+
+async def clear_legacy_keyboard() -> None:
+    """
+    Если этот бот-токен раньше использовался другой программой (например,
+    copy-trading ботом со своей постоянной клавиатурой START/STOP/AMOUNT/...),
+    Telegram продолжает показывать её внизу чата, пока что-то явно не пришлёт
+    ReplyKeyboardRemove — наши собственные кнопки инлайновые и её не трогают.
+    Вызывается один раз при старте.
+    """
+    if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_CHAT_ID:
+        return
+    if _app is None:
+        return
+    try:
+        await _app.bot.send_message(
+            chat_id=settings.TELEGRAM_CHAT_ID,
+            text="🧹 Убираю старую клавиатуру, если она осталась от другого бота...",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    except Exception:
+        pass
 
 
 async def notify(text: str) -> None:
@@ -272,3 +376,14 @@ async def notify(text: str) -> None:
     if _app is None:
         return
     await _app.bot.send_message(chat_id=settings.TELEGRAM_CHAT_ID, text=text)
+
+
+async def send_document(path: str, caption: str | None) -> None:
+    """Отправляет файл (например, CSV-отчёт) в чат. caption может быть None,
+    если это второй файл в паре и подпись уже была у первого."""
+    if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_CHAT_ID:
+        return
+    if _app is None:
+        return
+    with open(path, "rb") as f:
+        await _app.bot.send_document(chat_id=settings.TELEGRAM_CHAT_ID, document=f, caption=caption)
