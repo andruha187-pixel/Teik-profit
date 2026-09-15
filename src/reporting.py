@@ -76,10 +76,17 @@ async def build_and_send_report() -> None:
                row[storage.TRADES_COLUMNS.index("pnl_usdc")] > 0)
     pnl_sum = sum(row[storage.TRADES_COLUMNS.index("pnl_usdc")] or 0 for row in closed_trades)
 
+    by_asset = storage.get_pnl_by_asset(since_ts)
+    asset_lines = "\n".join(
+        f"  {a.upper()}: {b['trades']} сделок, PnL {b['pnl_usdc']:+.2f}"
+        for a, b in sorted(by_asset.items())
+    ) or "  (сделок за период не было)"
+
     caption = (
         f"📄 Отчёт {from_label} → {to_label} (UTC)\n"
         f"Тиков сигналов: {len(signals)} (с известным исходом: {labeled}) | вошли: {entered}\n"
-        f"Сделок закрыто: {len(closed_trades)} | побед: {wins} | PnL: {pnl_sum:+.2f} USDC"
+        f"Сделок закрыто: {len(closed_trades)} | побед: {wins} | PnL: {pnl_sum:+.2f} USDC\n\n"
+        f"По токенам за период:\n{asset_lines}"
     )
 
     await telegram_notify.send_document(signals_path, caption)

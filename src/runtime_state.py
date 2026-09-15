@@ -24,6 +24,11 @@ _DEFAULTS = {
     # По умолчанию выключено: каждая прошедшая порог сделка идёт полным
     # TRADE_SIZE_USDC, без урезания по пограничности score.
     "size_scaling_enabled": False,
+    # Стоп-лосс ОТДЕЛЬНОЙ позиции в процентах (не дневной!): если текущая
+    # стоимость позиции (по best bid в стакане) упала настолько от суммы
+    # входа — закрываем досрочно продажей, не дожидаясь резолюции рынка.
+    "position_stop_loss_enabled": False,
+    "position_stop_loss_pct": 50.0,
 }
 
 # Типы приведения при чтении из SQLite (там всё хранится как TEXT)
@@ -36,6 +41,8 @@ _CASTERS = {
     "min_entry_price": float,
     "max_entry_price": float,
     "size_scaling_enabled": lambda v: str(v).lower() == "true",
+    "position_stop_loss_enabled": lambda v: str(v).lower() == "true",
+    "position_stop_loss_pct": float,
 }
 
 _state: dict = dict(_DEFAULTS)

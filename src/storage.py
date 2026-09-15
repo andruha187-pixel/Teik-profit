@@ -71,6 +71,12 @@ _SIGNALS_MIGRATIONS = [
     ("down_best_ask", "REAL"),
     ("book_source", "TEXT"),
     ("outcome", "TEXT"),
+    ("asset", "TEXT"),
+    ("timeframe", "TEXT"),
+]
+
+_TRADES_MIGRATIONS = [
+    ("token_id", "TEXT"),
 ]
 
 
@@ -92,6 +98,10 @@ def init_db():
         for col, sql_type in _SIGNALS_MIGRATIONS:
             if col not in existing:
                 conn.execute(f"ALTER TABLE signals ADD COLUMN {col} {sql_type}")
+        existing_trades = {row[1] for row in conn.execute("PRAGMA table_info(trades)")}
+        for col, sql_type in _TRADES_MIGRATIONS:
+            if col not in existing_trades:
+                conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {sql_type}")
 
 
 def log_signal(market_slug: str, current_price: float, strike_price: float, decision,
@@ -102,6 +112,7 @@ def log_signal(market_slug: str, current_price: float, strike_price: float, deci
     передавать.
     """
     indicators = indicators or {}
+    asset, timeframe_label = parse_market_slug(market_slug)
     with _conn() as conn:
         conn.execute(
             """INSERT INTO signals
@@ -109,8 +120,8 @@ def log_signal(market_slug: str, current_price: float, strike_price: float, deci
                 safety_score, minutes_left, distance_atr, should_enter, reasons,
                 atr, atr_ratio_to_avg, ema_fast, ema_slow, ema_fast_slope, trend_up,
                 time_score, distance_score, trend_score, vol_score, liq_score,
-                ask_liquidity_usdc, up_best_ask, down_best_ask, book_source)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ask_liquidity_usdc, up_best_ask, down_best_ask, book_source, asset, timeframe)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 int(time.time()), market_slug, current_price, strike_price, decision.direction,
                 decision.entry_price, decision.safety_score, decision.minutes_left,
@@ -126,6 +137,7 @@ def log_signal(market_slug: str, current_price: float, strike_price: float, deci
                 down_book.best_ask if down_book else None,
                 (up_book.source if decision.direction == "UP" else down_book.source)
                 if (up_book and down_book) else None,
+                asset, timeframe_label,
             ),
         )
 
@@ -141,33 +153,29 @@ def label_signals_outcome(market_slug: str, outcome: str) -> int:
         return cur.rowcount
 
 
-def get_markets_needing_outcome(exclude_slug: str | None, limit: int = 50) -> list[str]:
+def get_markets_needing_outcome(exclude_slugs: set[str] | None, limit: int = 50) -> list[str]:
     """Слаги рынков, у которых есть сигналы без проставленного исхода —
     кандидаты на то, чтобы спросить Gamma API, не зарезолвились ли они."""
+    exclude_slugs = exclude_slugs or set()
     with _conn() as conn:
-        if exclude_slug:
-            cur = conn.execute(
-                "SELECT DISTINCT market_slug FROM signals WHERE outcome IS NULL AND market_slug != ? "
-                "ORDER BY ts ASC LIMIT ?", (exclude_slug, limit),
-            )
-        else:
-            cur = conn.execute(
-                "SELECT DISTINCT market_slug FROM signals WHERE outcome IS NULL ORDER BY ts ASC LIMIT ?",
-                (limit,),
-            )
-        return [row[0] for row in cur.fetchall()]
+        cur = conn.execute(
+            "SELECT DISTINCT market_slug FROM signals WHERE outcome IS NULL ORDER BY ts ASC LIMIT ?",
+            (limit + len(exclude_slugs),),
+        )
+        rows = [row[0] for row in cur.fetchall() if row[0] not in exclude_slugs]
+        return rows[:limit]
 
 
 def log_trade(market_slug: str, condition_id: str, direction: str, entry_price: float,
-              size_usdc: float, order_id: str, status: str, dry_run: bool) -> int:
+              size_usdc: float, order_id: str, status: str, dry_run: bool, token_id: str = "") -> int:
     with _conn() as conn:
         cur = conn.execute(
             """INSERT INTO trades
                (ts, market_slug, condition_id, direction, entry_price, size_usdc,
-                order_id, status, outcome, pnl_usdc, dry_run)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)""",
+                order_id, status, outcome, pnl_usdc, dry_run, token_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)""",
             (int(time.time()), market_slug, condition_id, direction, entry_price,
-             size_usdc, order_id, status, int(dry_run)),
+             size_usdc, order_id, status, int(dry_run), token_id),
         )
         return cur.lastrowid
 
@@ -189,10 +197,30 @@ def get_open_trade_for_market(market_slug: str):
         return cur.fetchone()
 
 
+def count_open_trades() -> int:
+    """Общее число сейчас открытых позиций по ВСЕМ активам/таймфреймам —
+    используется для общего лимита MAX_OPEN_POSITIONS (см. executor.py)."""
+    with _conn() as conn:
+        cur = conn.execute("SELECT COUNT(*) FROM trades WHERE outcome IS NULL")
+        return cur.fetchone()[0]
+
+
+def parse_market_slug(slug: str) -> tuple[str, str]:
+    """'sol-updown-1h-1789270200' -> ('sol', '1h'). Если формат неожиданный,
+    возвращает ('unknown', 'unknown') вместо падения — отчёты не должны
+    рушиться из-за одного странного слага."""
+    try:
+        asset, rest = slug.split("-updown-", 1)
+        label = rest.split("-", 1)[0]
+        return asset, label
+    except (ValueError, AttributeError):
+        return "unknown", "unknown"
+
+
 def get_unsettled_trades():
     with _conn() as conn:
         cur = conn.execute(
-            "SELECT id, market_slug, condition_id, direction, entry_price, size_usdc, dry_run "
+            "SELECT id, market_slug, condition_id, direction, entry_price, size_usdc, dry_run, token_id "
             "FROM trades WHERE outcome IS NULL",
         )
         return cur.fetchall()
@@ -209,10 +237,51 @@ def get_pnl_summary(since_ts: int = 0):
         return {"trades": count or 0, "pnl_usdc": total_pnl or 0.0, "wins": wins or 0}
 
 
+def get_pnl_by_asset(since_ts: int = 0) -> dict[str, dict]:
+    """PnL/винрейт по каждому активу отдельно (суммируя все таймфреймы этого
+    актива) — для кнопки 'Статистика' в Telegram."""
+    with _conn() as conn:
+        cur = conn.execute(
+            "SELECT market_slug, pnl_usdc FROM trades WHERE outcome IS NOT NULL AND ts >= ?",
+            (since_ts,),
+        )
+        rows = cur.fetchall()
+
+    by_asset: dict[str, dict] = {}
+    for slug, pnl in rows:
+        asset, _label = parse_market_slug(slug)
+        bucket = by_asset.setdefault(asset, {"trades": 0, "pnl_usdc": 0.0, "wins": 0})
+        bucket["trades"] += 1
+        bucket["pnl_usdc"] += pnl or 0.0
+        if (pnl or 0.0) > 0:
+            bucket["wins"] += 1
+    return by_asset
+
+
+def get_pnl_by_timeframe(since_ts: int = 0) -> dict[str, dict]:
+    """То же самое, но сгруппировано по таймфрейму (15m/1h) вместо актива."""
+    with _conn() as conn:
+        cur = conn.execute(
+            "SELECT market_slug, pnl_usdc FROM trades WHERE outcome IS NOT NULL AND ts >= ?",
+            (since_ts,),
+        )
+        rows = cur.fetchall()
+
+    by_tf: dict[str, dict] = {}
+    for slug, pnl in rows:
+        _asset, label = parse_market_slug(slug)
+        bucket = by_tf.setdefault(label, {"trades": 0, "pnl_usdc": 0.0, "wins": 0})
+        bucket["trades"] += 1
+        bucket["pnl_usdc"] += pnl or 0.0
+        if (pnl or 0.0) > 0:
+            bucket["wins"] += 1
+    return by_tf
+
+
 # --- Экспорт для периодических отчётов (см. src/reporting.py) ---
 
 SIGNALS_COLUMNS = [
-    "id", "ts", "market_slug", "current_price", "strike_price", "direction", "entry_price",
+    "id", "ts", "market_slug", "asset", "timeframe", "current_price", "strike_price", "direction", "entry_price",
     "safety_score", "minutes_left", "distance_atr", "should_enter", "reasons",
     "atr", "atr_ratio_to_avg", "ema_fast", "ema_slow", "ema_fast_slope", "trend_up",
     "time_score", "distance_score", "trend_score", "vol_score", "liq_score",
@@ -221,7 +290,7 @@ SIGNALS_COLUMNS = [
 
 TRADES_COLUMNS = [
     "id", "ts", "market_slug", "condition_id", "direction", "entry_price", "size_usdc",
-    "order_id", "status", "outcome", "pnl_usdc", "dry_run",
+    "order_id", "status", "outcome", "pnl_usdc", "dry_run", "token_id",
 ]
 
 

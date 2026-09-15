@@ -145,6 +145,23 @@ async def _sender(ws) -> None:
         await ws.send(json.dumps(payload))
 
 
+def _handle_message(msg: dict) -> None:
+    """Обработка ОДНОГО объекта сообщения. Вызывается и напрямую (обычный
+    dict), и поэлементно, если сервер прислал JSON-массив (см. ниже)."""
+    event_type = msg.get("event_type")
+    if event_type == "book":
+        asset = str(msg.get("asset_id") or "")
+        if asset:
+            _apply_snapshot(asset, msg)
+    elif event_type == "price_change":
+        _apply_delta(msg)
+    elif event_type == "tick_size_change":
+        asset = str(msg.get("asset_id") or "")
+        new_tick = msg.get("new_tick_size")
+        if asset in _books and new_tick:
+            _books[asset]["tick_size"] = float(new_tick)
+
+
 async def run_forever() -> None:
     """Фоновая задача: держит WS-соединение живым, переподключается при обрыве.
     Запускать один раз при старте бота (main.py). Keepalive — protocol-level
@@ -166,19 +183,15 @@ async def run_forever() -> None:
                     async for raw in ws:
                         if raw == "PONG":
                             continue
-                        msg = json.loads(raw)
-                        event_type = msg.get("event_type")
-                        if event_type == "book":
-                            asset = str(msg.get("asset_id") or "")
-                            if asset:
-                                _apply_snapshot(asset, msg)
-                        elif event_type == "price_change":
-                            _apply_delta(msg)
-                        elif event_type == "tick_size_change":
-                            asset = str(msg.get("asset_id") or "")
-                            new_tick = msg.get("new_tick_size")
-                            if asset in _books and new_tick:
-                                _books[asset]["tick_size"] = float(new_tick)
+                        parsed = json.loads(raw)
+                        # Сервер иногда шлёт не один объект, а МАССИВ объектов
+                        # разом (например, снапшот сразу по нескольким
+                        # подписанным токенам при первом коннекте) — раньше
+                        # это валило .get() на list и роняло всё соединение.
+                        messages = parsed if isinstance(parsed, list) else [parsed]
+                        for msg in messages:
+                            if isinstance(msg, dict):
+                                _handle_message(msg)
                 finally:
                     sender_task.cancel()
         except Exception as exc:  # noqa: BLE001

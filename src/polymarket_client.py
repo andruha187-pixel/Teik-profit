@@ -187,3 +187,27 @@ async def place_buy_order(token_id: str, price_cap: float, amount_usdc: float, t
         max_price=str(price_cap),
         order_type="FOK",
     )
+
+
+async def place_sell_order(token_id: str, shares: float, min_price: float | None = None) -> dict:
+    """
+    Market-ордер SELL с исполнением FOK — досрочное закрытие позиции
+    (стоп-лосс по проценту, см. executor.check_position_stop_losses).
+
+    ВАЖНО: для SELL этот SDK использует параметр `shares` (количество акций),
+    а не `amount`, как для BUY (доллары) — это подтверждено официальной
+    документацией Polymarket отдельно от BUY-примеров, не мой домысел по
+    аналогии. min_price — защита от слиппеджа на продаже (не даём продать
+    дешевле этой цены); если конкретная версия SDK не примет этот kwarg,
+    отправляем без него — не хотим падать всей функцией из-за
+    необязательного параметра защиты в SDK, который всё ещё в статусе beta.
+    """
+    client = await _get_client()
+    kwargs = dict(token_id=token_id, side="SELL", shares=str(round(shares, 2)), order_type="FOK")
+    if min_price is not None:
+        kwargs["min_price"] = str(min_price)
+    try:
+        return await client.place_market_order(**kwargs)
+    except TypeError:
+        kwargs.pop("min_price", None)
+        return await client.place_market_order(**kwargs)
