@@ -28,17 +28,18 @@ def _get_int(name: str, default: int) -> int:
 
 @dataclass
 class Settings:
-    # --- Асset / market ---
-    ASSET: str = os.getenv("ASSET", "btc")                 # btc / eth / sol / xrp
-    MARKET_INTERVAL_MIN: int = _get_int("MARKET_INTERVAL_MIN", 15)
+    # --- Активы ---
+    # Список торгуемых монет через запятую — на каждую заводится независимый
+    # поток по каждому таймфрейму (см. src/timeframes.py).
+    ASSETS: list = field(default_factory=lambda: [
+        a.strip().lower() for a in os.getenv("ASSETS", "btc,eth,sol,bnb,hype,xrp").split(",") if a.strip()
+    ])
 
     # --- Binance (источник цены/индикаторов) ---
-    BINANCE_SYMBOL: str = os.getenv("BINANCE_SYMBOL", "BTCUSDT")
     BINANCE_BASE_URL: str = os.getenv("BINANCE_BASE_URL", "https://api.binance.com")
-    KLINE_INTERVAL: str = os.getenv("KLINE_INTERVAL", "1m")
-    ATR_PERIOD: int = _get_int("ATR_PERIOD", 14)
-    EMA_FAST: int = _get_int("EMA_FAST", 9)
-    EMA_SLOW: int = _get_int("EMA_SLOW", 21)
+    # Фьючерсный хост — фолбэк для монет без спотовой пары на Binance (HYPE
+    # на споте под вопросом на момент написания; на фьючерсах есть точно).
+    BINANCE_FUTURES_URL: str = os.getenv("BINANCE_FUTURES_URL", "https://fapi.binance.com")
     ATR_LOOKBACK_FOR_REGIME: int = _get_int("ATR_LOOKBACK_FOR_REGIME", 60)
 
     # --- Polymarket / CLOB ---
@@ -53,13 +54,9 @@ class Settings:
     # в конфиге на случай отката на другой клиент, полем можно не заниматься.
     POLY_SIGNATURE_TYPE: int = _get_int("POLY_SIGNATURE_TYPE", 0)
 
-    # --- Стратегия входа ---
+    # --- Стратегия входа (общее для всех активов/таймфреймов) ---
     MIN_ENTRY_PRICE: float = _get_float("MIN_ENTRY_PRICE", 0.87)
     MAX_ENTRY_PRICE: float = _get_float("MAX_ENTRY_PRICE", 0.95)
-    MIN_MINUTES_LEFT: float = _get_float("MIN_MINUTES_LEFT", 2.0)
-    MAX_MINUTES_LEFT: float = _get_float("MAX_MINUTES_LEFT", 9.0)
-    ATR_DISTANCE_MULT: float = _get_float("ATR_DISTANCE_MULT", 1.3)
-    ATR_SPIKE_MULT: float = _get_float("ATR_SPIKE_MULT", 2.2)
     SAFETY_SCORE_THRESHOLD: float = _get_float("SAFETY_SCORE_THRESHOLD", 75.0)
     MIN_BOOK_LIQUIDITY_USDC: float = _get_float("MIN_BOOK_LIQUIDITY_USDC", 25.0)
 
@@ -70,7 +67,14 @@ class Settings:
 
     # --- Управление капиталом ---
     TRADE_SIZE_USDC: float = _get_float("TRADE_SIZE_USDC", 10.0)
-    MAX_OPEN_POSITIONS: int = _get_int("MAX_OPEN_POSITIONS", 1)
+    # Общий потолок ОДНОВРЕМЕННО открытых позиций по ВСЕМ активам/таймфреймам
+    # разом — без этого при 12 параллельных потоках (6 монет x 2 таймфрейма)
+    # можно случайно открыть 12 позиций разом, если все совпадут по времени.
+    MAX_OPEN_POSITIONS: int = _get_int("MAX_OPEN_POSITIONS", 3)
+    # Ниже этой суммы даже пробовать не стоит — комиссии и слиппедж съедят
+    # выгоду. Если в стакане меньше этого объёма по нужной цене — тик тихо
+    # пропускается (не считается ошибкой, просто рынок сейчас неликвиден).
+    MIN_VIABLE_TRADE_USDC: float = _get_float("MIN_VIABLE_TRADE_USDC", 2.0)
     DAILY_LOSS_LIMIT_USDC: float = _get_float("DAILY_LOSS_LIMIT_USDC", 50.0)
 
     # --- Масштабирование ставки по уверенности сигнала ---
@@ -83,7 +87,6 @@ class Settings:
 
     # --- Режим работы ---
     DRY_RUN: bool = _get_bool("DRY_RUN", True)          # True = только сигналы, ордера не шлём
-    POLL_INTERVAL_SECONDS: int = _get_int("POLL_INTERVAL_SECONDS", 5)
 
     # --- Telegram ---
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
