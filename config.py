@@ -55,7 +55,7 @@ class Settings:
     POLY_SIGNATURE_TYPE: int = _get_int("POLY_SIGNATURE_TYPE", 0)
 
     # --- Стратегия входа (общее для всех активов/таймфреймов) ---
-    MIN_ENTRY_PRICE: float = _get_float("MIN_ENTRY_PRICE", 0.87)
+    MIN_ENTRY_PRICE: float = _get_float("MIN_ENTRY_PRICE", 0.80)
     MAX_ENTRY_PRICE: float = _get_float("MAX_ENTRY_PRICE", 0.95)
     SAFETY_SCORE_THRESHOLD: float = _get_float("SAFETY_SCORE_THRESHOLD", 75.0)
     MIN_BOOK_LIQUIDITY_USDC: float = _get_float("MIN_BOOK_LIQUIDITY_USDC", 25.0)
