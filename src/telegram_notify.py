@@ -39,10 +39,12 @@ def _main_menu_text() -> str:
     paused = runtime_state.get("paused")
     dry_run = runtime_state.get("dry_run")
     pos_sl_on = runtime_state.get("position_stop_loss_enabled")
+    enabled_assets = runtime_state.get_enabled_assets()
     lines = [
         "🤖 *Polymarket Multi-Asset Bot*",
         "",
         f"Статус: {'⏸ на паузе' if paused else '▶️ активен'} | Режим: {'🧪 DRY RUN' if dry_run else '🔴 LIVE'}",
+        f"Активы: {', '.join(a.upper() for a in sorted(enabled_assets)) or '(нет включённых)'}",
         f"Размер позиции: {runtime_state.get('trade_size_usdc'):.0f} USDC",
         f"Стоп-лосс/день: {runtime_state.get('daily_loss_limit_usdc'):.0f} USDC",
         f"Стоп-лосс позиции: {'вкл ' + str(round(runtime_state.get('position_stop_loss_pct'))) + '%' if pos_sl_on else 'выкл'}",
@@ -65,12 +67,14 @@ def _main_menu_markup() -> InlineKeyboardMarkup:
     paused = runtime_state.get("paused")
     rows = [
         [InlineKeyboardButton("▶️ Старт" if paused else "⏸ Стоп", callback_data="pause_toggle")],
+        [InlineKeyboardButton("🪙 Активы", callback_data="menu:assets")],
         [
             InlineKeyboardButton("💰 Размер позиции", callback_data="menu:size"),
             InlineKeyboardButton("🛑 Стоп-лосс/день", callback_data="menu:sl"),
         ],
         [
             InlineKeyboardButton("📉 Стоп-лосс позиции", callback_data="menu:possl"),
+            InlineKeyboardButton("📈 Диапазон входа", callback_data="menu:range"),
         ],
         [
             InlineKeyboardButton("📊 Статистика", callback_data="stats"),
@@ -81,6 +85,22 @@ def _main_menu_markup() -> InlineKeyboardMarkup:
             callback_data="mode_toggle",
         )],
     ]
+    return InlineKeyboardMarkup(rows)
+
+
+def _assets_menu_markup() -> InlineKeyboardMarkup:
+    enabled = runtime_state.get_enabled_assets()
+    rows = []
+    row = []
+    for asset in settings.ASSETS:
+        mark = "✅ " if asset in enabled else "🔴 "
+        row.append(InlineKeyboardButton(f"{mark}{asset.upper()}", callback_data=f"asset_toggle:{asset}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="menu:main")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -143,6 +163,49 @@ def _position_sl_menu_markup() -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton(
         "🔴 Выключить" if enabled else "🟢 Включить", callback_data="possl_toggle",
     )])
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="menu:main")])
+    return InlineKeyboardMarkup(rows)
+
+
+MIN_ENTRY_PRESETS = [0.80, 0.85, 0.87, 0.90]
+MAX_ENTRY_PRESETS = [0.93, 0.95, 0.97]
+
+
+def _range_menu_markup() -> InlineKeyboardMarkup:
+    cur_min = runtime_state.get("min_entry_price")
+    cur_max = runtime_state.get("max_entry_price")
+    rows = [[InlineKeyboardButton("— Минимум —", callback_data="noop")]]
+    row = []
+    for val in MIN_ENTRY_PRESETS:
+        mark = "✅ " if abs(val - cur_min) < 0.001 else ""
+        row.append(InlineKeyboardButton(f"{mark}{val:.2f}", callback_data=f"minentry_set:{val}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([
+        InlineKeyboardButton("−0.01", callback_data="minentry_delta:-0.01"),
+        InlineKeyboardButton("+0.01", callback_data="minentry_delta:+0.01"),
+    ])
+    rows.append([InlineKeyboardButton("✏️ Свой минимум", callback_data="minentry_custom")])
+
+    rows.append([InlineKeyboardButton("— Максимум —", callback_data="noop")])
+    row = []
+    for val in MAX_ENTRY_PRESETS:
+        mark = "✅ " if abs(val - cur_max) < 0.001 else ""
+        row.append(InlineKeyboardButton(f"{mark}{val:.2f}", callback_data=f"maxentry_set:{val}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([
+        InlineKeyboardButton("−0.01", callback_data="maxentry_delta:-0.01"),
+        InlineKeyboardButton("+0.01", callback_data="maxentry_delta:+0.01"),
+    ])
+    rows.append([InlineKeyboardButton("✏️ Свой максимум", callback_data="maxentry_custom")])
+
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="menu:main")])
     return InlineKeyboardMarkup(rows)
 
@@ -283,6 +346,21 @@ async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"✅ Стоп-лосс позиции: {value:.1f}%", reply_markup=_position_sl_menu_markup(),
         )
+    elif _pending_input == "min_entry":
+        value = round(min(value, runtime_state.get("max_entry_price") - 0.01), 2)
+        runtime_state.set("min_entry_price", value)
+        _pending_input = None
+        await update.message.reply_text(
+            f"✅ Минимум диапазона входа: {value:.2f}", reply_markup=_range_menu_markup(),
+        )
+    elif _pending_input == "max_entry":
+        value = round(max(value, runtime_state.get("min_entry_price") + 0.01), 2)
+        value = min(value, 0.99)
+        runtime_state.set("max_entry_price", value)
+        _pending_input = None
+        await update.message.reply_text(
+            f"✅ Максимум диапазона входа: {value:.2f}", reply_markup=_range_menu_markup(),
+        )
 
 
 # ------------------------------------------------------------- кнопки -----
@@ -298,6 +376,22 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "menu:size":
         await query.edit_message_text("💰 Выбери размер позиции (USDC на сделку):", reply_markup=_size_menu_markup())
+
+    elif data == "menu:assets":
+        enabled = runtime_state.get_enabled_assets()
+        await query.edit_message_text(
+            f"🪙 Активные монеты: {len(enabled)} из {len(settings.ASSETS)}.\n"
+            "Тапни, чтобы включить/выключить конкретную монету — остальные не затронет.",
+            reply_markup=_assets_menu_markup(),
+        )
+
+    elif data.startswith("asset_toggle:"):
+        asset = data.split(":", 1)[1]
+        now_enabled = runtime_state.toggle_asset(asset)
+        await query.edit_message_text(
+            f"{'✅' if now_enabled else '🔴'} {asset.upper()} теперь {'включён' if now_enabled else 'выключен'}.",
+            reply_markup=_assets_menu_markup(),
+        )
 
     elif data == "menu:sl":
         await query.edit_message_text(
@@ -315,6 +409,63 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "процент от суммы входа ещё ДО резолюции рынка — бот продаёт её досрочно, "
             "не дожидаясь исхода. Это отдельно от дневного лимита в USDC.",
             reply_markup=_position_sl_menu_markup(),
+        )
+
+    elif data == "menu:range":
+        await query.edit_message_text(
+            f"📈 Диапазон входа: {runtime_state.get('min_entry_price'):.2f} — "
+            f"{runtime_state.get('max_entry_price'):.2f}\n\n"
+            "Бот входит, только если ask на нужной стороне попадает в этот диапазон "
+            "(и score выше порога). Шире диапазон — больше сигналов, но ниже средняя "
+            "цена входа (более рискованные, менее 'подтверждённые' рынком ситуации).",
+            reply_markup=_range_menu_markup(),
+        )
+
+    elif data == "noop":
+        pass
+
+    elif data.startswith("minentry_set:"):
+        val = float(data.split(":", 1)[1])
+        runtime_state.set("min_entry_price", val)
+        await query.edit_message_text(
+            f"✅ Минимум диапазона входа: {val:.2f}", reply_markup=_range_menu_markup(),
+        )
+
+    elif data.startswith("minentry_delta:"):
+        delta = float(data.split(":", 1)[1])
+        new_val = round(min(runtime_state.get("max_entry_price") - 0.01, max(0.5, runtime_state.get("min_entry_price") + delta)), 2)
+        runtime_state.set("min_entry_price", new_val)
+        await query.edit_message_text(
+            f"✅ Минимум диапазона входа: {new_val:.2f}", reply_markup=_range_menu_markup(),
+        )
+
+    elif data == "minentry_custom":
+        _pending_input = "min_entry"
+        await query.edit_message_text(
+            "✏️ Напиши минимальную цену входа следующим сообщением, например: 0.82",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="menu:range")]]),
+        )
+
+    elif data.startswith("maxentry_set:"):
+        val = float(data.split(":", 1)[1])
+        runtime_state.set("max_entry_price", val)
+        await query.edit_message_text(
+            f"✅ Максимум диапазона входа: {val:.2f}", reply_markup=_range_menu_markup(),
+        )
+
+    elif data.startswith("maxentry_delta:"):
+        delta = float(data.split(":", 1)[1])
+        new_val = round(max(runtime_state.get("min_entry_price") + 0.01, min(0.99, runtime_state.get("max_entry_price") + delta)), 2)
+        runtime_state.set("max_entry_price", new_val)
+        await query.edit_message_text(
+            f"✅ Максимум диапазона входа: {new_val:.2f}", reply_markup=_range_menu_markup(),
+        )
+
+    elif data == "maxentry_custom":
+        _pending_input = "max_entry"
+        await query.edit_message_text(
+            "✏️ Напиши максимальную цену входа следующим сообщением, например: 0.96",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="menu:range")]]),
         )
 
     elif data == "menu:settings":

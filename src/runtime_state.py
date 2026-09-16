@@ -29,6 +29,10 @@ _DEFAULTS = {
     # входа — закрываем досрочно продажей, не дожидаясь резолюции рынка.
     "position_stop_loss_enabled": False,
     "position_stop_loss_pct": 50.0,
+    # Какие активы сейчас реально торгуются — можно включать/выключать
+    # по одному через Telegram, не трогая остальные и не передеплоя.
+    # Хранится как строка через запятую (см. get/set_enabled_assets ниже).
+    "enabled_assets": ",".join(settings.ASSETS),
 }
 
 # Типы приведения при чтении из SQLite (там всё хранится как TEXT)
@@ -43,6 +47,7 @@ _CASTERS = {
     "size_scaling_enabled": lambda v: str(v).lower() == "true",
     "position_stop_loss_enabled": lambda v: str(v).lower() == "true",
     "position_stop_loss_pct": float,
+    "enabled_assets": str,
 }
 
 _state: dict = dict(_DEFAULTS)
@@ -70,3 +75,30 @@ def set(key: str, value) -> None:
 
 def snapshot() -> dict:
     return dict(_state)
+
+
+# --- Включение/выключение отдельных активов ---
+
+def get_enabled_assets() -> set[str]:
+    raw = _state.get("enabled_assets", "") or ""
+    return {a for a in raw.split(",") if a}
+
+
+def is_asset_enabled(asset: str) -> bool:
+    return asset.lower() in get_enabled_assets()
+
+
+def set_enabled_assets(assets: set[str]) -> None:
+    set("enabled_assets", ",".join(sorted(assets)))
+
+
+def toggle_asset(asset: str) -> bool:
+    """Переключает состояние актива и возвращает новое (True = включён)."""
+    asset = asset.lower()
+    enabled = get_enabled_assets()
+    if asset in enabled:
+        enabled.discard(asset)
+    else:
+        enabled.add(asset)
+    set_enabled_assets(enabled)
+    return asset in enabled

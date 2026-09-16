@@ -37,6 +37,19 @@ _instance_state: dict[str, dict] = {}
 
 async def _instance_tick(asset: str, timeframe: TimeframeProfile) -> None:
     key = f"{asset}:{timeframe.label}"
+
+    if not runtime_state.is_asset_enabled(asset):
+        # Актив выключен кнопкой в Telegram — не тратим запросы к API,
+        # просто помечаем в статусе, что поток на паузе, и выходим.
+        _instance_state[key] = {
+            "market_slug": "—", "asset": asset, "timeframe": timeframe.label,
+            "direction": "выкл", "current_price": "—", "strike_price": "—",
+            "minutes_left": "—", "safety_score": "—",
+            "up_token_id": None, "down_token_id": None,
+        }
+        telegram_notify.set_state_ref(_instance_state)
+        return
+
     market = await market_discovery.get_active_market(asset, timeframe)
     _active_slugs[key] = market.slug
 
