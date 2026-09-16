@@ -29,9 +29,28 @@ import time
 import httpx
 
 sys.path.insert(0, ".")
+from config import settings  # noqa: E402
 from src import binance_feed, indicators, market_discovery  # noqa: E402
 
 DATA_API = "https://data-api.polymarket.com"
+
+
+async def send_to_telegram(path: str, caption: str) -> bool:
+    """Шлём результат прямо в Telegram, чтобы не лезть за файлом в консоль
+    хостинга. Используем Bot напрямую (не через Application бота) — это
+    разовая отправка, полноценный polling-цикл тут не нужен."""
+    if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_CHAT_ID:
+        print("⚠️ TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID не заданы — файл останется только на диске.")
+        return False
+    try:
+        from telegram import Bot
+        bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
+        with open(path, "rb") as f:
+            await bot.send_document(chat_id=settings.TELEGRAM_CHAT_ID, document=f, caption=caption)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        print(f"⚠️ Не удалось отправить в Telegram: {exc}")
+        return False
 
 
 async def fetch_all_trades(address: str, page_size: int = 500) -> list[dict]:
@@ -187,6 +206,16 @@ async def analyze(address: str, asset: str) -> str:
     unknown = sum(1 for r in rows if r["won"] is None)
     print(f"\nГотово: {out_path}")
     print(f"Побед: {wins} | Поражений: {losses} | Исход неизвестен: {unknown}")
+
+    caption = (
+        f"🔍 Анализ кошелька {address}\n"
+        f"Актив: {asset.upper()} 15m | Сделок: {len(rows)}\n"
+        f"Побед: {wins} | Поражений: {losses} | Исход неизвестен: {unknown}"
+    )
+    sent = await send_to_telegram(out_path, caption)
+    if sent:
+        print("✅ Файл отправлен в Telegram.")
+
     return out_path
 
 
