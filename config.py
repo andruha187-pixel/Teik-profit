@@ -66,16 +66,21 @@ class Settings:
     MAX_ENTRY_EXECUTION_PRICE: float = _get_float("MAX_ENTRY_EXECUTION_PRICE", 0.97)
 
     # --- Управление капиталом ---
-    TRADE_SIZE_USDC: float = _get_float("TRADE_SIZE_USDC", 10.0)
+    # Дефолты откалиброваны под небольшой депозит (~$60) — см. обсуждение
+    # в README: фиксированный (не растущий в % от банка) размер ставки,
+    # чтобы не разгонять риск компаундингом на непроверенной вживую
+    # стратегии. Меняй TRADE_SIZE_USDC пропорционально своему реальному
+    # депозиту — это НЕ универсальная константа.
+    TRADE_SIZE_USDC: float = _get_float("TRADE_SIZE_USDC", 2.0)
     # Общий потолок ОДНОВРЕМЕННО открытых позиций по ВСЕМ активам/таймфреймам
     # разом — без этого при 12 параллельных потоках (6 монет x 2 таймфрейма)
     # можно случайно открыть 12 позиций разом, если все совпадут по времени.
-    MAX_OPEN_POSITIONS: int = _get_int("MAX_OPEN_POSITIONS", 3)
+    MAX_OPEN_POSITIONS: int = _get_int("MAX_OPEN_POSITIONS", 2)
     # Ниже этой суммы даже пробовать не стоит — комиссии и слиппедж съедят
     # выгоду. Если в стакане меньше этого объёма по нужной цене — тик тихо
     # пропускается (не считается ошибкой, просто рынок сейчас неликвиден).
     MIN_VIABLE_TRADE_USDC: float = _get_float("MIN_VIABLE_TRADE_USDC", 2.0)
-    DAILY_LOSS_LIMIT_USDC: float = _get_float("DAILY_LOSS_LIMIT_USDC", 50.0)
+    DAILY_LOSS_LIMIT_USDC: float = _get_float("DAILY_LOSS_LIMIT_USDC", 6.0)
 
     # --- Масштабирование ставки по уверенности сигнала ---
     # Ставка = TRADE_SIZE_USDC только при score >= SIZE_SCALING_MAX_SCORE.
@@ -98,6 +103,10 @@ class Settings:
     # --- Отчёты для анализа стратегии ---
     REPORT_INTERVAL_HOURS: float = _get_float("REPORT_INTERVAL_HOURS", 4.0)
     REPORTS_DIR: str = os.getenv("REPORTS_DIR", "data/reports")
+
+    # --- Отслеживание чужого кошелька (уведомления + опциональный копитрейдинг) ---
+    WALLET_TRACK_ADDRESS: str = os.getenv("WALLET_TRACK_ADDRESS", "0x4707b735acce66b2ccb5600086de2329685cd1ce")
+    WALLET_TRACK_POLL_SECONDS: int = _get_int("WALLET_TRACK_POLL_SECONDS", 3)
 
 
 settings = Settings()
