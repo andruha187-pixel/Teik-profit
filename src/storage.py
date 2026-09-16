@@ -77,6 +77,7 @@ _SIGNALS_MIGRATIONS = [
 
 _TRADES_MIGRATIONS = [
     ("token_id", "TEXT"),
+    ("source", "TEXT"),  # 'strategy' (наш сигнал) | 'copytrade' (скопировано с отслеживаемого кошелька)
 ]
 
 
@@ -167,15 +168,16 @@ def get_markets_needing_outcome(exclude_slugs: set[str] | None, limit: int = 50)
 
 
 def log_trade(market_slug: str, condition_id: str, direction: str, entry_price: float,
-              size_usdc: float, order_id: str, status: str, dry_run: bool, token_id: str = "") -> int:
+              size_usdc: float, order_id: str, status: str, dry_run: bool, token_id: str = "",
+              source: str = "strategy") -> int:
     with _conn() as conn:
         cur = conn.execute(
             """INSERT INTO trades
                (ts, market_slug, condition_id, direction, entry_price, size_usdc,
-                order_id, status, outcome, pnl_usdc, dry_run, token_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)""",
+                order_id, status, outcome, pnl_usdc, dry_run, token_id, source)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)""",
             (int(time.time()), market_slug, condition_id, direction, entry_price,
-             size_usdc, order_id, status, int(dry_run), token_id),
+             size_usdc, order_id, status, int(dry_run), token_id, source),
         )
         return cur.lastrowid
 
@@ -290,7 +292,7 @@ SIGNALS_COLUMNS = [
 
 TRADES_COLUMNS = [
     "id", "ts", "market_slug", "condition_id", "direction", "entry_price", "size_usdc",
-    "order_id", "status", "outcome", "pnl_usdc", "dry_run", "token_id",
+    "order_id", "status", "outcome", "pnl_usdc", "dry_run", "token_id", "source",
 ]
 
 

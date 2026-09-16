@@ -17,7 +17,7 @@ import time
 
 from config import settings
 from src import binance_feed, market_discovery, indicators, strategy
-from src import polymarket_client, storage, telegram_notify, executor, book_stream, runtime_state, reporting
+from src import polymarket_client, storage, telegram_notify, executor, book_stream, runtime_state, reporting, wallet_tracker
 from src.timeframes import TIMEFRAMES, TimeframeProfile
 
 logging.basicConfig(
@@ -199,6 +199,7 @@ async def main():
 
         report_task = asyncio.create_task(reporting.report_loop())
         settlement_task = asyncio.create_task(settlement_loop())
+        wallet_tracker_task = asyncio.create_task(wallet_tracker.wallet_tracker_loop())
 
         instance_tasks = [
             asyncio.create_task(_instance_loop(asset, timeframe))
@@ -213,6 +214,7 @@ async def main():
                 book_stream_task.cancel()
             report_task.cancel()
             settlement_task.cancel()
+            wallet_tracker_task.cancel()
             await app.updater.stop()
             await app.stop()
 

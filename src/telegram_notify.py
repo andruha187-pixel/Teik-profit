@@ -34,6 +34,13 @@ def set_state_ref(state: dict) -> None:
 
 # ---------------------------------------------------------------- меню ----
 
+def _size_summary() -> str:
+    if runtime_state.get("sizing_mode") == "percent":
+        size_now = runtime_state.compute_trade_size()
+        return f"{runtime_state.get('bankroll_pct'):.0f}% банка (сейчас {size_now:.2f} USDC)"
+    return f"{runtime_state.get('trade_size_usdc'):.2f} USDC (фикс.)"
+
+
 def _main_menu_text() -> str:
     s = _state_ref  # dict: "asset:timeframe" -> instance state
     paused = runtime_state.get("paused")
@@ -45,7 +52,7 @@ def _main_menu_text() -> str:
         "",
         f"Статус: {'⏸ на паузе' if paused else '▶️ активен'} | Режим: {'🧪 DRY RUN' if dry_run else '🔴 LIVE'}",
         f"Активы: {', '.join(a.upper() for a in sorted(enabled_assets)) or '(нет включённых)'}",
-        f"Размер позиции: {runtime_state.get('trade_size_usdc'):.0f} USDC",
+        f"Размер позиции: {_size_summary()}",
         f"Стоп-лосс/день: {runtime_state.get('daily_loss_limit_usdc'):.0f} USDC",
         f"Стоп-лосс позиции: {'вкл ' + str(round(runtime_state.get('position_stop_loss_pct'))) + '%' if pos_sl_on else 'выкл'}",
         f"Safety score порог: {runtime_state.get('safety_score_threshold'):.0f}",
@@ -76,6 +83,7 @@ def _main_menu_markup() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📉 Стоп-лосс позиции", callback_data="menu:possl"),
             InlineKeyboardButton("📈 Диапазон входа", callback_data="menu:range"),
         ],
+        [InlineKeyboardButton("🐋 Слежка за кошельком", callback_data="menu:wallet")],
         [
             InlineKeyboardButton("📊 Статистика", callback_data="stats"),
             InlineKeyboardButton("⚙️ Настройки", callback_data="menu:settings"),
@@ -104,19 +112,75 @@ def _assets_menu_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def _size_menu_markup() -> InlineKeyboardMarkup:
-    current = runtime_state.get("trade_size_usdc")
+BANKROLL_PCT_PRESETS = [3, 5, 7, 10]
+COPYTRADE_SIZE_PRESETS = [2, 5, 10, 20]
+
+
+def _wallet_menu_markup() -> InlineKeyboardMarkup:
+    notify_on = runtime_state.get("wallet_notify_enabled")
+    copy_on = runtime_state.get("wallet_copytrade_enabled")
+    size = runtime_state.get("copytrade_size_usdc")
+
+    rows = [
+        [InlineKeyboardButton(
+            "🔔 Уведомления: выкл" if not notify_on else "🔕 Уведомления: вкл",
+            callback_data="wallet_notify_toggle",
+        )],
+        [InlineKeyboardButton(
+            "🟢 Включить копитрейдинг" if not copy_on else "🔴 Выключить копитрейдинг",
+            callback_data="wallet_copytrade_toggle",
+        )],
+        [InlineKeyboardButton("— Размер копи-сделки —", callback_data="noop")],
+    ]
     row = []
-    rows = []
-    for val in SIZE_PRESETS:
-        mark = "✅ " if abs(val - current) < 0.01 else ""
-        row.append(InlineKeyboardButton(f"{mark}{val}", callback_data=f"size_set:{val}"))
-        if len(row) == 3:
+    for val in COPYTRADE_SIZE_PRESETS:
+        mark = "✅ " if abs(val - size) < 0.01 else ""
+        row.append(InlineKeyboardButton(f"{mark}{val}", callback_data=f"copysize_set:{val}"))
+        if len(row) == 2:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
-    rows.append([InlineKeyboardButton("✏️ Свой размер", callback_data="size_custom")])
+    rows.append([InlineKeyboardButton("✏️ Свой размер копи-сделки", callback_data="copysize_custom")])
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="menu:main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _size_menu_markup() -> InlineKeyboardMarkup:
+    mode = runtime_state.get("sizing_mode")
+    rows = [[InlineKeyboardButton(
+        "🔀 Режим: % от банка" if mode == "fixed" else "🔀 Режим: фикс. сумма",
+        callback_data="sizing_mode_toggle",
+    )]]
+
+    if mode == "percent":
+        row = []
+        for val in BANKROLL_PCT_PRESETS:
+            mark = "✅ " if abs(val - runtime_state.get("bankroll_pct")) < 0.01 else ""
+            row.append(InlineKeyboardButton(f"{mark}{val}%", callback_data=f"bankrollpct_set:{val}"))
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        rows.append([
+            InlineKeyboardButton("−1%", callback_data="bankrollpct_delta:-1"),
+            InlineKeyboardButton("+1%", callback_data="bankrollpct_delta:+1"),
+        ])
+        rows.append([InlineKeyboardButton("✏️ Свой стартовый банк", callback_data="startbank_custom")])
+    else:
+        current = runtime_state.get("trade_size_usdc")
+        row = []
+        for val in SIZE_PRESETS:
+            mark = "✅ " if abs(val - current) < 0.01 else ""
+            row.append(InlineKeyboardButton(f"{mark}{val}", callback_data=f"size_set:{val}"))
+            if len(row) == 3:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        rows.append([InlineKeyboardButton("✏️ Свой размер", callback_data="size_custom")])
+
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="menu:main")])
     return InlineKeyboardMarkup(rows)
 
@@ -361,6 +425,18 @@ async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"✅ Максимум диапазона входа: {value:.2f}", reply_markup=_range_menu_markup(),
         )
+    elif _pending_input == "starting_bankroll":
+        runtime_state.set("starting_bankroll_usdc", value)
+        _pending_input = None
+        await update.message.reply_text(
+            f"✅ Стартовый банк: {value:.2f} USDC", reply_markup=_size_menu_markup(),
+        )
+    elif _pending_input == "copytrade_size":
+        runtime_state.set("copytrade_size_usdc", value)
+        _pending_input = None
+        await update.message.reply_text(
+            f"✅ Размер копи-сделки: {value:.2f} USDC", reply_markup=_wallet_menu_markup(),
+        )
 
 
 # ------------------------------------------------------------- кнопки -----
@@ -375,7 +451,91 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(_main_menu_text(), reply_markup=_main_menu_markup(), parse_mode="Markdown")
 
     elif data == "menu:size":
-        await query.edit_message_text("💰 Выбери размер позиции (USDC на сделку):", reply_markup=_size_menu_markup())
+        mode = runtime_state.get("sizing_mode")
+        if mode == "percent":
+            bank = runtime_state.current_bankroll()
+            size_now = runtime_state.compute_trade_size()
+            text = (
+                f"💰 Режим: % от банка\n"
+                f"Стартовый банк: {runtime_state.get('starting_bankroll_usdc'):.2f} USDC\n"
+                f"Текущий банк (старт + реализованный PnL): {bank:.2f} USDC\n"
+                f"Доля на сделку: {runtime_state.get('bankroll_pct'):.0f}% → сейчас это {size_now:.2f} USDC\n\n"
+                "Размер сам растёт на прибыли и сжимается на просадке."
+            )
+        else:
+            text = f"💰 Режим: фиксированная сумма — {runtime_state.get('trade_size_usdc'):.2f} USDC на сделку."
+        await query.edit_message_text(text, reply_markup=_size_menu_markup())
+
+    elif data == "sizing_mode_toggle":
+        new_mode = "percent" if runtime_state.get("sizing_mode") == "fixed" else "fixed"
+        runtime_state.set("sizing_mode", new_mode)
+        await query.edit_message_text(
+            f"✅ Режим размера ставки: {'% от банка' if new_mode=='percent' else 'фиксированная сумма'}",
+            reply_markup=_size_menu_markup(),
+        )
+
+    elif data.startswith("bankrollpct_set:"):
+        val = float(data.split(":", 1)[1])
+        runtime_state.set("bankroll_pct", val)
+        await query.edit_message_text(f"✅ Доля от банка: {val:.0f}%", reply_markup=_size_menu_markup())
+
+    elif data.startswith("bankrollpct_delta:"):
+        delta = float(data.split(":", 1)[1])
+        new_val = min(50.0, max(1.0, runtime_state.get("bankroll_pct") + delta))
+        runtime_state.set("bankroll_pct", new_val)
+        await query.edit_message_text(f"✅ Доля от банка: {new_val:.0f}%", reply_markup=_size_menu_markup())
+
+    elif data == "startbank_custom":
+        _pending_input = "starting_bankroll"
+        await query.edit_message_text(
+            "✏️ Напиши стартовый банк в USDC следующим сообщением, например: 60",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="menu:size")]]),
+        )
+
+    elif data == "menu:wallet":
+        addr = settings.WALLET_TRACK_ADDRESS
+        notify_on = runtime_state.get("wallet_notify_enabled")
+        copy_on = runtime_state.get("wallet_copytrade_enabled")
+        await query.edit_message_text(
+            f"🐋 Слежу за кошельком:\n`{addr}`\n\n"
+            f"Уведомления: {'🔔 включены' if notify_on else '🔕 выключены'}\n"
+            f"Копитрейдинг: {'🟢 включён' if copy_on else '🔴 выключен'} "
+            f"(размер: {runtime_state.get('copytrade_size_usdc'):.2f} USDC на сделку)\n\n"
+            "Копитрейдинг использует те же лимиты риска, что и основная стратегия "
+            "(дневной стоп-лосс, общий потолок открытых позиций).",
+            reply_markup=_wallet_menu_markup(),
+            parse_mode="Markdown",
+        )
+
+    elif data == "wallet_notify_toggle":
+        new_val = not runtime_state.get("wallet_notify_enabled")
+        runtime_state.set("wallet_notify_enabled", new_val)
+        await query.edit_message_text(
+            f"{'🔔 Уведомления включены' if new_val else '🔕 Уведомления выключены'}",
+            reply_markup=_wallet_menu_markup(),
+        )
+
+    elif data == "wallet_copytrade_toggle":
+        new_val = not runtime_state.get("wallet_copytrade_enabled")
+        runtime_state.set("wallet_copytrade_enabled", new_val)
+        msg = (
+            "🟢 Копитрейдинг включён — бот будет пытаться повторять его входы реальными "
+            "(или dry-run) сделками." if new_val else
+            "🔴 Копитрейдинг выключен — только уведомления, без автоматических сделок."
+        )
+        await query.edit_message_text(msg, reply_markup=_wallet_menu_markup())
+
+    elif data.startswith("copysize_set:"):
+        val = float(data.split(":", 1)[1])
+        runtime_state.set("copytrade_size_usdc", val)
+        await query.edit_message_text(f"✅ Размер копи-сделки: {val:.2f} USDC", reply_markup=_wallet_menu_markup())
+
+    elif data == "copysize_custom":
+        _pending_input = "copytrade_size"
+        await query.edit_message_text(
+            "✏️ Напиши размер копи-сделки в USDC следующим сообщением, например: 7.5",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="menu:wallet")]]),
+        )
 
     elif data == "menu:assets":
         enabled = runtime_state.get_enabled_assets()

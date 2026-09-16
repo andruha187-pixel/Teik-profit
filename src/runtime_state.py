@@ -33,6 +33,20 @@ _DEFAULTS = {
     # по одному через Telegram, не трогая остальные и не передеплоя.
     # Хранится как строка через запятую (см. get/set_enabled_assets ниже).
     "enabled_assets": ",".join(settings.ASSETS),
+    # Режим размера ставки: "fixed" (константа в USDC, trade_size_usdc) или
+    # "percent" (доля от ТЕКУЩЕГО банка — starting_bankroll_usdc + вся
+    # реализованная прибыль/убыток с начала). Percent-режим сам сжимается
+    # при просадке и растёт при выигрышах — в отличие от fixed, который на
+    # похудевшем банке становится относительно только агрессивнее.
+    "sizing_mode": "fixed",
+    "bankroll_pct": 5.0,
+    "starting_bankroll_usdc": 60.0,
+    # Отслеживание чужого кошелька: уведомления всегда можно включить
+    # отдельно от реального копирования сделок (copytrade) — по умолчанию
+    # только уведомляем, ничего не покупаем автоматически.
+    "wallet_notify_enabled": True,
+    "wallet_copytrade_enabled": False,
+    "copytrade_size_usdc": 5.0,
 }
 
 # Типы приведения при чтении из SQLite (там всё хранится как TEXT)
@@ -48,6 +62,12 @@ _CASTERS = {
     "position_stop_loss_enabled": lambda v: str(v).lower() == "true",
     "position_stop_loss_pct": float,
     "enabled_assets": str,
+    "sizing_mode": str,
+    "bankroll_pct": float,
+    "starting_bankroll_usdc": float,
+    "wallet_notify_enabled": lambda v: str(v).lower() == "true",
+    "wallet_copytrade_enabled": lambda v: str(v).lower() == "true",
+    "copytrade_size_usdc": float,
 }
 
 _state: dict = dict(_DEFAULTS)
@@ -102,3 +122,23 @@ def toggle_asset(asset: str) -> bool:
         enabled.add(asset)
     set_enabled_assets(enabled)
     return asset in enabled
+
+
+# --- Размер ставки: fixed или % от текущего банка ---
+
+def current_bankroll() -> float:
+    """starting_bankroll_usdc + вся реализованная прибыль/убыток с начала
+    (settled-сделки в storage.trades). Не зависит от режима DRY_RUN/LIVE —
+    это оценка, а не реальный баланс на бирже; в LIVE полезно сверять с
+    фактическим балансом кошелька время от времени."""
+    pnl = storage.get_pnl_summary(0)["pnl_usdc"]
+    return get("starting_bankroll_usdc") + pnl
+
+
+def compute_trade_size() -> float:
+    """Базовый размер ставки ДО масштабирования по score (см.
+    executor._scale_trade_size) — либо константа, либо доля от банка."""
+    if get("sizing_mode") == "percent":
+        bankroll = max(0.0, current_bankroll())
+        return round(bankroll * get("bankroll_pct") / 100, 2)
+    return get("trade_size_usdc")

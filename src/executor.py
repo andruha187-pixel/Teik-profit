@@ -55,7 +55,7 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
         # параллельных потоках несколько сигналов могут совпасть по времени.
         return
 
-    base_size = runtime_state.get("trade_size_usdc")
+    base_size = runtime_state.compute_trade_size()
     score_threshold = runtime_state.get("safety_score_threshold")
     if runtime_state.get("size_scaling_enabled"):
         trade_size = _scale_trade_size(base_size, decision.safety_score, score_threshold)
@@ -144,6 +144,81 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
         f"Ask на сигнале: {decision.entry_price:.3f} | Потолок исполнения: {execution_price:.3f} "
         f"(тик {tick:g}) | Размер: {trade_size:.2f} из {base_size:.0f} USDC (score {decision.safety_score}/{score_threshold:.0f})\n"
         f"Расхождение: {decision.distance_atr} ATR | До конца рынка: {decision.minutes_left:.1f} мин"
+    )
+
+
+async def execute_copytrade(token_id: str, direction: str, slug: str, condition_id: str,
+                             price_hint: float | None) -> None:
+    """
+    Повторяет вход отслеживаемого кошелька (см. src/wallet_tracker.py).
+    Отдельный от maybe_enter путь — здесь нет своего score, входим просто
+    потому что вошёл он; риск-лимиты (дневной стоп-лосс, потолок открытых
+    позиций) те же самые, общие с основной стратегией.
+    """
+    if runtime_state.get("paused"):
+        return
+    if storage.get_open_trade_for_market(slug):
+        return  # уже скопировали (или у нас своя позиция) в этом рынке
+    if _daily_loss_exceeded():
+        return  # дневной лимит уже сработал — не копируем, пока не настанет новый день
+    if storage.count_open_trades() >= settings.MAX_OPEN_POSITIONS:
+        return
+
+    trade_size = runtime_state.get("copytrade_size_usdc")
+    dry_run = runtime_state.get("dry_run")
+
+    # Токен мог быть не в нашем WS-кэше вообще (мы его раньше не отслеживали) —
+    # подписываемся сразу и берём стакан через get_orderbook_cached, который
+    # сам падает в REST, если WS ещё не успел прогреться.
+    if settings.USE_LIVE_BOOK_STREAM:
+        book_stream.subscribe([token_id])
+    book = await polymarket_client.get_orderbook_cached(token_id, depth_levels=10)
+    available_liquidity = book.ask_liquidity_usdc
+    if available_liquidity < settings.MIN_VIABLE_TRADE_USDC:
+        return
+    if available_liquidity < trade_size:
+        trade_size = round(available_liquidity * 0.9, 2)
+
+    tick = book.tick_size
+    reference_price = price_hint or book.best_ask
+    if reference_price is None:
+        return
+    raw_cap = min(reference_price + settings.LIVE_ENTRY_MAX_SLIPPAGE, settings.MAX_ENTRY_EXECUTION_PRICE)
+    execution_price = polymarket_client.round_price_for_buy(raw_cap, tick)
+
+    status = "DRY_RUN"
+    order_id = "dry-run"
+    if not dry_run:
+        if not settings.POLY_PRIVATE_KEY:
+            await telegram_notify.notify(
+                "❌ Копитрейдинг: LIVE включён, но POLY_PRIVATE_KEY не задан — вход пропущен."
+            )
+            return
+        try:
+            resp = await polymarket_client.place_buy_order(token_id, execution_price, trade_size, tick)
+        except Exception as exc:  # noqa: BLE001
+            await telegram_notify.notify(f"❌ Копитрейдинг: ошибка при выставлении ордера ({slug}): {exc}")
+            return
+        order_id = polymarket_client.response_field(resp, "order_id") or polymarket_client.response_field(resp, "orderID") or str(resp)
+        status = polymarket_client.response_field(resp, "status") or "SUBMITTED"
+
+    storage.log_trade(
+        market_slug=slug,
+        condition_id=condition_id,
+        direction=direction,
+        entry_price=execution_price,
+        size_usdc=trade_size,
+        order_id=order_id,
+        status=status,
+        dry_run=dry_run,
+        token_id=token_id,
+        source="copytrade",
+    )
+
+    await telegram_notify.notify(
+        f"{'🧪 [DRY RUN] ' if dry_run else '✅ '}📋 Скопирован вход {direction} по {slug}\n"
+        f"Цена кошелька: {reference_price:.3f} | Потолок исполнения: {execution_price:.3f} | "
+        f"Размер: {trade_size:.2f} USDC"
     )
 
 
