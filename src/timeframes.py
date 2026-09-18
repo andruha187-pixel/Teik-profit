@@ -1,46 +1,24 @@
 """
-Профили таймфреймов. Каждый актив торгуется независимо на каждом
-таймфрейме из этого списка — итого len(ASSETS) x len(TIMEFRAMES)
-параллельных потоков (см. main.py).
+Профиль таймфрейма для этого бота — ТОЛЬКО 5 минут. Это отдельный,
+самостоятельный проект (форк основного 15m-бота), альтернативные таймфреймы
+намеренно удалены, а не просто выключены — держим кодовую базу узкой
+под одну конкретную задачу: тест 5-минутного рынка.
 
-Почему у часового таймфрейма другие параметры, а не те же самые числа,
-растянутые на час:
+ВАЖНО: параметры ниже — ПРОПОРЦИОНАЛЬНО пересчитанные из того, что
+реально сработало на 15-минутном боте (после калибровки по 961 реальной
+сделке другого трейдера + по живым 4-часовым отчётам), а не откалиброванные
+на реальных 5-минутных данных. Считай их отправной точкой для теста в
+DRY_RUN, не готовым к LIVE значением.
 
-- **Индикаторы на 5-минутных свечах, а не 1-минутных.** 15-минутный рынок
-  и ATR(14)/EMA(9,21) на 1m свечах соразмерны (14-21 минута истории на
-  окно в 15 минут). Для часового рынка 1m-индикаторы были бы слишком
-  шумными относительно масштаба окна — используем 5m свечи, тогда ATR(14)
-  и EMA(9/21) агрегируют ~45-105 минут истории, что уже сопоставимо с
-  часовым горизонтом.
-- **Окно входа шире и позже относительно длины рынка**: 10-45 из 60 минут
-  (то есть между 17-й и 50-й минутой) вместо 2-9 из 15. Логика та же
-  пропорция "не слишком рано / не слишком поздно", просто пересчитанная
-  под более длинное окно с поправкой на то, что часовому рынку требуется
-  больше времени, чтобы цена успела статистически значимо разойтись от
-  страйка, и одновременно есть больше времени на потенциальный разворот
-  ближе к экспирации, так что верхняя граница (сколько минут ДО конца всё
-  ещё можно входить) не растягивается пропорционально — оставляем более
-  консервативный запас на развороты в последние 10 минут.
-- **discovery_mode="hourly_et_named"**: у часовых рынков Polymarket
-  СОВСЕМ ДРУГОЙ формат слага, не unix-таймстемп, а человекочитаемый и
-  привязанный к Eastern Time: `bitcoin-up-or-down-september-13-2026-8pm-et`.
-  Плюс часть активов называется полным именем, а не тикером (bitcoin,
-  ethereum, solana — но xrp, bnb, hype как тикер). Обнаружено эмпирически
-  через сайт Polymarket, не из документации — см. src/market_discovery.py.
-- **Опрос реже** (30с вместо 5с) — часовой рынок меняется гораздо
-  медленнее, незачем дёргать API так же часто, как для 15-минутного.
-
-5-минутный профиль (`5m`) использует ТОТ ЖЕ формат слага, что и 15m
-(тикер+unix-таймстемп, `discovery_mode="deterministic"`) — отличается
-только числом в слаге. Но параметры индикаторов и окна входа —
-ПРОПОРЦИОНАЛЬНО пересчитанные ДОГАДКИ, а не откалиброванные на реальных
-данных, в отличие от 15m (тот калибровался по 961 реальной сделке
-другого трейдера + по живым отчётам этого бота). Для 5m такого разбора
-не делали — присматривайся к первым отчётам особенно внимательно.
-
-Пороги можно переопределить через .env (см. .env.example), но дефолты —
-разумная отправная точка, а не проверенный оптимум ни для одного из
-таймфреймов.
+- Индикаторы на 1m-свечах (тоньше некуда у Binance).
+- ATR(7)/EMA(3,7) вместо ATR(14)/EMA(9,21) — короче период, пропорционально
+  более быстрому рынку (5 минут вместо 15).
+- Окно входа 1.0-3.5 минуты из 5 (пропорция окна 2-9 из 15 у 15m-версии).
+- discovery_mode="deterministic" — 5-минутные рынки Polymarket используют
+  тот же формат слага, что и 15m (тикер + unix-таймстемп начала окна),
+  никакой человекочитаемой привязки к Eastern Time, как у часовых.
+- Опрос раз в 3 секунды — рынок живёт всего 5 минут, нужна более частая
+  проверка, чем у 15-минутного (там 5 секунд).
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -63,9 +41,9 @@ def _s(name: str, default: str) -> str:
 
 @dataclass(frozen=True)
 class TimeframeProfile:
-    label: str                     # "5m" / "15m" / "1h" — используется в market_discovery и слагах
+    label: str
     interval_minutes: int
-    kline_interval: str            # свечи Binance для индикаторов
+    kline_interval: str
     atr_period: int
     ema_fast: int
     ema_slow: int
@@ -74,23 +52,19 @@ class TimeframeProfile:
     max_minutes_left: float
     atr_distance_mult: float
     atr_spike_mult: float
-    discovery_mode: str            # "deterministic" | "hourly_et_named" | "series"
+    discovery_mode: str            # "deterministic" | "series" (см. market_discovery.py)
     poll_interval_seconds: int
 
 
-_ALL_TIMEFRAMES: list[TimeframeProfile] = [
+TIMEFRAMES: list[TimeframeProfile] = [
     TimeframeProfile(
         label="5m",
         interval_minutes=5,
-        # 1m — минимальная гранулярность свечей Binance, тоньше некуда.
         kline_interval=_s("TF_5M_KLINE_INTERVAL", "1m"),
-        # Короче, чем у 15m (14/9/21), пропорционально более быстрому рынку —
-        # НЕПРОВЕРЕННАЯ на реальных данных догадка, не как у 15m.
         atr_period=_i("TF_5M_ATR_PERIOD", 7),
         ema_fast=_i("TF_5M_EMA_FAST", 3),
         ema_slow=_i("TF_5M_EMA_SLOW", 7),
         atr_lookback_for_regime=_i("TF_5M_ATR_LOOKBACK", 30),
-        # Пропорционально окну 2-9 из 15 у 15m: ~1-3.5 из 5.
         min_minutes_left=_f("TF_5M_MIN_MINUTES_LEFT", 1.0),
         max_minutes_left=_f("TF_5M_MAX_MINUTES_LEFT", 3.5),
         atr_distance_mult=_f("TF_5M_ATR_DISTANCE_MULT", 1.5),
@@ -98,41 +72,4 @@ _ALL_TIMEFRAMES: list[TimeframeProfile] = [
         discovery_mode="deterministic",
         poll_interval_seconds=_i("TF_5M_POLL_SECONDS", 3),
     ),
-    TimeframeProfile(
-        label="15m",
-        interval_minutes=15,
-        kline_interval=_s("TF_15M_KLINE_INTERVAL", "1m"),
-        atr_period=_i("TF_15M_ATR_PERIOD", 14),
-        ema_fast=_i("TF_15M_EMA_FAST", 9),
-        ema_slow=_i("TF_15M_EMA_SLOW", 21),
-        atr_lookback_for_regime=_i("TF_15M_ATR_LOOKBACK", 60),
-        min_minutes_left=_f("TF_15M_MIN_MINUTES_LEFT", 2.0),
-        max_minutes_left=_f("TF_15M_MAX_MINUTES_LEFT", 9.0),
-        atr_distance_mult=_f("TF_15M_ATR_DISTANCE_MULT", 1.5),
-        atr_spike_mult=_f("TF_15M_ATR_SPIKE_MULT", 2.2),
-        discovery_mode="deterministic",
-        poll_interval_seconds=_i("TF_15M_POLL_SECONDS", 5),
-    ),
-    TimeframeProfile(
-        label="1h",
-        interval_minutes=60,
-        kline_interval=_s("TF_1H_KLINE_INTERVAL", "5m"),
-        atr_period=_i("TF_1H_ATR_PERIOD", 14),
-        ema_fast=_i("TF_1H_EMA_FAST", 9),
-        ema_slow=_i("TF_1H_EMA_SLOW", 21),
-        atr_lookback_for_regime=_i("TF_1H_ATR_LOOKBACK", 60),
-        min_minutes_left=_f("TF_1H_MIN_MINUTES_LEFT", 10.0),
-        max_minutes_left=_f("TF_1H_MAX_MINUTES_LEFT", 45.0),
-        atr_distance_mult=_f("TF_1H_ATR_DISTANCE_MULT", 1.3),
-        atr_spike_mult=_f("TF_1H_ATR_SPIKE_MULT", 2.2),
-        discovery_mode="hourly_et_named",
-        poll_interval_seconds=_i("TF_1H_POLL_SECONDS", 20),
-    ),
 ]
-
-# Какие таймфреймы реально торгуются — через запятую в .env. По умолчанию
-# только 15m (часовую и 5-минутную стратегии отключили по факту, но код
-# для них остаётся на месте — можно вернуть без единой правки, просто
-# дописав нужную метку сюда).
-_enabled_labels = {s.strip() for s in os.getenv("ENABLED_TIMEFRAMES", "15m").split(",") if s.strip()}
-TIMEFRAMES: list[TimeframeProfile] = [tf for tf in _ALL_TIMEFRAMES if tf.label in _enabled_labels]

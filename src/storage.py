@@ -213,7 +213,7 @@ def count_open_trades() -> int:
 
 
 def parse_market_slug(slug: str) -> tuple[str, str]:
-    """'sol-updown-1h-1789270200' -> ('sol', '1h'). Если формат неожиданный,
+    """'sol-updown-5m-1789270200' -> ('sol', '5m'). Если формат неожиданный,
     возвращает ('unknown', 'unknown') вместо падения — отчёты не должны
     рушиться из-за одного странного слага."""
     try:
@@ -273,7 +273,7 @@ def get_pnl_by_asset(since_ts: int = 0) -> dict[str, dict]:
 
 
 def get_pnl_by_timeframe(since_ts: int = 0) -> dict[str, dict]:
-    """То же самое, но сгруппировано по таймфрейму (15m/1h) вместо актива."""
+    """То же самое, но сгруппировано по таймфрейму вместо актива (в этом боте таймфрейм всегда 5m, но колонка общая с основным ботом)."""
     with _conn() as conn:
         cur = conn.execute(
             "SELECT market_slug, pnl_usdc FROM trades WHERE outcome IS NOT NULL AND ts >= ?",
