@@ -1,6 +1,6 @@
 services:
   - type: worker
-    name: polymarket-btc-bot
+    name: polymarket-5m-bot
     env: python
     plan: starter
     buildCommand: "pip install -r requirements.txt"
