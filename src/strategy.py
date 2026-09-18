@@ -57,15 +57,24 @@ def _score_distance(distance_atr: float, atr_distance_mult: float) -> float:
     return ((capped - atr_distance_mult) / (3.0 - atr_distance_mult)) * 100
 
 
-def _score_trend_alignment(direction: str, ema_fast_slope: float, trend_up: bool) -> float:
+def _score_trend_alignment(direction: str, ema_fast_slope: float, trend_up: bool, macd_bullish: bool) -> float:
+    """
+    Три НЕЗАВИСИМЫХ голоса за направление: наклон EMA9, положение EMA9
+    относительно EMA21, и знак гистограммы MACD. MACD добавлен после
+    реального случая (2026-09-17): кластер проигрышей на UP-ставках, где
+    EMA9>EMA21 ещё держалась "вверх" (запаздывающий индикатор), а моментум
+    уже развернулся вниз — MACD реагирует на смену моментума раньше двух
+    EMA. Раньше было 2 голоса (0/50/100), теперь 3 (0/33/67/100) — цена
+    прохождения полного согласия чуть выше, зато отсекает именно те
+    случаи, где EMA всё ещё "тренд", а моментум уже развернулся.
+    """
     direction_up = direction == "UP"
-    slope_agrees = (ema_fast_slope > 0) == direction_up
-    trend_agrees = trend_up == direction_up
-    if slope_agrees and trend_agrees:
-        return 100.0
-    if slope_agrees or trend_agrees:
-        return 50.0
-    return 0.0
+    votes = [
+        (ema_fast_slope > 0) == direction_up,
+        trend_up == direction_up,
+        macd_bullish == direction_up,
+    ]
+    return sum(votes) / len(votes) * 100
 
 
 def _score_volatility_regime(atr_ratio_to_avg: float, atr_spike_mult: float) -> float:
@@ -120,7 +129,7 @@ def evaluate(
 
     time_score = _score_time_window(minutes_left, min_minutes_left, max_minutes_left)
     distance_score = _score_distance(distance_atr, atr_distance_mult)
-    trend_score = _score_trend_alignment(direction, indicators["ema_fast_slope"], indicators["trend_up"])
+    trend_score = _score_trend_alignment(direction, indicators["ema_fast_slope"], indicators["trend_up"], indicators["macd_bullish"])
     vol_score = _score_volatility_regime(indicators["atr_ratio_to_avg"], atr_spike_mult)
     liq_score = _score_liquidity(book, trade_size)
 
@@ -159,7 +168,27 @@ def evaluate(
         reasons.append("недостаточно ликвидности в стакане")
 
     price_in_range = min_entry <= book.best_ask <= max_entry
-    should_enter = price_in_range and safety_score >= score_threshold
+    # ВРЕМЕННОЕ ОКНО, МИНИМАЛЬНАЯ ДИСТАНЦИЯ И АНОМАЛЬНАЯ ВОЛАТИЛЬНОСТЬ —
+    # ЖЁСТКИЕ ГРАНИЦЫ ДОПУСТИМОСТИ, не просто "предпочтения" внутри общего
+    # score. С весами ниже 0.35+0.25 (distance+trend) достаточно, чтобы
+    # перевесить полностью нулевой time_score и пройти порог — это реально
+    # случилось в проде (отчёт от 2026-09-16: вход на btc с 12.1 минуты
+    # вместо разрешённых 2-9, score 80.6 при пороге 75). По той же причине
+    # добавлен vol_score > 0: при резком всплеске ATR (например, в момент
+    # заявлений ФРС — ровно то, из-за чего пользователь поставил бота на
+    # паузу) сильный сигнал по дистанции+тренду мог бы перевесить нулевой
+    # vol_score и всё равно войти прямо в шторм, где риск разворота выше
+    # обычного. time_score==0, distance_score==0 и vol_score==0 означают
+    # "физически/статистически вне заданных границ", а не просто "менее
+    # удачно" — поэтому это отдельные обязательные условия, а не только
+    # вклад в сумму.
+    should_enter = (
+        price_in_range
+        and safety_score >= score_threshold
+        and time_score > 0
+        and distance_score > 0
+        and vol_score > 0
+    )
 
     return Decision(
         should_enter=should_enter,

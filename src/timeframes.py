@@ -30,6 +30,14 @@
 - **Опрос реже** (30с вместо 5с) — часовой рынок меняется гораздо
   медленнее, незачем дёргать API так же часто, как для 15-минутного.
 
+5-минутный профиль (`5m`) использует ТОТ ЖЕ формат слага, что и 15m
+(тикер+unix-таймстемп, `discovery_mode="deterministic"`) — отличается
+только числом в слаге. Но параметры индикаторов и окна входа —
+ПРОПОРЦИОНАЛЬНО пересчитанные ДОГАДКИ, а не откалиброванные на реальных
+данных, в отличие от 15m (тот калибровался по 961 реальной сделке
+другого трейдера + по живым отчётам этого бота). Для 5m такого разбора
+не делали — присматривайся к первым отчётам особенно внимательно.
+
 Пороги можно переопределить через .env (см. .env.example), но дефолты —
 разумная отправная точка, а не проверенный оптимум ни для одного из
 таймфреймов.
@@ -55,7 +63,7 @@ def _s(name: str, default: str) -> str:
 
 @dataclass(frozen=True)
 class TimeframeProfile:
-    label: str                     # "15m" / "1h" — используется в market_discovery и слагах
+    label: str                     # "5m" / "15m" / "1h" — используется в market_discovery и слагах
     interval_minutes: int
     kline_interval: str            # свечи Binance для индикаторов
     atr_period: int
@@ -71,6 +79,25 @@ class TimeframeProfile:
 
 
 _ALL_TIMEFRAMES: list[TimeframeProfile] = [
+    TimeframeProfile(
+        label="5m",
+        interval_minutes=5,
+        # 1m — минимальная гранулярность свечей Binance, тоньше некуда.
+        kline_interval=_s("TF_5M_KLINE_INTERVAL", "1m"),
+        # Короче, чем у 15m (14/9/21), пропорционально более быстрому рынку —
+        # НЕПРОВЕРЕННАЯ на реальных данных догадка, не как у 15m.
+        atr_period=_i("TF_5M_ATR_PERIOD", 7),
+        ema_fast=_i("TF_5M_EMA_FAST", 3),
+        ema_slow=_i("TF_5M_EMA_SLOW", 7),
+        atr_lookback_for_regime=_i("TF_5M_ATR_LOOKBACK", 30),
+        # Пропорционально окну 2-9 из 15 у 15m: ~1-3.5 из 5.
+        min_minutes_left=_f("TF_5M_MIN_MINUTES_LEFT", 1.0),
+        max_minutes_left=_f("TF_5M_MAX_MINUTES_LEFT", 3.5),
+        atr_distance_mult=_f("TF_5M_ATR_DISTANCE_MULT", 1.5),
+        atr_spike_mult=_f("TF_5M_ATR_SPIKE_MULT", 2.2),
+        discovery_mode="deterministic",
+        poll_interval_seconds=_i("TF_5M_POLL_SECONDS", 3),
+    ),
     TimeframeProfile(
         label="15m",
         interval_minutes=15,
@@ -104,7 +131,8 @@ _ALL_TIMEFRAMES: list[TimeframeProfile] = [
 ]
 
 # Какие таймфреймы реально торгуются — через запятую в .env. По умолчанию
-# только 15m (часовую стратегию отключили по факту, но код для неё остаётся
-# на месте — можно вернуть без единой правки, просто дописав "1h" сюда).
+# только 15m (часовую и 5-минутную стратегии отключили по факту, но код
+# для них остаётся на месте — можно вернуть без единой правки, просто
+# дописав нужную метку сюда).
 _enabled_labels = {s.strip() for s in os.getenv("ENABLED_TIMEFRAMES", "15m").split(",") if s.strip()}
 TIMEFRAMES: list[TimeframeProfile] = [tf for tf in _ALL_TIMEFRAMES if tf.label in _enabled_labels]
