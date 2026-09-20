@@ -41,6 +41,69 @@ def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> 
     return macd_line, signal_line, histogram
 
 
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """Relative Strength Index — 0-100, >70 обычно трактуют как
+    перекупленность, <30 как перепроданность. Для исследования моментума
+    интереснее не сами пороги, а то, коррелирует ли текущий RSI с тем,
+    продолжит ли цена ЭТОГО конкретного контракта Polymarket двигаться в
+    ту же сторону в оставшееся до конца окна время."""
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, float("nan"))
+    return 100 - (100 / (1 + rs))
+
+
+def bollinger_bands(series: pd.Series, period: int = 20, num_std: float = 2.0) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Возвращает (upper, middle, lower). middle = SMA(period)."""
+    middle = series.rolling(period).mean()
+    std = series.rolling(period).std()
+    upper = middle + num_std * std
+    lower = middle - num_std * std
+    return upper, middle, lower
+
+
+def compute_extended_snapshot(df: pd.DataFrame, atr_period: int, ema_fast: int, ema_slow: int,
+                               atr_regime_lookback: int, rsi_period: int = 14,
+                               bb_period: int = 20) -> dict:
+    """
+    Расширенный набор индикаторов ДЛЯ ИССЛЕДОВАТЕЛЬСКОГО БОТА (momentum_tracker) —
+    не используется в живой торговой стратегии, чтобы не менять поведение
+    уже проверенного бота. Включает всё из compute_indicator_snapshot плюс
+    RSI, полосы Боллинджера (ширина и позиция цены в них — %B) и объём
+    относительно среднего.
+    """
+    base = compute_indicator_snapshot(df, atr_period, ema_fast, ema_slow, atr_regime_lookback)
+
+    df = df.copy()
+    df["rsi"] = rsi(df["close"], rsi_period)
+    upper, middle, lower = bollinger_bands(df["close"], bb_period)
+    df["bb_upper"], df["bb_middle"], df["bb_lower"] = upper, middle, lower
+
+    last = df.iloc[-1]
+    bb_width = float(last["bb_upper"] - last["bb_lower"]) if pd.notna(last["bb_upper"]) else None
+    # %B: 0 = у нижней полосы, 1 = у верхней, >1/<0 = цена вышла за полосу
+    bb_percent_b = None
+    if bb_width and bb_width > 0:
+        bb_percent_b = float((last["close"] - last["bb_lower"]) / bb_width)
+
+    volume_last = float(df["volume"].iloc[-1])
+    volume_avg = float(df["volume"].tail(atr_regime_lookback).mean())
+    volume_ratio = (volume_last / volume_avg) if volume_avg else None
+
+    base.update({
+        "rsi": float(last["rsi"]) if pd.notna(last["rsi"]) else None,
+        "bb_width": bb_width,
+        "bb_percent_b": bb_percent_b,
+        "volume_last": volume_last,
+        "volume_avg": volume_avg,
+        "volume_ratio": volume_ratio,
+    })
+    return base
+
+
 def compute_indicator_snapshot(df: pd.DataFrame, atr_period: int, ema_fast: int,
                                 ema_slow: int, atr_regime_lookback: int) -> dict:
     """

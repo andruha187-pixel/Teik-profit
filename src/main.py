@@ -17,7 +17,7 @@ import time
 
 from config import settings
 from src import binance_feed, market_discovery, indicators, strategy
-from src import polymarket_client, storage, telegram_notify, executor, book_stream, runtime_state, reporting, wallet_tracker
+from src import polymarket_client, storage, telegram_notify, executor, book_stream, runtime_state, reporting, wallet_tracker, momentum_tracker
 from src.timeframes import TIMEFRAMES, TimeframeProfile
 
 logging.basicConfig(
@@ -115,6 +115,12 @@ async def _instance_tick(asset: str, timeframe: TimeframeProfile) -> None:
 
     await executor.maybe_enter(market, decision)
 
+    if settings.MOMENTUM_TRACKER_ENABLED:
+        try:
+            await momentum_tracker.check_market(market, timeframe)
+        except Exception as exc:  # noqa: BLE001 — исследовательский модуль не должен ронять торговлю
+            log.warning("Ошибка momentum_tracker для %s: %s", market.slug, exc)
+
 
 async def _instance_loop(asset: str, timeframe: TimeframeProfile) -> None:
     key = f"{asset}:{timeframe.label}"
@@ -152,7 +158,11 @@ async def settlement_loop() -> None:
         try:
             await executor.settle_resolved_trades()
             await executor.check_position_stop_losses()
-            await executor.label_resolved_markets(exclude_slugs=set(_active_slugs.values()))
+            active = set(_active_slugs.values())
+            await executor.label_resolved_markets(exclude_slugs=active)
+            if settings.MOMENTUM_TRACKER_ENABLED:
+                await momentum_tracker.label_resolved(exclude_slugs=active)
+                momentum_tracker.cleanup_old_sessions(active)
         except Exception as exc:  # noqa: BLE001
             log.exception("Ошибка в settlement_loop: %s", exc)
         await asyncio.sleep(10)

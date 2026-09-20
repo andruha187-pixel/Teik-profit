@@ -127,6 +127,27 @@ def ask_liquidity_usdc(asset: str, depth_levels: int = 5) -> float:
     return sum(price * size for price, size in top)
 
 
+def book_imbalance(asset: str, depth_levels: int = 10) -> float | None:
+    """
+    Дисбаланс стакана: доля объёма на покупку (bid) от общего объёма
+    (bid+ask) в первых depth_levels уровнях. >0.5 — давление вверх
+    (больше желающих купить, чем продать по видимым ценам), <0.5 — вниз.
+    Используется в momentum_tracker как один из индикаторов возможного
+    продолжения движения цены — сырой сигнал давления, которого нет ни
+    в ATR/EMA (это про историю цены), ни в объёме свечи Binance (это
+    вообще про другой рынок, BTC/USDT, а не про сам контракт Polymarket).
+    """
+    b = _books.get(asset)
+    if not b or (not b.get("bids") and not b.get("asks")):
+        return None
+    bid_vol = sum(size for _, size in sorted(b.get("bids", {}).items(), reverse=True)[:depth_levels])
+    ask_vol = sum(size for _, size in sorted(b.get("asks", {}).items())[:depth_levels])
+    total = bid_vol + ask_vol
+    if total <= 0:
+        return None
+    return bid_vol / total
+
+
 def tick_size(asset: str) -> float:
     b = _books.get(asset)
     return float(b["tick_size"]) if b and b.get("tick_size") else 0.01

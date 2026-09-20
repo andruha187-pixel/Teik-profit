@@ -54,8 +54,9 @@ async def build_and_send_report() -> None:
 
     signals = storage.get_signals_since(since_ts)
     trades = storage.get_trades_since(since_ts)
+    momentum = storage.get_momentum_since(since_ts) if settings.MOMENTUM_TRACKER_ENABLED else []
 
-    if not signals and not trades:
+    if not signals and not trades and not momentum:
         _set_last_report_ts(now_ts)
         return
 
@@ -91,6 +92,21 @@ async def build_and_send_report() -> None:
 
     await telegram_notify.send_document(signals_path, caption)
     await telegram_notify.send_document(trades_path, None)
+
+    if momentum:
+        momentum_path = f"{base}_momentum.csv"
+        _write_csv(momentum_path, storage.MOMENTUM_COLUMNS, momentum)
+        reached_by_cp: dict[float, int] = {}
+        for row in momentum:
+            cp = row[storage.MOMENTUM_COLUMNS.index("checkpoint_price")]
+            reached_by_cp[cp] = reached_by_cp.get(cp, 0) + 1
+        cp_lines = "\n".join(f"  {cp:.2f}: {n} раз" for cp, n in sorted(reached_by_cp.items()))
+        momentum_caption = (
+            f"🔬 Momentum-отчёт {from_label} → {to_label}\n"
+            f"Контрольных точек зафиксировано: {len(momentum)}\n\n"
+            f"По уровням:\n{cp_lines}"
+        )
+        await telegram_notify.send_document(momentum_path, momentum_caption)
 
     _set_last_report_ts(now_ts)
 

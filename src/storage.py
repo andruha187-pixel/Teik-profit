@@ -50,6 +50,32 @@ CREATE TABLE IF NOT EXISTS bot_settings (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+
+CREATE TABLE IF NOT EXISTS momentum_checkpoints (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts INTEGER NOT NULL,
+    market_slug TEXT NOT NULL,
+    asset TEXT,
+    timeframe TEXT,
+    side TEXT,
+    checkpoint_price REAL,
+    minutes_left REAL,
+    rsi REAL,
+    macd_histogram REAL,
+    macd_bullish INTEGER,
+    atr REAL,
+    atr_ratio_to_avg REAL,
+    ema_fast REAL,
+    ema_slow REAL,
+    ema_fast_slope REAL,
+    trend_up INTEGER,
+    bb_width REAL,
+    bb_percent_b REAL,
+    volume_ratio REAL,
+    book_imbalance REAL,
+    final_outcome TEXT,
+    side_won INTEGER
+);
 """
 
 # Колонки, добавленные уже после первого релиза — через ALTER TABLE, чтобы
@@ -307,6 +333,63 @@ TRADES_COLUMNS = [
     "id", "ts", "market_slug", "condition_id", "direction", "entry_price", "size_usdc",
     "order_id", "status", "outcome", "pnl_usdc", "dry_run", "token_id", "source",
 ]
+
+
+MOMENTUM_COLUMNS = [
+    "id", "ts", "market_slug", "asset", "timeframe", "side", "checkpoint_price", "minutes_left",
+    "rsi", "macd_histogram", "macd_bullish", "atr", "atr_ratio_to_avg", "ema_fast", "ema_slow",
+    "ema_fast_slope", "trend_up", "bb_width", "bb_percent_b", "volume_ratio", "book_imbalance",
+    "final_outcome", "side_won",
+]
+
+
+def log_momentum_checkpoint(market_slug: str, asset: str, timeframe: str, side: str,
+                             checkpoint_price: float, minutes_left: float, indicators: dict,
+                             book_imbalance: float | None) -> None:
+    with _conn() as conn:
+        conn.execute(
+            """INSERT INTO momentum_checkpoints
+               (ts, market_slug, asset, timeframe, side, checkpoint_price, minutes_left,
+                rsi, macd_histogram, macd_bullish, atr, atr_ratio_to_avg, ema_fast, ema_slow,
+                ema_fast_slope, trend_up, bb_width, bb_percent_b, volume_ratio, book_imbalance)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                int(time.time()), market_slug, asset, timeframe, side, checkpoint_price, minutes_left,
+                indicators.get("rsi"), indicators.get("macd_histogram"),
+                int(indicators.get("macd_bullish")) if indicators.get("macd_bullish") is not None else None,
+                indicators.get("atr"), indicators.get("atr_ratio_to_avg"),
+                indicators.get("ema_fast"), indicators.get("ema_slow"), indicators.get("ema_fast_slope"),
+                int(indicators.get("trend_up")) if indicators.get("trend_up") is not None else None,
+                indicators.get("bb_width"), indicators.get("bb_percent_b"), indicators.get("volume_ratio"),
+                book_imbalance,
+            ),
+        )
+
+
+def label_momentum_outcome(market_slug: str, outcome: str) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE momentum_checkpoints SET final_outcome = ?, side_won = (side = ?) WHERE market_slug = ? AND final_outcome IS NULL",
+            (outcome, outcome, market_slug),
+        )
+
+
+def get_momentum_markets_needing_outcome(exclude_slugs: set[str] | None, limit: int = 50) -> list[str]:
+    exclude_slugs = exclude_slugs or set()
+    with _conn() as conn:
+        cur = conn.execute(
+            "SELECT DISTINCT market_slug FROM momentum_checkpoints WHERE final_outcome IS NULL ORDER BY ts ASC LIMIT ?",
+            (limit + len(exclude_slugs),),
+        )
+        rows = [row[0] for row in cur.fetchall() if row[0] not in exclude_slugs]
+        return rows[:limit]
+
+
+def get_momentum_since(since_ts: int) -> list[tuple]:
+    with _conn() as conn:
+        cols = ", ".join(MOMENTUM_COLUMNS)
+        cur = conn.execute(f"SELECT {cols} FROM momentum_checkpoints WHERE ts >= ? ORDER BY ts ASC", (since_ts,))
+        return cur.fetchall()
 
 
 def get_signals_since(since_ts: int) -> list[tuple]:
