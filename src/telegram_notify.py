@@ -24,7 +24,9 @@ _pending_input: str | None = None  # "size" | "stoploss" | None — ждём л�
 SIZE_PRESETS = [5, 10, 20, 50, 100]
 STOPLOSS_PRESETS = [20, 50, 100, 200]
 POSITION_SL_PRESETS = [20, 30, 50, 70]
-SCORE_PRESETS = [65, 75, 85, 90]
+SCORE_PRESETS = [75, 85, 88, 92]
+# Мин. расстояние от страйка, % от цены (0 = выкл). Для BTC ~84k: 0.05% ≈ $42, 0.07% ≈ $59, 0.10% ≈ $84.
+DISTANCE_PRESETS = [0.0, 0.05, 0.07, 0.10]
 
 
 def set_state_ref(state: dict) -> None:
@@ -39,6 +41,31 @@ def _size_summary() -> str:
         size_now = runtime_state.compute_trade_size()
         return f"{runtime_state.get('bankroll_pct'):.0f}% банка (сейчас {size_now:.2f} USDC)"
     return f"{runtime_state.get('trade_size_usdc'):.2f} USDC (фикс.)"
+
+
+def _distance_summary() -> str:
+    pct = runtime_state.get("min_distance_pct") or 0.0
+    if pct <= 0:
+        return "выкл"
+    return f"{pct:.2f}% (≈${pct / 100 * 84000:.0f} для BTC)"
+
+
+def _settings_text() -> str:
+    scaling_on = runtime_state.get("size_scaling_enabled")
+    scaling_line = (
+        f"Размер ставки масштабируется от порога: на пограничном score — "
+        f"{settings.SIZE_SCALING_MIN_FRACTION*100:.0f}% от размера позиции, "
+        f"на score {settings.SIZE_SCALING_MAX_SCORE:.0f}+ — полный размер."
+        if scaling_on else
+        "Масштабирование выключено — любая прошедшая порог сделка идёт полным размером."
+    )
+    return (
+        f"⚙️ Safety score порог: {runtime_state.get('safety_score_threshold'):.0f}\n"
+        "Чем выше — тем реже и осторожнее входы.\n\n"
+        f"📏 Мин. расстояние от страйка: {_distance_summary()}\n"
+        "Не входить, если цена ближе к страйку, чем этот % от цены.\n\n"
+        + scaling_line
+    )
 
 
 def _main_menu_text() -> str:
@@ -56,6 +83,8 @@ def _main_menu_text() -> str:
         f"Стоп-лосс/день: {runtime_state.get('daily_loss_limit_usdc'):.0f} USDC",
         f"Стоп-лосс позиции: {'вкл ' + str(round(runtime_state.get('position_stop_loss_pct'))) + '%' if pos_sl_on else 'выкл'}",
         f"Safety score порог: {runtime_state.get('safety_score_threshold'):.0f}",
+        f"Диапазон входа: {runtime_state.get('min_entry_price'):.2f}–{runtime_state.get('max_entry_price'):.2f}",
+        f"Мин. расстояние от страйка: {_distance_summary()}",
     ]
     if s:
         lines.append("")
@@ -84,6 +113,7 @@ def _main_menu_markup() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📈 Диапазон входа", callback_data="menu:range"),
         ],
         [InlineKeyboardButton("🐋 Слежка за кошельком", callback_data="menu:wallet")],
+        [InlineKeyboardButton("🔒 Хедж-бот", callback_data="menu:hedge")],
         [
             InlineKeyboardButton("📊 Статистика", callback_data="stats"),
             InlineKeyboardButton("⚙️ Настройки", callback_data="menu:settings"),
@@ -114,6 +144,47 @@ def _assets_menu_markup() -> InlineKeyboardMarkup:
 
 BANKROLL_PCT_PRESETS = [3, 5, 7, 10]
 COPYTRADE_SIZE_PRESETS = [2, 5, 10, 20]
+
+
+HEDGE_STAKE_PRESETS = [2, 5, 10, 20]
+HEDGE_TRIGGER_PRESETS = [0.85, 0.88, 0.90, 0.93]
+
+
+def _hedge_menu_markup() -> InlineKeyboardMarkup:
+    enabled = runtime_state.get("hedge_bot_enabled")
+    entry = runtime_state.get("hedge_entry_price")
+    trigger = runtime_state.get("hedge_trigger_price")
+    stake = runtime_state.get("hedge_stake_usdc")
+
+    rows = [
+        [InlineKeyboardButton(
+            "🔴 Выключить хедж-бота" if enabled else "🟢 Включить хедж-бота",
+            callback_data="hedge_toggle",
+        )],
+        [InlineKeyboardButton("— Порог хеджа (сейчас {:.2f}) —".format(trigger), callback_data="noop")],
+    ]
+    row = []
+    for val in HEDGE_TRIGGER_PRESETS:
+        mark = "✅ " if abs(val - trigger) < 0.001 else ""
+        row.append(InlineKeyboardButton(f"{mark}{val:.2f}", callback_data=f"hedgetrigger_set:{val}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("— Размер ставки —", callback_data="noop")])
+    row = []
+    for val in HEDGE_STAKE_PRESETS:
+        mark = "✅ " if abs(val - stake) < 0.01 else ""
+        row.append(InlineKeyboardButton(f"{mark}{val}", callback_data=f"hedgestake_set:{val}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("✏️ Свой размер ставки", callback_data="hedgestake_custom")])
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="menu:main")])
+    return InlineKeyboardMarkup(rows)
 
 
 def _wallet_menu_markup() -> InlineKeyboardMarkup:
@@ -294,6 +365,16 @@ def _settings_menu_markup() -> InlineKeyboardMarkup:
         InlineKeyboardButton("−1", callback_data="score_delta:-1"),
         InlineKeyboardButton("+1", callback_data="score_delta:+1"),
     ])
+    rows.append([InlineKeyboardButton("— 📏 Мин. расстояние от страйка —", callback_data="noop")])
+    cur_dist = runtime_state.get("min_distance_pct") or 0.0
+    drow = []
+    for val in DISTANCE_PRESETS:
+        mark = "✅ " if abs(val - cur_dist) < 1e-6 else ""
+        label = "выкл" if val == 0 else f"{val:.2f}%"
+        drow.append(InlineKeyboardButton(f"{mark}{label}", callback_data=f"dist_set:{val}"))
+    rows.append(drow)
+    rows.append([InlineKeyboardButton("✏️ Своё расстояние, %", callback_data="dist_custom")])
+    rows.append([InlineKeyboardButton("⭐ Рекомендованные настройки", callback_data="preset_apply")])
     scaling_on = runtime_state.get("size_scaling_enabled")
     rows.append([InlineKeyboardButton(
         "📉 Масштабировать размер по score" if not scaling_on else "💯 Входить полным размером",
@@ -389,7 +470,7 @@ async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = (update.message.text or "").strip().replace(",", ".")
     try:
         value = float(raw)
-        if value <= 0:
+        if value < 0 or (value == 0 and _pending_input != "min_distance"):
             raise ValueError
     except ValueError:
         await update.message.reply_text("Не похоже на положительное число, попробуй ещё раз (например: 15.5)")
@@ -436,6 +517,17 @@ async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _pending_input = None
         await update.message.reply_text(
             f"✅ Размер копи-сделки: {value:.2f} USDC", reply_markup=_wallet_menu_markup(),
+        )
+    elif _pending_input == "min_distance":
+        value = min(value, 5.0)
+        runtime_state.set("min_distance_pct", value)
+        _pending_input = None
+        await update.message.reply_text("✅ " + _settings_text(), reply_markup=_settings_menu_markup())
+    elif _pending_input == "hedge_stake":
+        runtime_state.set("hedge_stake_usdc", value)
+        _pending_input = None
+        await update.message.reply_text(
+            f"✅ Размер ставки хеджа: {value:.2f} USDC", reply_markup=_hedge_menu_markup(),
         )
 
 
@@ -490,6 +582,44 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "✏️ Напиши стартовый банк в USDC следующим сообщением, например: 60",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="menu:size")]]),
+        )
+
+    elif data == "menu:hedge":
+        enabled = runtime_state.get("hedge_bot_enabled")
+        await query.edit_message_text(
+            f"🔒 Хедж-бот: {'🟢 включён' if enabled else '🔴 выключен'}\n"
+            f"Вход при цене {runtime_state.get('hedge_entry_price'):.2f}, хедж противоположной стороны при "
+            f"{runtime_state.get('hedge_trigger_price'):.2f}\n"
+            f"Размер ставки: {runtime_state.get('hedge_stake_usdc'):.2f} USDC\n\n"
+            "Если цена не доходит до порога хеджа — остаётся односторонняя позиция "
+            "(по нашим данным такие случаи почти всегда проигрывают). "
+            "PnL в отчётах — без учёта комиссии тейкера.",
+            reply_markup=_hedge_menu_markup(),
+        )
+
+    elif data == "hedge_toggle":
+        new_val = not runtime_state.get("hedge_bot_enabled")
+        runtime_state.set("hedge_bot_enabled", new_val)
+        await query.edit_message_text(
+            f"{'🟢 Хедж-бот включён' if new_val else '🔴 Хедж-бот выключен'}",
+            reply_markup=_hedge_menu_markup(),
+        )
+
+    elif data.startswith("hedgetrigger_set:"):
+        val = float(data.split(":", 1)[1])
+        runtime_state.set("hedge_trigger_price", val)
+        await query.edit_message_text(f"✅ Порог хеджа: {val:.2f}", reply_markup=_hedge_menu_markup())
+
+    elif data.startswith("hedgestake_set:"):
+        val = float(data.split(":", 1)[1])
+        runtime_state.set("hedge_stake_usdc", val)
+        await query.edit_message_text(f"✅ Размер ставки хеджа: {val:.2f} USDC", reply_markup=_hedge_menu_markup())
+
+    elif data == "hedgestake_custom":
+        _pending_input = "hedge_stake"
+        await query.edit_message_text(
+            "✏️ Напиши размер ставки хеджа в USDC следующим сообщением, например: 7.5",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="menu:hedge")]]),
         )
 
     elif data == "menu:wallet":
@@ -629,17 +759,26 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "menu:settings":
-        scaling_on = runtime_state.get("size_scaling_enabled")
-        scaling_line = (
-            f"Размер ставки масштабируется от порога: на пограничном score — "
-            f"{settings.SIZE_SCALING_MIN_FRACTION*100:.0f}% от размера позиции, "
-            f"на score {settings.SIZE_SCALING_MAX_SCORE:.0f}+ — полный размер."
-            if scaling_on else
-            "Масштабирование выключено — любая прошедшая порог сделка идёт полным размером."
-        )
+        await query.edit_message_text(_settings_text(), reply_markup=_settings_menu_markup())
+
+    elif data.startswith("dist_set:"):
+        runtime_state.set("min_distance_pct", float(data.split(":", 1)[1]))
+        await query.edit_message_text("✅ " + _settings_text(), reply_markup=_settings_menu_markup())
+
+    elif data == "dist_custom":
+        _pending_input = "min_distance"
         await query.edit_message_text(
-            f"⚙️ Safety score порог: {runtime_state.get('safety_score_threshold'):.0f}\n"
-            "Чем выше — тем реже и осторожнее входы.\n\n" + scaling_line,
+            "✏️ Напиши минимальное расстояние от страйка в % от цены, например: 0.07\n"
+            "(для BTC ~84k: 0.05 ≈ $42, 0.07 ≈ $59, 0.10 ≈ $84). 0 — выключить фильтр.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="menu:settings")]]),
+        )
+
+    elif data == "preset_apply":
+        runtime_state.apply_recommended()
+        await query.edit_message_text(
+            "⭐ Применены рекомендованные настройки: порог 88, диапазон "
+            f"{runtime_state.get('min_entry_price'):.2f}–{runtime_state.get('max_entry_price'):.2f}.\n\n"
+            + _settings_text(),
             reply_markup=_settings_menu_markup(),
         )
 

@@ -202,10 +202,18 @@ async def place_sell_order(token_id: str, shares: float, min_price: float | None
     отправляем без него — не хотим падать всей функцией из-за
     необязательного параметра защиты в SDK, который всё ещё в статусе beta.
     """
+    # Округляем через Decimal, а не float: 14.29*0.94 как float даёт
+    # 13.432599999999999 (артефакт двоичного представления десятичных
+    # дробей), а не чисто 13.4326 — биржа отклоняет такие "грязные" числа
+    # (реальный случай на хедж-боте, 2026-09-22: "invalid amounts...
+    # max accuracy of 2 decimals... max of 4 decimals").
+    from decimal import Decimal, ROUND_DOWN
+    shares_dec = Decimal(str(shares)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
     client = await _get_client()
-    kwargs = dict(token_id=token_id, side="SELL", shares=str(round(shares, 2)), order_type="FOK")
+    kwargs = dict(token_id=token_id, side="SELL", shares=str(shares_dec), order_type="FOK")
     if min_price is not None:
-        kwargs["min_price"] = str(min_price)
+        price_dec = Decimal(str(min_price)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        kwargs["min_price"] = str(price_dec)
     try:
         return await client.place_market_order(**kwargs)
     except TypeError:

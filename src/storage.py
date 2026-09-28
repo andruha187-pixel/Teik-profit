@@ -76,7 +76,94 @@ CREATE TABLE IF NOT EXISTS momentum_checkpoints (
     final_outcome TEXT,
     side_won INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS hedge_positions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts INTEGER NOT NULL,
+    market_slug TEXT NOT NULL,
+    asset TEXT,
+    timeframe TEXT,
+    side TEXT,
+    entry_price REAL,
+    entry_shares REAL,
+    entry_cost REAL,
+    entry_token_id TEXT,
+    hedge_price REAL,
+    hedge_shares REAL,
+    hedge_cost REAL,
+    hedge_token_id TEXT,
+    hedge_ts INTEGER,
+    status TEXT,
+    outcome TEXT,
+    pnl_usdc REAL,
+    dry_run INTEGER
+);
 """
+
+HEDGE_COLUMNS = [
+    "id", "ts", "market_slug", "asset", "timeframe", "side", "entry_price", "entry_shares",
+    "entry_cost", "entry_token_id", "hedge_price", "hedge_shares", "hedge_cost", "hedge_token_id",
+    "hedge_ts", "status", "outcome", "pnl_usdc", "dry_run",
+]
+
+
+def create_hedge_position(market_slug: str, asset: str, timeframe: str, side: str,
+                           entry_price: float, entry_shares: float, entry_cost: float,
+                           entry_token_id: str, dry_run: bool) -> int:
+    with _conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO hedge_positions
+               (ts, market_slug, asset, timeframe, side, entry_price, entry_shares, entry_cost,
+                entry_token_id, status, dry_run)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open_unhedged', ?)""",
+            (int(time.time()), market_slug, asset, timeframe, side, entry_price, entry_shares,
+             entry_cost, entry_token_id, int(dry_run)),
+        )
+        return cur.lastrowid
+
+
+def get_open_hedge_position(market_slug: str, side: str):
+    with _conn() as conn:
+        cur = conn.execute(
+            "SELECT id, entry_shares, entry_cost, status FROM hedge_positions "
+            "WHERE market_slug = ? AND side = ? AND status IN ('open_unhedged', 'hedged')",
+            (market_slug, side),
+        )
+        return cur.fetchone()
+
+
+def mark_hedged(position_id: int, hedge_price: float, hedge_shares: float, hedge_cost: float,
+                hedge_token_id: str) -> None:
+    with _conn() as conn:
+        conn.execute(
+            """UPDATE hedge_positions SET status = 'hedged', hedge_price = ?, hedge_shares = ?,
+               hedge_cost = ?, hedge_token_id = ?, hedge_ts = ? WHERE id = ?""",
+            (hedge_price, hedge_shares, hedge_cost, hedge_token_id, int(time.time()), position_id),
+        )
+
+
+def settle_hedge_position(position_id: int, outcome: str, pnl_usdc: float) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE hedge_positions SET status = 'closed', outcome = ?, pnl_usdc = ? WHERE id = ?",
+            (outcome, pnl_usdc, position_id),
+        )
+
+
+def get_unsettled_hedge_positions():
+    with _conn() as conn:
+        cur = conn.execute(
+            "SELECT id, market_slug, side, entry_shares, entry_cost, hedge_shares, hedge_cost, status, dry_run "
+            "FROM hedge_positions WHERE status IN ('open_unhedged', 'hedged')"
+        )
+        return cur.fetchall()
+
+
+def get_hedge_positions_since(since_ts: int) -> list[tuple]:
+    with _conn() as conn:
+        cols = ", ".join(HEDGE_COLUMNS)
+        cur = conn.execute(f"SELECT {cols} FROM hedge_positions WHERE ts >= ? ORDER BY ts ASC", (since_ts,))
+        return cur.fetchall()
 
 # Колонки, добавленные уже после первого релиза — через ALTER TABLE, чтобы
 # не терять историю на уже задеплоенных базах. (column_name, sql_type)

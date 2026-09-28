@@ -21,6 +21,10 @@ _DEFAULTS = {
     "safety_score_threshold": settings.SAFETY_SCORE_THRESHOLD,
     "min_entry_price": settings.MIN_ENTRY_PRICE,
     "max_entry_price": settings.MAX_ENTRY_PRICE,
+    # Мин. расстояние цены от страйка, % от цены (0 = выкл) — см. config.py.
+    "min_distance_pct": settings.MIN_DISTANCE_PCT,
+    # Версия применённого набора рекомендованных настроек (см. RECOMMENDED ниже).
+    "preset_version": 0,
     # По умолчанию выключено: каждая прошедшая порог сделка идёт полным
     # TRADE_SIZE_USDC, без урезания по пограничности score.
     "size_scaling_enabled": False,
@@ -47,6 +51,17 @@ _DEFAULTS = {
     "wallet_notify_enabled": True,
     "wallet_copytrade_enabled": False,
     "copytrade_size_usdc": 5.0,
+    # Хедж-бот: вход по ENTRY_PRICE, докупка противоположной стороны при
+    # достижении HEDGE_PRICE — см. src/hedge_bot.py. Пороги пришли из
+    # анализа реальных momentum-отчётов (2026-09-20): хедж на 0.90 дал
+    # положительный PnL на бэктесте, хедж на 0.70-0.85 — отрицательный,
+    # несмотря на то, что сам хедж всегда безубыточен по построению —
+    # разница в том, сколько сессий вообще НЕ доходит до точки хеджа и
+    # остаётся неприкрытой позицией (см. обсуждение в чате).
+    "hedge_bot_enabled": False,  # хедж живёт отдельным ботом (polymarket-hedge-bot)
+    "hedge_entry_price": 0.70,
+    "hedge_trigger_price": 0.90,
+    "hedge_stake_usdc": 5.0,
 }
 
 # Типы приведения при чтении из SQLite (там всё хранится как TEXT)
@@ -58,6 +73,8 @@ _CASTERS = {
     "safety_score_threshold": float,
     "min_entry_price": float,
     "max_entry_price": float,
+    "min_distance_pct": float,
+    "preset_version": int,
     "size_scaling_enabled": lambda v: str(v).lower() == "true",
     "position_stop_loss_enabled": lambda v: str(v).lower() == "true",
     "position_stop_loss_pct": float,
@@ -68,6 +85,10 @@ _CASTERS = {
     "wallet_notify_enabled": lambda v: str(v).lower() == "true",
     "wallet_copytrade_enabled": lambda v: str(v).lower() == "true",
     "copytrade_size_usdc": float,
+    "hedge_bot_enabled": lambda v: str(v).lower() == "true",
+    "hedge_entry_price": float,
+    "hedge_trigger_price": float,
+    "hedge_stake_usdc": float,
 }
 
 _state: dict = dict(_DEFAULTS)
@@ -82,6 +103,42 @@ def init_from_db() -> None:
                 _state[key] = _CASTERS[key](raw)
             except (TypeError, ValueError):
                 pass
+    _apply_preset_if_new()
+
+
+# Рекомендованные настройки по итогам анализа отчётов 25-28.09 (5m и 15m BTC).
+# Применяются ОДИН РАЗ при первом старте новой версии поверх того, что было
+# сохранено в базе из Telegram (иначе старые значения из bot_settings, например
+# порог 92, так и остались бы). Дальше можно спокойно менять из Telegram —
+# повторно не перезапишутся, пока не поднимем PRESET_VERSION. Кнопка
+# "⭐ Рекомендованные" в ⚙️ Настройках применяет их вручную ещё раз.
+PRESET_VERSION = 1
+
+
+def recommended() -> dict:
+    return {
+        "safety_score_threshold": 88.0,
+        "min_entry_price": 0.90,
+        "max_entry_price": 0.95,
+        "min_distance_pct": settings.MIN_DISTANCE_PCT,
+        # Хедж вынесен в отдельный бот; здесь он тратил бы тот же кошелёк
+        # и в LIVE покупал бы по $5 на каждом рынке, где цена прошла 0.70.
+        "hedge_bot_enabled": False,
+    }
+
+
+def apply_recommended() -> dict:
+    rec = recommended()
+    for key, value in rec.items():
+        set(key, value)
+    return rec
+
+
+def _apply_preset_if_new() -> None:
+    if int(_state.get("preset_version") or 0) >= PRESET_VERSION:
+        return
+    apply_recommended()
+    set("preset_version", PRESET_VERSION)
 
 
 def get(key: str):

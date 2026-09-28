@@ -108,6 +108,20 @@ async def build_and_send_report() -> None:
         )
         await telegram_notify.send_document(momentum_path, momentum_caption)
 
+    hedge_positions = storage.get_hedge_positions_since(since_ts)
+    if hedge_positions:
+        hedge_path = f"{base}_hedge.csv"
+        _write_csv(hedge_path, storage.HEDGE_COLUMNS, hedge_positions)
+        closed = [row for row in hedge_positions if row[storage.HEDGE_COLUMNS.index("status")] == "closed"]
+        hedged_count = sum(1 for row in closed if row[storage.HEDGE_COLUMNS.index("hedge_price")] is not None)
+        pnl_sum = sum(row[storage.HEDGE_COLUMNS.index("pnl_usdc")] or 0 for row in closed)
+        hedge_caption = (
+            f"🔒 Хедж-бот {from_label} → {to_label}\n"
+            f"Позиций закрыто: {len(closed)} (захеджировано: {hedged_count}, "
+            f"без хеджа: {len(closed) - hedged_count}) | PnL: {pnl_sum:+.2f} USDC (без учёта комиссии)"
+        )
+        await telegram_notify.send_document(hedge_path, hedge_caption)
+
     _set_last_report_ts(now_ts)
 
 

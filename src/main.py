@@ -17,7 +17,8 @@ import time
 
 from config import settings
 from src import binance_feed, market_discovery, indicators, strategy
-from src import polymarket_client, storage, telegram_notify, executor, book_stream, runtime_state, reporting, wallet_tracker, momentum_tracker
+from src.market_discovery import ActiveMarket
+from src import polymarket_client, storage, telegram_notify, executor, book_stream, runtime_state, reporting, wallet_tracker, momentum_tracker, hedge_bot
 from src.timeframes import TIMEFRAMES, TimeframeProfile
 
 logging.basicConfig(
@@ -30,6 +31,12 @@ log = logging.getLogger("polymarket-bot")
 # — общий словарь, читает settlement_loop, чтобы не спрашивать Gamma API про
 # рынки, которые заведомо ещё не могли зарезолвиться.
 _active_slugs: dict[str, str] = {}
+
+# Рынок на протяжении всего своего окна не меняется — кэшируем и спрашиваем
+# Gamma API заново только когда окно истекло, а не на каждом тике (было:
+# один и тот же рынок запрашивался каждые 3-5 секунд, до ~100 лишних
+# запросов за один 5-минутный рынок).
+_active_markets: dict[str, ActiveMarket] = {}
 
 # Последнее состояние каждого потока — для команды /token и общего статуса.
 _instance_state: dict[str, dict] = {}
@@ -50,11 +57,20 @@ async def _instance_tick(asset: str, timeframe: TimeframeProfile) -> None:
         telegram_notify.set_state_ref(_instance_state)
         return
 
-    market = await market_discovery.get_active_market(asset, timeframe)
-    _active_slugs[key] = market.slug
-
-    if settings.USE_LIVE_BOOK_STREAM:
-        book_stream.subscribe([market.up_token_id, market.down_token_id])
+    cached = _active_markets.get(key)
+    if cached is not None and time.time() < cached.end_time:
+        market = cached
+    else:
+        # Окно истекло (или это первый тик) — отписываемся от токенов
+        # СТАРОГО рынка для этого же потока прежде, чем подписаться на новый.
+        # Без этого _subscribed растёт неограниченно с каждым новым окном.
+        if cached is not None and settings.USE_LIVE_BOOK_STREAM:
+            book_stream.unsubscribe([cached.up_token_id, cached.down_token_id])
+        market = await market_discovery.get_active_market(asset, timeframe)
+        _active_slugs[key] = market.slug
+        _active_markets[key] = market
+        if settings.USE_LIVE_BOOK_STREAM:
+            book_stream.subscribe([market.up_token_id, market.down_token_id])
 
     if not runtime_state.get("dry_run"):
         asyncio.create_task(polymarket_client.prewarm_transport())
@@ -121,6 +137,11 @@ async def _instance_tick(asset: str, timeframe: TimeframeProfile) -> None:
         except Exception as exc:  # noqa: BLE001 — исследовательский модуль не должен ронять торговлю
             log.warning("Ошибка momentum_tracker для %s: %s", market.slug, exc)
 
+    try:
+        await hedge_bot.check_market(market, timeframe)
+    except Exception as exc:  # noqa: BLE001 — хедж-бот не должен ронять основную торговлю
+        log.warning("Ошибка hedge_bot для %s: %s", market.slug, exc)
+
 
 async def _instance_loop(asset: str, timeframe: TimeframeProfile) -> None:
     key = f"{asset}:{timeframe.label}"
@@ -163,6 +184,7 @@ async def settlement_loop() -> None:
             if settings.MOMENTUM_TRACKER_ENABLED:
                 await momentum_tracker.label_resolved(exclude_slugs=active)
                 momentum_tracker.cleanup_old_sessions(active)
+            await hedge_bot.settle_resolved()
         except Exception as exc:  # noqa: BLE001
             log.exception("Ошибка в settlement_loop: %s", exc)
         await asyncio.sleep(10)

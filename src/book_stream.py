@@ -91,10 +91,30 @@ def _apply_delta(msg: dict) -> None:
 def subscribe(asset_ids: list[str]) -> None:
     """Идемпотентно добавляем токены в подписку. Реально уходит в сокет,
     когда соединение поднято — если сокета ещё нет, он подхватит при коннекте."""
-    new = [a for a in asset_ids if a and a not in _subscribed]
-    if not new:
+    new_ids = [a for a in asset_ids if a and a not in _subscribed]
+    if not new_ids:
         return
-    _subscribed.update(new)
+    _subscribed.update(new_ids)
+    try:
+        _send_queue.put_nowait({"type": "market", "assets_ids": list(_subscribed), "custom_feature_enabled": True})
+    except asyncio.QueueFull:
+        pass
+
+
+def unsubscribe(asset_ids: list[str]) -> None:
+    """Убираем токены истёкших окон из подписки — без этого _subscribed
+    растёт неограниченно (каждое новое окно добавляет токены, старые
+    никогда не убирались), и если у Polymarket есть лимит на размер
+    подписки, новые токены в какой-то момент перестают получать данные
+    вообще (реальный случай на хедж-боте, 2026-09-21: "нет цены в стакане"
+    в 75-97% проверок после ~часа работы). Шлём заново ПОЛНЫЙ желаемый
+    список — судя по формату протокола, сервер заменяет подписку целиком."""
+    removed = [a for a in asset_ids if a in _subscribed]
+    if not removed:
+        return
+    for a in removed:
+        _subscribed.discard(a)
+        _books.pop(a, None)
     try:
         _send_queue.put_nowait({"type": "market", "assets_ids": list(_subscribed), "custom_feature_enabled": True})
     except asyncio.QueueFull:
@@ -202,9 +222,18 @@ async def run_forever() -> None:
                 sender_task = asyncio.create_task(_sender(ws))
                 try:
                     async for raw in ws:
-                        if raw == "PONG":
+                        if not raw or raw == "PONG":
                             continue
-                        parsed = json.loads(raw)
+                        try:
+                            parsed = json.loads(raw)
+                        except (json.JSONDecodeError, ValueError) as exc:
+                            # Одно кривое/пустое сообщение НЕ должно рвать всё
+                            # соединение — раньше именно так и происходило:
+                            # json.loads("") -> исключение -> вылет из async for
+                            # -> полный реконнект каждые несколько секунд, и в
+                            # моменты разрыва бот не видел цену вообще.
+                            log.debug("Пропускаю нераспарсенное сообщение стакана (%s): %r", exc, raw[:200])
+                            continue
                         # Сервер иногда шлёт не один объект, а МАССИВ объектов
                         # разом (например, снапшот сразу по нескольким
                         # подписанным токенам при первом коннекте) — раньше

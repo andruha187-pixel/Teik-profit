@@ -167,6 +167,18 @@ def evaluate(
     if liq_score < 50:
         reasons.append("недостаточно ликвидности в стакане")
 
+    # Мин. расстояние от страйка в % от цены (0 = выкл). Жёсткое условие, как
+    # и временное окно: в тихом рынке "много ATR" может быть всего $40-70 для
+    # BTC, и именно на таких входах 15m ловил проигрыши (см. config.py).
+    min_distance_pct = runtime_state.get("min_distance_pct") or 0.0
+    distance_usd = abs(current_price - strike_price)
+    distance_pct = distance_usd / strike_price * 100 if strike_price else 0.0
+    distance_ok = min_distance_pct <= 0 or distance_pct >= min_distance_pct
+    if not distance_ok:
+        reasons.append(
+            f"до страйка {distance_usd:.2f} ({distance_pct:.3f}%) меньше минимума {min_distance_pct:.3f}%"
+        )
+
     price_in_range = min_entry <= book.best_ask <= max_entry
     # ВРЕМЕННОЕ ОКНО, МИНИМАЛЬНАЯ ДИСТАНЦИЯ И АНОМАЛЬНАЯ ВОЛАТИЛЬНОСТЬ —
     # ЖЁСТКИЕ ГРАНИЦЫ ДОПУСТИМОСТИ, не просто "предпочтения" внутри общего
@@ -188,6 +200,7 @@ def evaluate(
         and time_score > 0
         and distance_score > 0
         and vol_score > 0
+        and distance_ok
     )
 
     return Decision(

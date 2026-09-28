@@ -131,6 +131,16 @@ def _extract_market_fields(event: dict) -> tuple[str, list[str], int | None, int
     down_idx = next((i for i, o in enumerate(outcomes) if o.lower() == "down"), 1)
     up_token, down_token = token_ids[up_idx], token_ids[down_idx]
 
+    if up_token == down_token:
+        # Реальный случай на хедж-боте, 2026-09-21: у HYPE иногда
+        # up_token_id == down_token_id (причина не выяснена — либо
+        # особенность конкретно этого рынка в API Polymarket, либо гонка на
+        # границе окна). С такой парой UP и DOWN — на самом деле один и тот
+        # же контракт, торговать нельзя.
+        raise RuntimeError(
+            f"up_token_id == down_token_id для {event.get('slug', '?')} — сломанная пара токенов, пропускаю"
+        )
+
     start_time = _parse_timestamp(event.get("marketStartTime"))
     end_time = _parse_timestamp(event.get("endDate") or market.get("endDate"))
 

@@ -82,7 +82,16 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
     # обязательно выравниваем по тику — иначе CLOB отклонит ордер с неверным
     # шагом цены прямо в критичный момент.
     tick = book_stream.tick_size(token_id)
-    raw_cap = min(decision.entry_price + settings.LIVE_ENTRY_MAX_SLIPPAGE, settings.MAX_ENTRY_EXECUTION_PRICE)
+    # Потолок исполнения НЕ может быть выше максимума из «📈 Диапазон
+    # входа». Раньше запас на слиппедж (+0.01) добавлялся поверх: сигнал
+    # по 0.95 при максимуме 0.95 уходил с потолком 0.96 и реально
+    # исполнялся по 0.96. Оба реальных проигрыша BTC 5m за 25-28.09
+    # (−$21.86 и −$27.11) были именно такими сделками.
+    raw_cap = min(
+        decision.entry_price + settings.LIVE_ENTRY_MAX_SLIPPAGE,
+        settings.MAX_ENTRY_EXECUTION_PRICE,
+        runtime_state.get("max_entry_price"),
+    )
     execution_price = polymarket_client.round_price_for_buy(raw_cap, tick)
 
     status = "DRY_RUN"
