@@ -55,10 +55,18 @@ class Settings:
     POLY_SIGNATURE_TYPE: int = _get_int("POLY_SIGNATURE_TYPE", 0)
 
     # --- Стратегия входа (общее для всех активов/таймфреймов) ---
-    MIN_ENTRY_PRICE: float = _get_float("MIN_ENTRY_PRICE", 0.80)
+    MIN_ENTRY_PRICE: float = _get_float("MIN_ENTRY_PRICE", 0.90)
     MAX_ENTRY_PRICE: float = _get_float("MAX_ENTRY_PRICE", 0.95)
-    SAFETY_SCORE_THRESHOLD: float = _get_float("SAFETY_SCORE_THRESHOLD", 75.0)
+    SAFETY_SCORE_THRESHOLD: float = _get_float("SAFETY_SCORE_THRESHOLD", 88.0)
     MIN_BOOK_LIQUIDITY_USDC: float = _get_float("MIN_BOOK_LIQUIDITY_USDC", 25.0)
+    # Минимальное расстояние цены от страйка в % от цены (0 = фильтр выключен).
+    # Зачем: расхождение в ATR обманчиво в тихом рынке — при маленьком ATR
+    # "3-4 ATR" это всего $40-70 для BTC, и за 5-7 минут до конца 15m-рынка
+    # такое расстояние легко съедается. Бэктест 15m BTC (25-28.09, 139 рынков):
+    # без фильтра −$17, с минимумом ~$60 (0.07% при BTC ~84k) — +$38, из 4
+    # проигрышей остался 1. На 5m фильтр ничего не дал (там вход за 1.5-3 мин),
+    # поэтому для 5m по умолчанию выключен. Меняется из Telegram (⚙️ Настройки).
+    MIN_DISTANCE_PCT: float = _get_float("MIN_DISTANCE_PCT", 0.0)
 
     # --- Латентность / исполнение (прогрев стакана и транспорта) ---
     USE_LIVE_BOOK_STREAM: bool = _get_bool("USE_LIVE_BOOK_STREAM", True)
