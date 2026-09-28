@@ -37,6 +37,9 @@ def _scale_trade_size(base_size: float, score: float, threshold: float) -> float
     return round(base_size * fraction, 2)
 
 
+_liquidity_skip_notified: set[str] = set()
+
+
 async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
     if not decision.should_enter:
         return
@@ -70,9 +73,22 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
     # потолка. Если объём меньше запрошенного — торгуем тем, что реально
     # есть (с запасом на случай, что часть заберут раньше нас), а не
     # отправляем заведомо обречённый на отмену ордер на полную сумму.
-    available_liquidity = book_stream.ask_liquidity_usdc(token_id, depth_levels=10)
+    # Раньше глубину брали ТОЛЬКО из WS-кэша (book_stream). Когда WS-стакан
+    # по токену пустой или протух, стратегия видела цену через REST-фолбэк,
+    # а здесь получала ликвидность 0 и молча пропускала вход. Так 28.09
+    # (16:19-20:19) 15m-бот выдал 18 сигналов по 3 рынкам и не открыл ни
+    # одной сделки — у всех сигналов book_source был "rest". Теперь берём
+    # стакан так же, как стратегия: WS, если свежий, иначе REST.
+    book = await polymarket_client.get_orderbook_cached(token_id, depth_levels=10)
+    available_liquidity = book.ask_liquidity_usdc
     if available_liquidity < settings.MIN_VIABLE_TRADE_USDC:
-        return  # почти пустой стакан — не о чем говорить, тихо пропускаем тик
+        if market.slug not in _liquidity_skip_notified:
+            _liquidity_skip_notified.add(market.slug)
+            await telegram_notify.notify(
+                f"⚠️ Сигнал по {market.slug} пропущен: в стакане всего "
+                f"{available_liquidity:.2f} USDC (источник: {book.source})."
+            )
+        return
     if available_liquidity < trade_size:
         trade_size = round(available_liquidity * 0.9, 2)
 
@@ -81,7 +97,7 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
     # небольшой запас на слиппедж, но не платим больше жёсткого потолка, и
     # обязательно выравниваем по тику — иначе CLOB отклонит ордер с неверным
     # шагом цены прямо в критичный момент.
-    tick = book_stream.tick_size(token_id)
+    tick = book.tick_size or book_stream.tick_size(token_id)
     # Потолок исполнения НЕ может быть выше максимума из «📈 Диапазон
     # входа». Раньше запас на слиппедж (+0.01) добавлялся поверх: сигнал
     # по 0.95 при максимуме 0.95 уходил с потолком 0.96 и реально
