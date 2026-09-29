@@ -39,6 +39,12 @@ _books: dict[str, dict] = {}
 _subscribed: set[str] = set()
 _send_queue: asyncio.Queue = asyncio.Queue()
 _ws_ready = asyncio.Event()
+# Когда токен добавлен в подписку — чтобы сторож мог понять, что данные по
+# нему так и не пришли (см. _watchdog).
+_subscribed_at: dict[str, int] = {}
+_last_forced_reconnect_ms = 0
+WATCHDOG_NO_DATA_MS = 8000        # подписаны столько, а стакана так и нет — переподключаемся
+WATCHDOG_MIN_INTERVAL_MS = 30000  # не чаще раза в 30 с
 
 
 def now_ms() -> int:
@@ -95,8 +101,15 @@ def subscribe(asset_ids: list[str]) -> None:
     if not new_ids:
         return
     _subscribed.update(new_ids)
+    ts = now_ms()
+    for a in new_ids:
+        _subscribed_at[a] = ts
+    # На УЖЕ открытом соединении Polymarket ждёт {"operation": "subscribe"}.
+    # Повторное стартовое сообщение {"type": "market", ...} сервер на живом
+    # сокете игнорирует — из-за этого после первого окна новые токены вообще
+    # не получали стакан, и 28-29.09 бот 100% времени сидел на REST.
     try:
-        _send_queue.put_nowait({"type": "market", "assets_ids": list(_subscribed), "custom_feature_enabled": True})
+        _send_queue.put_nowait({"operation": "subscribe", "assets_ids": new_ids, "custom_feature_enabled": True})
     except asyncio.QueueFull:
         pass
 
@@ -114,9 +127,10 @@ def unsubscribe(asset_ids: list[str]) -> None:
         return
     for a in removed:
         _subscribed.discard(a)
+        _subscribed_at.pop(a, None)
         _books.pop(a, None)
     try:
-        _send_queue.put_nowait({"type": "market", "assets_ids": list(_subscribed), "custom_feature_enabled": True})
+        _send_queue.put_nowait({"operation": "unsubscribe", "assets_ids": removed})
     except asyncio.QueueFull:
         pass
 
@@ -186,6 +200,23 @@ async def _sender(ws) -> None:
         await ws.send(json.dumps(payload))
 
 
+async def _watchdog(ws) -> None:
+    """Страховка на случай, если сервер всё равно не прислал стакан по новому
+    токену: переподключаемся — при коннекте уходит стартовое сообщение с
+    ПОЛНЫМ списком подписки, и снапшоты приходят заново."""
+    global _last_forced_reconnect_ms
+    while True:
+        await asyncio.sleep(3)
+        ts = now_ms()
+        missing = [a for a in _subscribed
+                   if a not in _books and ts - _subscribed_at.get(a, ts) > WATCHDOG_NO_DATA_MS]
+        if missing and ts - _last_forced_reconnect_ms > WATCHDOG_MIN_INTERVAL_MS:
+            _last_forced_reconnect_ms = ts
+            log.warning("Нет стакана по %d токенам после подписки — переподключаю WS", len(missing))
+            await ws.close()
+            return
+
+
 def _handle_message(msg: dict) -> None:
     """Обработка ОДНОГО объекта сообщения. Вызывается и напрямую (обычный
     dict), и поэлементно, если сервер прислал JSON-массив (см. ниже)."""
@@ -219,7 +250,12 @@ async def run_forever() -> None:
                     await ws.send(json.dumps({
                         "type": "market", "assets_ids": list(_subscribed), "custom_feature_enabled": True,
                     }))
+                # Сбрасываем таймеры: после реконнекта снапшоты придут заново.
+                ts0 = now_ms()
+                for a in list(_subscribed):
+                    _subscribed_at[a] = ts0
                 sender_task = asyncio.create_task(_sender(ws))
+                watchdog_task = asyncio.create_task(_watchdog(ws))
                 try:
                     async for raw in ws:
                         if not raw or raw == "PONG":
@@ -244,6 +280,7 @@ async def run_forever() -> None:
                                 _handle_message(msg)
                 finally:
                     sender_task.cancel()
+                    watchdog_task.cancel()
         except Exception as exc:  # noqa: BLE001
             log.warning("Book stream disconnected (%s), reconnecting in %ss", exc, RECONNECT_BACKOFF_SEC)
             _ws_ready.clear()
