@@ -143,6 +143,9 @@ async def _instance_tick(asset: str, timeframe: TimeframeProfile) -> None:
         log.warning("Ошибка hedge_bot для %s: %s", market.slug, exc)
 
 
+ERROR_RETRY_SECONDS = 30
+
+
 async def _instance_loop(asset: str, timeframe: TimeframeProfile) -> None:
     key = f"{asset}:{timeframe.label}"
     consecutive_failures = 0
@@ -150,24 +153,27 @@ async def _instance_loop(asset: str, timeframe: TimeframeProfile) -> None:
     while True:
         try:
             await _instance_tick(asset, timeframe)
+            if notified_dead:
+                await telegram_notify.notify(
+                    f"✅ Поток {key} снова работает после {consecutive_failures} ошибок подряд."
+                )
             consecutive_failures = 0
             notified_dead = False
         except Exception as exc:  # noqa: BLE001 — один сломанный поток не должен ронять остальные
             consecutive_failures += 1
-            log.exception("Ошибка в потоке %s (%d подряд): %s", key, consecutive_failures, exc)
+            err = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+            log.exception("Ошибка в потоке %s (%d подряд): %s", key, consecutive_failures, err)
             if consecutive_failures == 10 and not notified_dead:
-                # После 10 неудач подряд это, скорее всего, не временный сбой сети, а
-                # актив/таймфрейм, для которого рынка просто не существует (например,
-                # у XRP на момент написания нет часового Up/Down рынка) — не спамим
-                # логи и Telegram вечно, а один раз сообщаем и переходим на редкий опрос.
                 notified_dead = True
                 await telegram_notify.notify(
-                    f"⚠️ Поток {key} не может найти рынок уже {consecutive_failures} попыток подряд "
-                    f"({exc}). Похоже, этого рынка не существует для данного актива/таймфрейма. "
-                    f"Перехожу на редкий опрос (раз в 10 минут), остальные потоки не затронуты."
+                    f"⚠️ Поток {key}: {consecutive_failures} ошибок подряд ({err}). "
+                    f"Продолжаю пробовать раз в {ERROR_RETRY_SECONDS} с, сообщу, когда восстановится."
                 )
 
-        sleep_for = timeframe.poll_interval_seconds if consecutive_failures < 10 else 600
+        # Раньше после 10 ошибок подряд поток переходил на опрос раз в 10 минут
+        # — для BTC 5m это значит пропустить 2 рынка из каждых 2-х (ошибка
+        # обычно временная: таймаут Binance/Gamma). Теперь максимум 30 с.
+        sleep_for = timeframe.poll_interval_seconds if consecutive_failures < 10 else ERROR_RETRY_SECONDS
         await asyncio.sleep(sleep_for)
 
 
