@@ -21,9 +21,16 @@ import os
 import time
 
 from config import settings
-from src import storage, telegram_notify
+from src import storage, telegram_notify, loss_stats
 
 _LAST_REPORT_KEY = "last_report_ts"
+
+# Сделка, открытая в последние минуты окна, резолвится уже после отчёта — и
+# раньше её исход не попадал ни в один CSV (так «пропал» проигрыш 03.10 04:42).
+# Поэтому в trades.csv добавляем сделки последних 15 минут прошлого окна —
+# уже с исходом. Повторы между отчётами отличаются по id; подпись к отчёту
+# считает только сделки своего окна.
+TRADES_OVERLAP_SEC = 15 * 60
 
 
 def _write_csv(path: str, columns: list[str], rows: list[tuple]) -> None:
@@ -68,26 +75,44 @@ async def build_and_send_report() -> None:
     trades_path = f"{base}_trades.csv"
 
     _write_csv(signals_path, storage.SIGNALS_COLUMNS, signals)
-    _write_csv(trades_path, storage.TRADES_COLUMNS, trades)
+    trades_for_csv = storage.get_trades_since(max(0, since_ts - TRADES_OVERLAP_SEC))
+    _write_csv(trades_path, storage.TRADES_COLUMNS, trades_for_csv)
 
     entered = sum(1 for row in signals if row[storage.SIGNALS_COLUMNS.index("should_enter")])
     labeled = sum(1 for row in signals if row[storage.SIGNALS_COLUMNS.index("outcome")])
     closed_trades = [row for row in trades if row[storage.TRADES_COLUMNS.index("outcome")]]
-    wins = sum(1 for row in closed_trades if row[storage.TRADES_COLUMNS.index("pnl_usdc")] and
-               row[storage.TRADES_COLUMNS.index("pnl_usdc")] > 0)
-    pnl_sum = sum(row[storage.TRADES_COLUMNS.index("pnl_usdc")] or 0 for row in closed_trades)
+    i_pnl, i_dry = storage.TRADES_COLUMNS.index("pnl_usdc"), storage.TRADES_COLUMNS.index("dry_run")
+    # Реальные и виртуальные (DRY) сделки считаем раздельно — их PnL нельзя складывать
+    closed_live = [r for r in closed_trades if not r[i_dry]]
+    closed_dry = [r for r in closed_trades if r[i_dry]]
+    wins = sum(1 for r in closed_live if (r[i_pnl] or 0) > 0)
+    pnl_sum = sum(r[i_pnl] or 0 for r in closed_live)
+    dry_line = ""
+    if closed_dry:
+        dry_wins = sum(1 for r in closed_dry if (r[i_pnl] or 0) > 0)
+        dry_pnl = sum(r[i_pnl] or 0 for r in closed_dry)
+        dry_line = (f"\nDRY-сделок закрыто: {len(closed_dry)} | побед: {dry_wins} | "
+                    f"PnL: {dry_pnl:+.2f} (виртуально)")
 
-    by_asset = storage.get_pnl_by_asset(since_ts)
+    # По монетам — реальные (🔴) и виртуальные DRY-сделки (🧪) раздельно
+    by_asset = storage.get_pnl_by_asset_mode(since_ts)
     asset_lines = "\n".join(
-        f"  {a.upper()}: {b['trades']} сделок, PnL {b['pnl_usdc']:+.2f}"
-        for a, b in sorted(by_asset.items())
+        f"  {a.upper()} {'🧪 DRY' if dry else '🔴 LIVE'}: {loss_stats.plural_trades(b['trades'])}, PnL {b['pnl_usdc']:+.2f}"
+        + (" (виртуально)" if dry else "")
+        for (a, dry), b in sorted(by_asset.items(), key=lambda kv: (kv[0][1], kv[0][0]))
     ) or "  (сделок за период не было)"
+
+    try:
+        honest = "\n\n" + loss_stats.short_line("Всего LIVE", storage.get_outcome_stats(live=True))
+    except Exception:  # noqa: BLE001 — строка-сводка не должна ломать отчёт
+        honest = ""
 
     caption = (
         f"📄 Отчёт {from_label} → {to_label} (UTC)\n"
         f"Тиков сигналов: {len(signals)} (с известным исходом: {labeled}) | вошли: {entered}\n"
-        f"Сделок закрыто: {len(closed_trades)} | побед: {wins} | PnL: {pnl_sum:+.2f} USDC\n\n"
+        f"Реальных сделок закрыто: {len(closed_live)} | побед: {wins} | PnL: {pnl_sum:+.2f} USDC{dry_line}\n\n"
         f"По токенам за период:\n{asset_lines}"
+        f"{honest}"
     )
 
     await telegram_notify.send_document(signals_path, caption)

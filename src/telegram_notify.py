@@ -15,7 +15,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKe
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
 from config import settings
-from src import storage, runtime_state
+from src import storage, runtime_state, loss_stats
 
 _app: Application | None = None
 _state_ref: dict = {}  # заполняется из main.py: последний сигнал/статус для меню
@@ -68,6 +68,18 @@ def _settings_text() -> str:
     )
 
 
+_MODE_ICON = {"live": "🔴", "dry": "🧪", "off": "⏸"}
+
+
+def _assets_modes_line() -> str:
+    """'BTC 🔴, ETH 🧪, SOL 🧪' — включённые монеты с режимом: 🔴 реальные
+    сделки, 🧪 виртуальные (DRY)."""
+    return ", ".join(
+        f"{a.upper()} {_MODE_ICON[runtime_state.asset_mode(a)]}"
+        for a in settings.ASSETS if runtime_state.is_asset_enabled(a)
+    )
+
+
 def _main_menu_text() -> str:
     s = _state_ref  # dict: "asset:timeframe" -> instance state
     paused = runtime_state.get("paused")
@@ -78,7 +90,7 @@ def _main_menu_text() -> str:
         "🤖 *Polymarket Multi-Asset Bot*",
         "",
         f"Статус: {'⏸ на паузе' if paused else '▶️ активен'} | Режим: {'🧪 DRY RUN' if dry_run else '🔴 LIVE'}",
-        f"Активы: {', '.join(a.upper() for a in sorted(enabled_assets)) or '(нет включённых)'}",
+        f"Активы: {_assets_modes_line() or '(нет включённых)'}",
         f"Размер позиции: {_size_summary()}",
         f"Стоп-лосс/день: {runtime_state.get('daily_loss_limit_usdc'):.0f} USDC",
         f"Стоп-лосс позиции: {'вкл ' + str(round(runtime_state.get('position_stop_loss_pct'))) + '%' if pos_sl_on else 'выкл'}",
@@ -127,19 +139,37 @@ def _main_menu_markup() -> InlineKeyboardMarkup:
 
 
 def _assets_menu_markup() -> InlineKeyboardMarkup:
+    """Строка на монету: [✅/⏸ МОНЕТА] — включить/выключить поток,
+    [🔴 LIVE / 🧪 DRY] — реальные или виртуальные сделки по этой монете."""
     enabled = runtime_state.get_enabled_assets()
     rows = []
-    row = []
     for asset in settings.ASSETS:
-        mark = "✅ " if asset in enabled else "🔴 "
-        row.append(InlineKeyboardButton(f"{mark}{asset.upper()}", callback_data=f"asset_toggle:{asset}"))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
+        on = asset in enabled
+        live = runtime_state.is_asset_live(asset)
+        rows.append([
+            InlineKeyboardButton(f"{'✅' if on else '⏸'} {asset.upper()}", callback_data=f"asset_toggle:{asset}"),
+            InlineKeyboardButton("🔴 LIVE" if live else "🧪 DRY", callback_data=f"asset_mode:{asset}"),
+        ])
+    notify_on = runtime_state.get("notify_dry_assets")
+    rows.append([InlineKeyboardButton(
+        "🔔 Уведомления DRY-монет: вкл" if notify_on else "🔕 Уведомления DRY-монет: выкл",
+        callback_data="dry_notify_toggle",
+    )])
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="menu:main")])
     return InlineKeyboardMarkup(rows)
+
+
+def _assets_menu_text() -> str:
+    enabled = runtime_state.get_enabled_assets()
+    general = "🧪 DRY RUN — все сделки виртуальные" if runtime_state.get("dry_run") else "🔴 LIVE"
+    return (
+        f"🪙 Монеты: включено {len(enabled)} из {len(settings.ASSETS)}. Общий режим бота: {general}.\n\n"
+        "Левая кнопка — включить/выключить монету. Правая — режим монеты:\n"
+        "🔴 LIVE — реальные сделки (когда сам бот в LIVE),\n"
+        "🧪 DRY — виртуальные сделки: стратегия проверяется на этой монете без денег.\n\n"
+        "Новые монеты всегда начинают с DRY. Каждый тик по каждой включённой монете "
+        "попадает в 4-часовой отчёт — по нему видно, на какой монете стратегия работает."
+    )
 
 
 BANKROLL_PCT_PRESETS = [3, 5, 7, 10]
@@ -393,23 +423,70 @@ def _confirm_live_markup() -> InlineKeyboardMarkup:
 
 # ------------------------------------------------------------- команды ----
 
+def _owner_chat_id() -> int | None:
+    try:
+        return int(str(settings.TELEGRAM_CHAT_ID).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_owner(update: Update) -> bool:
+    """Управлять ботом может только чат из TELEGRAM_CHAT_ID (тот же, куда
+    приходят уведомления). Раньше проверки не было: любой, кто найдёт имя
+    бота, мог открыть /menu и нажать кнопки — вплоть до LIVE и размера
+    ставки. Если TELEGRAM_CHAT_ID не задан, ограничение не включаем, чтобы
+    не запереть владельца."""
+    owner = _owner_chat_id()
+    if owner is None:
+        return True
+    chat = getattr(update, "effective_chat", None)
+    return chat is not None and getattr(chat, "id", None) == owner
+
+
+async def _cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/export — ВСЕ сделки из базы одним CSV (в 4-часовых отчётах только
+    сделки своего окна, и по ним легко недосчитаться проигрышей)."""
+    if not _is_owner(update):
+        return
+    import csv
+    import os
+    rows = storage.get_trades_since(0)
+    os.makedirs(settings.REPORTS_DIR, exist_ok=True)
+    path = os.path.join(settings.REPORTS_DIR, time.strftime("all_trades_%Y%m%d-%H%M.csv", time.gmtime()))
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(storage.TRADES_COLUMNS)
+        w.writerows(rows)
+    live = storage.get_outcome_stats(live=True)
+    caption = f"📥 Все сделки: {len(rows)}\n" + loss_stats.short_line("LIVE", live)
+    await send_document(path, caption)
+
+
 async def _cmd_start_or_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_owner(update):
+        return
     await update.message.reply_text(
         _main_menu_text(), reply_markup=_main_menu_markup(), parse_mode="Markdown",
     )
 
 
 async def _cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_owner(update):
+        return
     await update.message.reply_text(
         _main_menu_text(), reply_markup=_main_menu_markup(), parse_mode="Markdown",
     )
 
 
 async def _cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_owner(update):
+        return
     await update.message.reply_text(_stats_text(), parse_mode="Markdown")
 
 
 async def _cmd_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_owner(update):
+        return
     s = _state_ref
     if not s:
         await update.message.reply_text("Пока нет данных ни по одному потоку — подожди первого тика бота.")
@@ -431,31 +508,50 @@ async def _cmd_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _stats_text() -> str:
     today_start = int(time.time() // 86400) * 86400
 
-    today = storage.get_pnl_summary(today_start)
-    total = storage.get_pnl_summary(0)
+    t_live = storage.get_pnl_summary(today_start, live_only=True)
+    a_live = storage.get_pnl_summary(0, live_only=True)
+    t_dry = storage.get_pnl_summary(today_start, dry_only=True)
+    a_dry = storage.get_pnl_summary(0, dry_only=True)
 
     lines = [
         "📊 *Статистика*",
         "",
-        f"Сегодня: {today['trades']} сделок, PnL {today['pnl_usdc']:+.2f} USDC, побед {today['wins']}",
-        f"Всего: {total['trades']} сделок, PnL {total['pnl_usdc']:+.2f} USDC, побед {total['wins']}",
+        f"LIVE сегодня: {loss_stats.plural_trades(t_live['trades'])}, PnL {t_live['pnl_usdc']:+.2f} USDC, побед {t_live['wins']}",
+        f"LIVE всего: {loss_stats.plural_trades(a_live['trades'])}, PnL {a_live['pnl_usdc']:+.2f} USDC, побед {a_live['wins']}",
     ]
+    if a_dry["trades"]:
+        # Виртуальный PnL — отдельно, чтобы не путать с реальными деньгами
+        lines.append(f"DRY сегодня: {loss_stats.plural_trades(t_dry['trades'])}, PnL {t_dry['pnl_usdc']:+.2f} (виртуально), побед {t_dry['wins']}")
+        lines.append(f"DRY всего: {loss_stats.plural_trades(a_dry['trades'])}, PnL {a_dry['pnl_usdc']:+.2f} (виртуально), побед {a_dry['wins']}")
 
-    by_asset_total = storage.get_pnl_by_asset(0)
-    if by_asset_total:
+    # Нормальные ли проигрыши: факт против того, что заложено в цены входа
+    # (см. src/loss_stats.py). Отдельно LIVE и DRY RUN — их нельзя смешивать.
+    try:
+        live_st = storage.get_outcome_stats(live=True)
+        dry_st = storage.get_outcome_stats(live=False)
         lines.append("")
-        lines.append("*По токенам (всего):*")
-        for asset in sorted(by_asset_total.keys()):
-            b = by_asset_total[asset]
-            lines.append(f"  {asset.upper()}: {b['trades']} сделок, PnL {b['pnl_usdc']:+.2f}, побед {b['wins']}")
+        lines.append("*Проигрыши: факт против цены входа*")
+        lines.extend(loss_stats.summary_lines("LIVE", live_st))
+        if dry_st["trades"]:
+            lines.extend(loss_stats.summary_lines("DRY RUN", dry_st))
+        lines.append("Все сделки одним файлом: /export")
+    except Exception:  # noqa: BLE001 — статистика не должна ломать меню
+        pass
 
-    by_tf_total = storage.get_pnl_by_timeframe(0)
-    if by_tf_total:
-        lines.append("")
-        lines.append("*По таймфреймам (всего):*")
-        for label in sorted(by_tf_total.keys()):
-            b = by_tf_total[label]
-            lines.append(f"  {label}: {b['trades']} сделок, PnL {b['pnl_usdc']:+.2f}, побед {b['wins']}")
+    # По каждой монете отдельно для LIVE и DRY: так видно, на какой монете
+    # стратегия даёт меньше проигрышей, чем заложено в цены, а на какой нет.
+    try:
+        by = storage.get_pnl_by_asset_mode(0)
+        if by:
+            lines.append("")
+            lines.append("*По монетам:*")
+            for asset, dry in sorted(by.keys(), key=lambda k: (k[1], k[0])):
+                st = storage.get_outcome_stats(live=not dry, asset=asset)
+                label = f"{asset.upper()} {'DRY' if dry else 'LIVE'}"
+                if st["trades"]:
+                    lines.append(f"  {loss_stats.short_line(label, st)}, PnL {st['pnl_usdc']:+.2f}")
+    except Exception:  # noqa: BLE001
+        pass
 
     return "\n".join(lines)
 
@@ -464,7 +560,7 @@ async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ловит обычный текст, когда мы ждём число после '✏️ Свой размер'/'✏️ Свой лимит'.
     Вне этого режима ничего не делает — не мешает обычной переписке."""
     global _pending_input
-    if _pending_input is None:
+    if _pending_input is None or not _is_owner(update):
         return
 
     raw = (update.message.text or "").strip().replace(",", ".")
@@ -536,6 +632,9 @@ async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global _pending_input
     query = update.callback_query
+    if not _is_owner(update):
+        await query.answer()
+        return
     data = query.data
     await query.answer()
 
@@ -668,18 +767,63 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "menu:assets":
-        enabled = runtime_state.get_enabled_assets()
-        await query.edit_message_text(
-            f"🪙 Активные монеты: {len(enabled)} из {len(settings.ASSETS)}.\n"
-            "Тапни, чтобы включить/выключить конкретную монету — остальные не затронет.",
-            reply_markup=_assets_menu_markup(),
-        )
+        await query.edit_message_text(_assets_menu_text(), reply_markup=_assets_menu_markup())
 
     elif data.startswith("asset_toggle:"):
         asset = data.split(":", 1)[1]
+        if asset not in settings.ASSETS:
+            return
         now_enabled = runtime_state.toggle_asset(asset)
+        mode = "реальные сделки" if not runtime_state.trade_is_dry(asset) else "виртуальные сделки (DRY)"
         await query.edit_message_text(
-            f"{'✅' if now_enabled else '🔴'} {asset.upper()} теперь {'включён' if now_enabled else 'выключен'}.",
+            f"{'✅' if now_enabled else '⏸'} {asset.upper()} теперь "
+            f"{'включён — ' + mode if now_enabled else 'выключен'}.\n\n" + _assets_menu_text(),
+            reply_markup=_assets_menu_markup(),
+        )
+
+    elif data.startswith("asset_mode:"):
+        asset = data.split(":", 1)[1]
+        if asset not in settings.ASSETS:
+            return
+        if runtime_state.is_asset_live(asset):
+            # LIVE -> DRY — безопасное направление, без подтверждения
+            runtime_state.set_asset_live(asset, False)
+            await query.edit_message_text(
+                f"🧪 {asset.upper()} переведён в DRY: дальше по нему только виртуальные сделки.\n\n"
+                + _assets_menu_text(),
+                reply_markup=_assets_menu_markup(),
+            )
+        else:
+            await query.edit_message_text(
+                f"⚠️ Включить реальные сделки по {asset.upper()}?\n"
+                "Когда бот в LIVE, по этой монете пойдут настоящие ордера. Сначала стоит "
+                "убедиться в 📊 Статистике, что в DRY по ней проигрышей заметно меньше, "
+                "чем заложено в цены.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"✅ Да, LIVE для {asset.upper()}", callback_data=f"asset_live_confirm:{asset}")],
+                    [InlineKeyboardButton("❌ Оставить DRY", callback_data="menu:assets")],
+                ]),
+            )
+
+    elif data.startswith("asset_live_confirm:"):
+        asset = data.split(":", 1)[1]
+        if asset not in settings.ASSETS:
+            return
+        runtime_state.set_asset_live(asset, True)
+        note = ("" if not runtime_state.get("dry_run")
+                else "\nСам бот сейчас в DRY RUN — реальные сделки пойдут, когда включишь LIVE в главном меню.")
+        await query.edit_message_text(
+            f"🔴 {asset.upper()} помечен для реальных сделок.{note}\n\n" + _assets_menu_text(),
+            reply_markup=_assets_menu_markup(),
+        )
+
+    elif data == "dry_notify_toggle":
+        new_val = not runtime_state.get("notify_dry_assets")
+        runtime_state.set("notify_dry_assets", new_val)
+        await query.edit_message_text(
+            ("🔔 Уведомления о виртуальных сделках DRY-монет включены.\n\n" if new_val
+             else "🔕 Уведомления о виртуальных сделках DRY-монет выключены — они видны в 📊 Статистике и отчётах.\n\n")
+            + _assets_menu_text(),
             reply_markup=_assets_menu_markup(),
         )
 
@@ -697,7 +841,13 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"порог {runtime_state.get('position_stop_loss_pct'):.0f}%.\n\n"
             "Если стоимость открытой позиции (по текущей цене в стакане) падает на этот "
             "процент от суммы входа ещё ДО резолюции рынка — бот продаёт её досрочно, "
-            "не дожидаясь исхода. Это отдельно от дневного лимита в USDC.",
+            "не дожидаясь исхода. Это отдельно от дневного лимита в USDC.\n\n"
+            "Что показала история (18.09–06.10, ~2700 рынков BTC 5m и все 213 реальных сделок): "
+            "прибыль стоп не увеличивает. Проигрышная позиция падает с 0.9 до 0.4 за секунды, "
+            "поэтому продаёт он обычно уже около −50…−80%, а примерно 4 из 10 позиций, просевших "
+            "на 50%, потом всё равно выигрывают — их стоп продаёт в минус. На реальных сделках "
+            "25.09–06.10 стоп 50% дал бы +$66 вместо +$114. Уменьшить боль от проигрышей "
+            "честнее размером ставки (💰 Размер позиции).",
             reply_markup=_position_sl_menu_markup(),
         )
 
@@ -914,6 +1064,7 @@ def build_app() -> Application:
     _app.add_handler(CommandHandler("status", _cmd_status))
     _app.add_handler(CommandHandler("pnl", _cmd_pnl))
     _app.add_handler(CommandHandler("token", _cmd_token))
+    _app.add_handler(CommandHandler("export", _cmd_export))
     _app.add_handler(CallbackQueryHandler(_on_callback))
     _app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text))
     return _app

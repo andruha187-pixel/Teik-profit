@@ -8,16 +8,34 @@ from __future__ import annotations
 import time
 
 from config import settings
-from src import storage, polymarket_client, telegram_notify, book_stream, runtime_state
+from src import storage, polymarket_client, telegram_notify, book_stream, runtime_state, loss_stats
 from src.market_discovery import ActiveMarket, get_resolution
 from src.strategy import Decision
 
 
 def _daily_loss_exceeded() -> bool:
+    """Дневной стоп-лосс считается только по РЕАЛЬНЫМ сделкам и блокирует
+    только реальные входы: виртуальный минус DRY-монеты не должен
+    останавливать торговлю BTC, а сбор данных по DRY-монетам не должен
+    обрываться из-за реальных убытков."""
     today_start = int(time.time() // 86400) * 86400
-    summary = storage.get_pnl_summary(today_start)
+    summary = storage.get_pnl_summary(today_start, live_only=True)
     limit = runtime_state.get("daily_loss_limit_usdc")
     return summary["pnl_usdc"] <= -abs(limit)
+
+
+def _quiet(asset: str, dry_run: bool) -> bool:
+    """Не слать в Telegram виртуальные сделки монет, переведённых в DRY
+    (иначе 5–6 монет засыплют чат). Монеты, помеченные как LIVE, уведомляют
+    как раньше, даже если весь бот сейчас в DRY RUN. Включается кнопкой
+    «🔔 Уведомления DRY-монет» в 🪙 Активах."""
+    return (bool(dry_run) and not runtime_state.is_asset_live(asset)
+            and not runtime_state.get("notify_dry_assets"))
+
+
+async def _notify(asset: str, dry_run: bool, text: str) -> None:
+    if not _quiet(asset, dry_run):
+        await telegram_notify.notify(text)
 
 
 def _scale_trade_size(base_size: float, score: float, threshold: float) -> float:
@@ -38,25 +56,40 @@ def _scale_trade_size(base_size: float, score: float, threshold: float) -> float
 
 
 _liquidity_skip_notified: set[str] = set()
+# id сделок, по которым уже сообщили о неудачной продаже по стоп-лоссу
+_sl_fail_notified: set[int] = set()
+# день (unix_ts // 86400), за который уже сообщили о дневном стоп-лоссе
+_daily_limit_notified_day: int | None = None
 
 
 async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
+    global _daily_limit_notified_day
     if not decision.should_enter:
         return
     if runtime_state.get("paused"):
         return
     if storage.get_open_trade_for_market(market.slug):
         return  # уже есть позиция в этом рынке
-    if _daily_loss_exceeded():
-        await telegram_notify.notify(
-            f"🛑 Стоп-лосс достигнут (лимит {runtime_state.get('daily_loss_limit_usdc'):.0f} USDC/день) — "
-            f"вход заблокирован до конца дня. Поменять лимит можно в 🛑 Стоп-лосс в меню."
-        )
-        return
-    if storage.count_open_trades() >= settings.MAX_OPEN_POSITIONS:
-        # Общий потолок по ВСЕМ активам/таймфреймам разом — при нескольких
-        # параллельных потоках несколько сигналов могут совпасть по времени.
-        return
+    # Реальная или виртуальная сделка — по общему режиму и режиму монеты
+    # (🪙 Активы): DRY-монеты торгуют виртуально, даже когда бот в LIVE.
+    dry_run = runtime_state.trade_is_dry(market.asset)
+    if not dry_run:
+        if _daily_loss_exceeded():
+            # Сообщаем один раз за день, а не на каждом тике с сигналом
+            day = int(time.time() // 86400)
+            if _daily_limit_notified_day != day:
+                _daily_limit_notified_day = day
+                await telegram_notify.notify(
+                    f"🛑 Стоп-лосс достигнут (лимит {runtime_state.get('daily_loss_limit_usdc'):.0f} USDC/день) — "
+                    f"реальные входы заблокированы до конца дня (DRY-монеты продолжают). "
+                    f"Поменять лимит можно в 🛑 Стоп-лосс в меню."
+                )
+            return
+        if storage.count_open_trades(live_only=True) >= settings.MAX_OPEN_POSITIONS:
+            # Общий потолок РЕАЛЬНЫХ позиций по всем активам разом — при
+            # нескольких потоках несколько сигналов могут совпасть по времени.
+            # Виртуальные сделки DRY-монет место не занимают.
+            return
 
     base_size = runtime_state.compute_trade_size()
     score_threshold = runtime_state.get("safety_score_threshold")
@@ -64,7 +97,6 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
         trade_size = _scale_trade_size(base_size, decision.safety_score, score_threshold)
     else:
         trade_size = base_size
-    dry_run = runtime_state.get("dry_run")
 
     token_id = market.up_token_id if decision.direction == "UP" else market.down_token_id
 
@@ -84,7 +116,7 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
     if available_liquidity < settings.MIN_VIABLE_TRADE_USDC:
         if market.slug not in _liquidity_skip_notified:
             _liquidity_skip_notified.add(market.slug)
-            await telegram_notify.notify(
+            await _notify(market.asset, dry_run,
                 f"⚠️ Сигнал по {market.slug} пропущен: в стакане всего "
                 f"{available_liquidity:.2f} USDC (источник: {book.source})."
             )
@@ -164,7 +196,7 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
         token_id=token_id,
     )
 
-    await telegram_notify.notify(
+    await _notify(market.asset, dry_run,
         f"{'🧪 [DRY RUN] ' if dry_run else '✅ '}Вход {decision.direction} по {market.slug}\n"
         f"Ask на сигнале: {decision.entry_price:.3f} | Потолок исполнения: {execution_price:.3f} "
         f"(тик {tick:g}) | Размер: {trade_size:.2f} из {base_size:.0f} USDC (score {decision.safety_score}/{score_threshold:.0f})\n"
@@ -185,13 +217,14 @@ async def execute_copytrade(token_id: str, direction: str, slug: str, condition_
     """
     if storage.get_open_trade_for_market(slug):
         return  # уже скопировали (или у нас своя позиция) в этом рынке
-    if _daily_loss_exceeded():
-        return  # дневной лимит уже сработал — не копируем, пока не настанет новый день
-    if storage.count_open_trades() >= settings.MAX_OPEN_POSITIONS:
-        return
+    dry_run = runtime_state.get("dry_run")
+    if not dry_run:
+        if _daily_loss_exceeded():
+            return  # дневной лимит уже сработал — не копируем, пока не настанет новый день
+        if storage.count_open_trades(live_only=True) >= settings.MAX_OPEN_POSITIONS:
+            return
 
     trade_size = runtime_state.get("copytrade_size_usdc")
-    dry_run = runtime_state.get("dry_run")
 
     # Токен мог быть не в нашем WS-кэше вообще (мы его раньше не отслеживали) —
     # подписываемся сразу и берём стакан через get_orderbook_cached, который
@@ -272,14 +305,26 @@ async def settle_resolved_trades() -> None:
         shares = size_usdc / entry_price
         won = outcome == direction
         pnl = (shares * 1.0 - size_usdc) if won else -size_usdc
-        storage.settle_trade(trade_id, outcome, pnl)
+        if not storage.settle_trade(trade_id, outcome, pnl):
+            continue  # уже закрыта стоп-лоссом, пока ждали ответ Gamma API
 
+        asset, _label = storage.parse_market_slug(market_slug)
         emoji = "🟢" if won else "🔴"
-        await telegram_notify.notify(
+        text = (
             f"{emoji} Рынок {market_slug} зарезолвился: {outcome}. "
             f"Наша ставка: {direction}. PnL: {pnl:+.2f} USDC"
             + (" (dry run)" if dry_run else "")
         )
+        if not won:
+            # Проигрыш по 0.95 — это «заложенные» ~5%, а не обязательно ошибка:
+            # показываем, сколько таких проигрышей ожидалось по ценам входа.
+            try:
+                st = storage.get_outcome_stats(live=not dry_run, asset=asset)
+                label = f"{asset.upper()}{' DRY' if dry_run else ''}"
+                text += "\n" + loss_stats.loss_context(st, entry_price, label)
+            except Exception:  # noqa: BLE001 — приписка не должна ломать резолюцию
+                pass
+        await _notify(asset, dry_run, text)
 
 
 async def check_position_stop_losses() -> None:
@@ -292,6 +337,14 @@ async def check_position_stop_losses() -> None:
 
     Оценка stops по best bid из живого стакана (book_stream) — тот же
     источник, что и для входа, без лишнего REST-запроса, если стакан свежий.
+
+    Вызывается из отдельного быстрого цикла main.stop_loss_loop (раз в ~2 с;
+    раньше — раз в 10 с из settlement_loop). Что показали отчёты 18.09–06.10
+    (~2700 рынков BTC 5m и все 213 реальных сделок): проигрышная позиция
+    падает с ~0.9 до ~0.4 за несколько секунд, поэтому стоп продаёт обычно уже
+    около −50…−80%, а примерно 4 из 10 позиций, просевших на 50%, потом всё
+    равно выигрывают. На реальных сделках стоп 50% дал бы +$66 вместо +$114 —
+    прибыль он не увеличивает. По умолчанию выключен.
     """
     if not runtime_state.get("position_stop_loss_enabled"):
         return
@@ -313,26 +366,42 @@ async def check_position_stop_losses() -> None:
             continue  # просадка ещё не достигла порога
 
         pnl_estimate = current_value - size_usdc
+        # Продаём 99% расчётного количества: entry_price — это потолок
+        # исполнения, а комиссия/округление могут оставить на кошельке чуть
+        # меньше акций, чем size/price — тогда FOK-продажа всего объёма
+        # отклонялась бы с "not enough balance". Остаток (~1%) дождётся
+        # резолюции как обычно.
+        sell_shares = shares * 0.99
 
         if dry_run:
-            storage.settle_trade(trade_id, "STOPPED", pnl_estimate)
-            await telegram_notify.notify(
+            if not storage.settle_trade(trade_id, "STOPPED", pnl_estimate):
+                continue  # рынок уже зарезолвился и сделка закрыта
+            await _notify(storage.parse_market_slug(market_slug)[0], dry_run,
                 f"🧪 [DRY RUN] 📉 Стоп-лосс позиции сработал бы: {market_slug} ({direction})\n"
                 f"Просадка {loss_pct:.1f}% (порог {stop_pct:.0f}%) | Оценка PnL: {pnl_estimate:+.2f} USDC"
             )
             continue
 
         if not settings.POLY_PRIVATE_KEY:
-            await telegram_notify.notify(
-                f"❌ Стоп-лосс сработал для {market_slug}, но POLY_PRIVATE_KEY не задан — "
-                "продать не могу. Проверь переменные окружения."
-            )
+            if trade_id not in _sl_fail_notified:
+                _sl_fail_notified.add(trade_id)
+                await telegram_notify.notify(
+                    f"❌ Стоп-лосс сработал для {market_slug}, но POLY_PRIVATE_KEY не задан — "
+                    "продать не могу. Проверь переменные окружения."
+                )
             continue
 
         try:
-            resp = await polymarket_client.place_sell_order(token_id, shares, min_price=book.best_bid * 0.98)
+            resp = await polymarket_client.place_sell_order(token_id, sell_shares, min_price=book.best_bid * 0.98)
         except Exception as exc:  # noqa: BLE001
-            await telegram_notify.notify(f"❌ Не удалось закрыть позицию по стоп-лоссу ({market_slug}): {exc}")
+            # Цикл крутится раз в ~2 с — сообщаем об ошибке один раз на сделку,
+            # а попытки продать продолжаются молча до резолюции рынка.
+            if trade_id not in _sl_fail_notified:
+                _sl_fail_notified.add(trade_id)
+                await telegram_notify.notify(
+                    f"❌ Не удалось закрыть позицию по стоп-лоссу ({market_slug}): {exc}\n"
+                    "Пробую дальше каждые ~2 с, пока рынок не закроется."
+                )
             continue
 
         status = polymarket_client.response_field(resp, "status") or "SOLD"

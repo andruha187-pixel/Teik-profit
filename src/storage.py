@@ -300,12 +300,17 @@ def log_trade(market_slug: str, condition_id: str, direction: str, entry_price: 
         return cur.lastrowid
 
 
-def settle_trade(trade_id: int, outcome: str, pnl_usdc: float) -> None:
+def settle_trade(trade_id: int, outcome: str, pnl_usdc: float) -> bool:
+    """Закрывает сделку, только если она ещё открыта. Резолюция и стоп-лосс
+    теперь живут в разных фоновых циклах (стоп — раз в ~2 с), поэтому
+    повторное закрытие уже закрытой сделки молча игнорируем и сообщаем об
+    этом через False — вызывающий код тогда не шлёт второе уведомление."""
     with _conn() as conn:
-        conn.execute(
-            "UPDATE trades SET outcome = ?, pnl_usdc = ? WHERE id = ?",
+        cur = conn.execute(
+            "UPDATE trades SET outcome = ?, pnl_usdc = ? WHERE id = ? AND outcome IS NULL",
             (outcome, pnl_usdc, trade_id),
         )
+        return cur.rowcount > 0
 
 
 def get_open_trade_for_market(market_slug: str):
@@ -317,11 +322,16 @@ def get_open_trade_for_market(market_slug: str):
         return cur.fetchone()
 
 
-def count_open_trades() -> int:
+def count_open_trades(live_only: bool = False) -> int:
     """Общее число сейчас открытых позиций по ВСЕМ активам/таймфреймам —
-    используется для общего лимита MAX_OPEN_POSITIONS (см. executor.py)."""
+    используется для общего лимита MAX_OPEN_POSITIONS (см. executor.py).
+    live_only=True — только реальные: виртуальные (DRY) сделки монет в
+    режиме DRY не должны занимать место реальных."""
     with _conn() as conn:
-        cur = conn.execute("SELECT COUNT(*) FROM trades WHERE outcome IS NULL")
+        q = "SELECT COUNT(*) FROM trades WHERE outcome IS NULL"
+        if live_only:
+            q += " AND dry_run = 0"
+        cur = conn.execute(q)
         return cur.fetchone()[0]
 
 
@@ -346,13 +356,14 @@ def get_unsettled_trades():
         return cur.fetchall()
 
 
-def get_pnl_summary(since_ts: int = 0, live_only: bool = False):
+def get_pnl_summary(since_ts: int = 0, live_only: bool = False, dry_only: bool = False):
     with _conn() as conn:
-        if live_only:
+        if live_only or dry_only:
             cur = conn.execute(
                 "SELECT COUNT(*), COALESCE(SUM(pnl_usdc), 0), "
                 "SUM(CASE WHEN pnl_usdc > 0 THEN 1 ELSE 0 END) "
-                "FROM trades WHERE outcome IS NOT NULL AND ts >= ? AND dry_run = 0", (since_ts,),
+                "FROM trades WHERE outcome IS NOT NULL AND ts >= ? AND dry_run = ?",
+                (since_ts, 0 if live_only else 1),
             )
         else:
             cur = conn.execute(
@@ -362,6 +373,58 @@ def get_pnl_summary(since_ts: int = 0, live_only: bool = False):
             )
         count, total_pnl, wins = cur.fetchone()
         return {"trades": count or 0, "pnl_usdc": total_pnl or 0.0, "wins": wins or 0}
+
+
+def get_outcome_stats(live: bool | None = None, since_ts: int = 0, asset: str | None = None) -> dict:
+    """Факт против ожидания по цене входа (см. src/loss_stats.py).
+
+    Только сделки, дошедшие до резолюции (outcome UP/DOWN); досрочно
+    закрытые по стоп-лоссу (STOPPED) не считаются. expected_losses =
+    сумма (1 − entry_price): столько проигрышей «заложено» в цены входа.
+    live=True — только реальные сделки, False — только DRY RUN, None — все.
+    """
+    q = ("SELECT entry_price, pnl_usdc, direction, outcome FROM trades "
+         "WHERE outcome IN ('UP', 'DOWN') AND ts >= ?")
+    params: list = [since_ts]
+    if live is not None:
+        q += " AND dry_run = ?"
+        params.append(0 if live else 1)
+    if asset:
+        q += " AND market_slug LIKE ?"
+        params.append(f"{asset.lower()}-updown-%")
+    with _conn() as conn:
+        rows = conn.execute(q, params).fetchall()
+    pnl_total = sum(pnl for _p, pnl, _d, _o in rows if pnl is not None)
+    win_pnls = [pnl for _p, pnl, d, o in rows if d == o and pnl is not None]
+    loss_pnls = [pnl for _p, pnl, d, o in rows if d != o and pnl is not None]
+    return {
+        "trades": len(rows),
+        "losses": sum(1 for _p, _pnl, d, o in rows if d != o),
+        "expected_losses": sum(1.0 - float(p) for p, *_ in rows if p is not None),
+        "avg_win": sum(win_pnls) / len(win_pnls) if win_pnls else 0.0,
+        "avg_loss": sum(loss_pnls) / len(loss_pnls) if loss_pnls else 0.0,
+        "pnl_usdc": pnl_total,
+    }
+
+
+def get_pnl_by_asset_mode(since_ts: int = 0) -> dict[tuple[str, bool], dict]:
+    """PnL по монетам отдельно для реальных и виртуальных сделок:
+    {(asset, dry_run): {"trades", "pnl_usdc", "wins"}} — чтобы в отчётах и
+    статистике виртуальная прибыль DRY-монет не смешивалась с реальной."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT market_slug, pnl_usdc, dry_run FROM trades WHERE outcome IS NOT NULL AND ts >= ?",
+            (since_ts,),
+        ).fetchall()
+    out: dict[tuple[str, bool], dict] = {}
+    for slug, pnl, dry in rows:
+        asset, _label = parse_market_slug(slug)
+        b = out.setdefault((asset, bool(dry)), {"trades": 0, "pnl_usdc": 0.0, "wins": 0})
+        b["trades"] += 1
+        b["pnl_usdc"] += pnl or 0.0
+        if (pnl or 0.0) > 0:
+            b["wins"] += 1
+    return out
 
 
 def get_pnl_by_asset(since_ts: int = 0) -> dict[str, dict]:

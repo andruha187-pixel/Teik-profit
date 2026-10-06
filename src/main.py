@@ -179,12 +179,11 @@ async def _instance_loop(asset: str, timeframe: TimeframeProfile) -> None:
 
 async def settlement_loop() -> None:
     """Общая (не привязанная к конкретному активу) фоновая задача: резолюция
-    сделок, стоп-лосс открытых позиций и разметка исходов сигналов по всем
-    потокам разом."""
+    сделок и разметка исходов сигналов по всем потокам разом. Стоп-лосс
+    позиций — в отдельном быстром цикле stop_loss_loop."""
     while True:
         try:
             await executor.settle_resolved_trades()
-            await executor.check_position_stop_losses()
             active = set(_active_slugs.values())
             await executor.label_resolved_markets(exclude_slugs=active)
             if settings.MOMENTUM_TRACKER_ENABLED:
@@ -194,6 +193,23 @@ async def settlement_loop() -> None:
         except Exception as exc:  # noqa: BLE001
             log.exception("Ошибка в settlement_loop: %s", exc)
         await asyncio.sleep(10)
+
+
+STOP_LOSS_CHECK_SECONDS = 2
+
+
+async def stop_loss_loop() -> None:
+    """Стоп-лосс позиции (если включён в Telegram) — проверка раз в ~2 с.
+    Раньше он жил в settlement_loop и проверялся раз в 10 с: по отчётам
+    25.09–05.10 проигрышная позиция падает с ~0.9 до ~0.4 за секунды, и на
+    тех же сделках проверка раз в 10 с продавала заметно хуже, чем раз в 2–3 с.
+    Выключенный стоп ничего не стоит: функция сразу выходит, без запросов."""
+    while True:
+        try:
+            await executor.check_position_stop_losses()
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Ошибка в stop_loss_loop: %s", exc)
+        await asyncio.sleep(STOP_LOSS_CHECK_SECONDS)
 
 
 async def main():
@@ -217,7 +233,7 @@ async def main():
 
         await telegram_notify.clear_legacy_keyboard()
         dry_run = runtime_state.get("dry_run")
-        assets_line = ", ".join(a.upper() for a in settings.ASSETS)
+        assets_line = telegram_notify._assets_modes_line() or "(нет включённых)"
         timeframes_line = ", ".join(tf.label for tf in TIMEFRAMES)
         forced_note = (
             "\n⚠️ Был сохранён LIVE-режим с прошлого раза, но POLY_PRIVATE_KEY сейчас не задан — "
@@ -226,7 +242,7 @@ async def main():
         )
         await telegram_notify.notify(
             f"🤖 Бот запущен. Режим: {'DRY RUN (без реальных сделок)' if dry_run else 'LIVE — реальные сделки!'}\n"
-            f"Активы: {assets_line}\nТаймфреймы: {timeframes_line}\n"
+            f"Активы: {assets_line} (🔴 реальные сделки, 🧪 DRY)\nТаймфреймы: {timeframes_line}\n"
             f"Открой /menu для управления (старт/стоп, размер позиции, стоп-лосс, настройки)."
             f"{forced_note}"
         )
@@ -237,6 +253,7 @@ async def main():
 
         report_task = asyncio.create_task(reporting.report_loop())
         settlement_task = asyncio.create_task(settlement_loop())
+        stop_loss_task = asyncio.create_task(stop_loss_loop())
         wallet_tracker_task = asyncio.create_task(wallet_tracker.wallet_tracker_loop())
 
         instance_tasks = [
@@ -252,6 +269,7 @@ async def main():
                 book_stream_task.cancel()
             report_task.cancel()
             settlement_task.cancel()
+            stop_loss_task.cancel()
             wallet_tracker_task.cancel()
             await app.updater.stop()
             await app.stop()

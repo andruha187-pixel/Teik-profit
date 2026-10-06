@@ -37,6 +37,16 @@ _DEFAULTS = {
     # по одному через Telegram, не трогая остальные и не передеплоя.
     # Хранится как строка через запятую (см. get/set_enabled_assets ниже).
     "enabled_assets": ",".join(settings.ASSETS),
+    # Режим по каждой монете. Реальные ордера идут только по монетам из этого
+    # списка (и только когда сам бот в LIVE); остальные включённые монеты
+    # торгуют в DRY RUN — виртуальные сделки, чтобы проверить стратегию на
+    # каждой монете отдельно, не рискуя деньгами. По умолчанию LIVE только
+    # BTC: любая новая монета начинает с DRY.
+    "live_assets": "btc",
+    # Уведомления о виртуальных сделках монет в режиме DRY. По умолчанию
+    # выключены, чтобы 5–6 монет не засыпали чат; всё видно в 📊 Статистике
+    # и в 4-часовых отчётах.
+    "notify_dry_assets": False,
     # Режим размера ставки: "fixed" (константа в USDC, trade_size_usdc) или
     # "percent" (доля от ТЕКУЩЕГО банка — starting_bankroll_usdc + вся
     # реализованная прибыль/убыток с начала). Percent-режим сам сжимается
@@ -79,6 +89,8 @@ _CASTERS = {
     "position_stop_loss_enabled": lambda v: str(v).lower() == "true",
     "position_stop_loss_pct": float,
     "enabled_assets": str,
+    "live_assets": str,
+    "notify_dry_assets": lambda v: str(v).lower() == "true",
     "sizing_mode": str,
     "bankroll_pct": float,
     "starting_bankroll_usdc": float,
@@ -179,6 +191,42 @@ def toggle_asset(asset: str) -> bool:
         enabled.add(asset)
     set_enabled_assets(enabled)
     return asset in enabled
+
+
+# --- Режим каждой монеты: LIVE или DRY ---
+
+def get_live_assets() -> set[str]:
+    raw = _state.get("live_assets", "") or ""
+    return {a for a in raw.split(",") if a}
+
+
+def is_asset_live(asset: str) -> bool:
+    """Монета помечена для реальной торговли (сама по себе — без учёта
+    общего режима бота)."""
+    return asset.lower() in get_live_assets()
+
+
+def set_asset_live(asset: str, live: bool) -> None:
+    assets = get_live_assets()
+    if live:
+        assets.add(asset.lower())
+    else:
+        assets.discard(asset.lower())
+    set("live_assets", ",".join(sorted(assets)))
+
+
+def trade_is_dry(asset: str) -> bool:
+    """Будет ли сделка по монете виртуальной: да, если весь бот в DRY RUN
+    или монета не помечена как LIVE."""
+    return bool(get("dry_run")) or not is_asset_live(asset)
+
+
+def asset_mode(asset: str) -> str:
+    """'off' — монета выключена, 'live' — реальные сделки прямо сейчас,
+    'dry' — виртуальные."""
+    if not is_asset_enabled(asset):
+        return "off"
+    return "dry" if trade_is_dry(asset) else "live"
 
 
 # --- Размер ставки: fixed или % от текущего банка ---

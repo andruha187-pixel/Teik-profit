@@ -26,6 +26,7 @@ SYMBOL_MAP = {
     "bnb": "BNBUSDT",
     "xrp": "XRPUSDT",
     "hype": "HYPEUSDT",
+    "doge": "DOGEUSDT",
 }
 
 
