@@ -32,7 +32,7 @@ class Settings:
     # Список торгуемых монет через запятую — на каждую заводится независимый
     # поток по каждому таймфрейму (см. src/timeframes.py).
     ASSETS: list = field(default_factory=lambda: [
-        a.strip().lower() for a in os.getenv("ASSETS", "btc,eth,sol,bnb,hype,xrp").split(",") if a.strip()
+        a.strip().lower() for a in os.getenv("ASSETS", "btc,eth,sol,xrp,bnb,doge,hype").split(",") if a.strip()
     ])
 
     # --- Binance (источник цены/индикаторов) ---
