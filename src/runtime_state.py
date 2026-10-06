@@ -9,9 +9,44 @@
 по себе, не только по твоей команде).
 """
 from __future__ import annotations
+import json
+import time
 
 from config import settings
 from src import storage
+
+# Ключи «своих» настроек монеты (см. asset_overrides ниже)
+RANGE_KEYS = ("min_entry_price", "max_entry_price")
+SIZING_KEYS = ("sizing_mode", "trade_size_usdc", "bankroll_pct")
+_OVERRIDE_FLOAT_KEYS = ("min_entry_price", "max_entry_price", "trade_size_usdc", "bankroll_pct")
+
+
+def _parse_overrides(raw) -> dict:
+    """JSON из базы -> {"sol": {"min_entry_price": 0.92, ...}, ...}. Битые или
+    неизвестные поля молча отбрасываем: настройки не должны ронять старт."""
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict = {}
+    for asset, ov in data.items():
+        if not isinstance(ov, dict):
+            continue
+        clean: dict = {}
+        for key in _OVERRIDE_FLOAT_KEYS:
+            if key in ov:
+                try:
+                    clean[key] = float(ov[key])
+                except (TypeError, ValueError):
+                    pass
+        if ov.get("sizing_mode") in ("fixed", "percent"):
+            clean["sizing_mode"] = ov["sizing_mode"]
+        if clean:
+            out[str(asset).lower()] = clean
+    return out
+
 
 _DEFAULTS = {
     "paused": False,
@@ -55,6 +90,13 @@ _DEFAULTS = {
     "sizing_mode": "fixed",
     "bankroll_pct": 5.0,
     "starting_bankroll_usdc": 60.0,
+    # Свои настройки отдельных монет поверх общих: диапазон входа и размер
+    # ставки (режим fixed/percent со своими значениями). Пример:
+    #   {"sol": {"min_entry_price": 0.92, "max_entry_price": 0.95},
+    #    "btc": {"sizing_mode": "percent", "bankroll_pct": 10.0, "trade_size_usdc": 20.0}}
+    # Чего у монеты нет — берётся общее значение и меняется вместе с ним.
+    # Банк для режима % один на все монеты (кошелёк один).
+    "asset_overrides": {},
     # Отслеживание чужого кошелька: уведомления всегда можно включить
     # отдельно от реального копирования сделок (copytrade) — по умолчанию
     # только уведомляем, ничего не покупаем автоматически.
@@ -94,6 +136,7 @@ _CASTERS = {
     "sizing_mode": str,
     "bankroll_pct": float,
     "starting_bankroll_usdc": float,
+    "asset_overrides": _parse_overrides,
     "wallet_notify_enabled": lambda v: str(v).lower() == "true",
     "wallet_copytrade_enabled": lambda v: str(v).lower() == "true",
     "copytrade_size_usdc": float,
@@ -159,7 +202,10 @@ def get(key: str):
 
 def set(key: str, value) -> None:
     _state[key] = value
-    storage.set_setting(key, value)
+    if key == "starting_bankroll_usdc":
+        _invalidate_bank_cache()
+    # Словари (asset_overrides) храним как JSON, а не как repr Python
+    storage.set_setting(key, json.dumps(value, sort_keys=True) if isinstance(value, dict) else value)
 
 
 def snapshot() -> dict:
@@ -231,7 +277,17 @@ def asset_mode(asset: str) -> str:
 
 # --- Размер ставки: fixed или % от текущего банка ---
 
-def current_bankroll() -> float:
+# (время, значение) последнего расчёта банка — для частых вызовов из
+# strategy (каждый тик каждой монеты), чтобы не ходить в базу каждый раз.
+_bank_cache: tuple[float, float] | None = None
+
+
+def _invalidate_bank_cache() -> None:
+    global _bank_cache
+    _bank_cache = None
+
+
+def current_bankroll(max_age: float = 0.0) -> float:
     """starting_bankroll_usdc + реализованная прибыль/убыток с начала.
     Считаем ТОЛЬКО реальные (не dry-run) сделки — иначе виртуальный PnL из
     периодов тестового прогона исказил бы размер реальных ставок (баг,
@@ -239,15 +295,168 @@ def current_bankroll() -> float:
     прошлого dry-run PnL). Если сейчас DRY_RUN, наоборот, честнее было бы
     видеть, как рос бы виртуальный банк — но раз sizing реальных денег и
     dry-run использует один и тот же расчёт, отдаём предпочтение
-    безопасности реальных ставок."""
+    безопасности реальных ставок.
+
+    Банк один на все монеты (кошелёк один), в том числе для монет со своим
+    процентом. max_age > 0 — можно взять значение, посчитанное не раньше
+    max_age секунд назад (для частых вызовов из strategy); сделки берут свежее."""
+    global _bank_cache
+    now = time.monotonic()
+    if max_age > 0 and _bank_cache is not None and now - _bank_cache[0] <= max_age:
+        return _bank_cache[1]
     pnl = storage.get_pnl_summary(0, live_only=True)["pnl_usdc"]
-    return get("starting_bankroll_usdc") + pnl
+    value = get("starting_bankroll_usdc") + pnl
+    _bank_cache = (now, value)
+    return value
 
 
-def compute_trade_size() -> float:
+def compute_trade_size(asset: str | None = None, max_bank_age: float = 0.0) -> float:
     """Базовый размер ставки ДО масштабирования по score (см.
-    executor._scale_trade_size) — либо константа, либо доля от банка."""
-    if get("sizing_mode") == "percent":
-        bankroll = max(0.0, current_bankroll())
-        return round(bankroll * get("bankroll_pct") / 100, 2)
-    return get("trade_size_usdc")
+    executor._scale_trade_size) — либо константа, либо доля от банка.
+    asset — монета: если у неё своя ставка (⚙️ в 🪙 Активах), берём её,
+    иначе общую."""
+    mode, trade_size_usdc, bankroll_pct = sizing(asset)
+    if mode == "percent":
+        bankroll = max(0.0, current_bankroll(max_age=max_bank_age))
+        return round(bankroll * bankroll_pct / 100, 2)
+    return trade_size_usdc
+
+
+# --- Свои настройки монеты: диапазон входа и ставка ---
+#
+# Монета без своих значений берёт общие (главное меню) и меняется вместе с
+# ними. Первое изменение в ⚙️ монеты копирует текущие общие значения и
+# дальше живёт отдельно; «↩️ как в общих» возвращает монету к общим.
+
+MIN_ENTRY_FLOOR = 0.50
+MIN_TRADE_SIZE_USDC = 1.0
+BANKROLL_PCT_MIN = 0.5
+BANKROLL_PCT_MAX = 50.0
+
+
+def max_entry_cap() -> float:
+    """Выше этой цены бот не покупает никогда (MAX_ENTRY_EXECUTION_PRICE):
+    максимум диапазона выше неё в LIVE давал бы ордера, которые не
+    исполнятся, а в DRY — виртуальные сделки по цене, которой в стакане нет."""
+    return round(float(settings.MAX_ENTRY_EXECUTION_PRICE), 2)
+
+
+def clamp_min_entry(value: float, max_entry: float) -> float:
+    return round(min(max(value, MIN_ENTRY_FLOOR), max_entry - 0.01), 2)
+
+
+def clamp_max_entry(value: float, min_entry: float) -> float:
+    return round(max(min(value, max_entry_cap()), min_entry + 0.01), 2)
+
+
+def _overrides() -> dict:
+    return _state.get("asset_overrides") or {}
+
+
+def _update_asset(asset: str, changes: dict | None = None, remove: tuple = ()) -> None:
+    """Меняет/удаляет поля своих настроек монеты. Всегда собираем новый
+    словарь (а не правим на месте), чтобы не испортить _DEFAULTS."""
+    asset = asset.lower()
+    data = {a: dict(v) for a, v in _overrides().items()}
+    cur = data.get(asset, {})
+    for key in remove:
+        cur.pop(key, None)
+    if changes:
+        cur.update(changes)
+    if cur:
+        data[asset] = cur
+    else:
+        data.pop(asset, None)
+    set("asset_overrides", data)
+
+
+def has_own_range(asset: str | None) -> bool:
+    if not asset:
+        return False
+    ov = _overrides().get(asset.lower(), {})
+    return all(k in ov for k in RANGE_KEYS)
+
+
+def has_own_sizing(asset: str | None) -> bool:
+    if not asset:
+        return False
+    ov = _overrides().get(asset.lower(), {})
+    return all(k in ov for k in SIZING_KEYS)
+
+
+def assets_with_own_settings() -> list[str]:
+    return [a for a in settings.ASSETS if has_own_range(a) or has_own_sizing(a)]
+
+
+def entry_range(asset: str | None = None) -> tuple[float, float]:
+    """(минимум, максимум) цены входа для монеты: свой диапазон, если задан,
+    иначе общий. Максимум не выше потолка исполнения (max_entry_cap)."""
+    if has_own_range(asset):
+        ov = _overrides()[asset.lower()]
+        lo, hi = float(ov["min_entry_price"]), float(ov["max_entry_price"])
+    else:
+        lo, hi = float(get("min_entry_price")), float(get("max_entry_price"))
+    return lo, min(hi, max_entry_cap())
+
+
+def set_asset_range(asset: str, lo: float | None = None, hi: float | None = None) -> tuple[float, float]:
+    """Меняет свой диапазон монеты (одну или обе границы). Если своего ещё не
+    было — начинает с текущего общего. Возвращает итоговый диапазон."""
+    cur_lo, cur_hi = entry_range(asset)
+    if lo is not None:
+        cur_lo = clamp_min_entry(lo, cur_hi)
+    if hi is not None:
+        cur_hi = clamp_max_entry(hi, cur_lo)
+    _update_asset(asset, {"min_entry_price": cur_lo, "max_entry_price": cur_hi})
+    return cur_lo, cur_hi
+
+
+def set_global_range(lo: float | None = None, hi: float | None = None) -> tuple[float, float]:
+    """То же для общего диапазона (главное меню → 📈 Диапазон входа)."""
+    cur_lo, cur_hi = entry_range(None)
+    if lo is not None:
+        cur_lo = clamp_min_entry(lo, cur_hi)
+    if hi is not None:
+        cur_hi = clamp_max_entry(hi, cur_lo)
+    set("min_entry_price", cur_lo)
+    set("max_entry_price", cur_hi)
+    return cur_lo, cur_hi
+
+
+def reset_asset_range(asset: str) -> None:
+    _update_asset(asset, remove=RANGE_KEYS)
+
+
+def sizing(asset: str | None = None) -> tuple[str, float, float]:
+    """(режим 'fixed'|'percent', фикс. сумма USDC, % банка) для монеты: свои,
+    если заданы, иначе общие."""
+    if has_own_sizing(asset):
+        ov = _overrides()[asset.lower()]
+        return ov["sizing_mode"], float(ov["trade_size_usdc"]), float(ov["bankroll_pct"])
+    return get("sizing_mode"), float(get("trade_size_usdc")), float(get("bankroll_pct"))
+
+
+def set_asset_sizing(asset: str, mode: str | None = None, trade_size_usdc: float | None = None,
+                     bankroll_pct: float | None = None) -> None:
+    """Своя ставка монеты: режим и/или значение. Если своей ещё не было —
+    начинаем с текущей общей (режим и оба значения)."""
+    cur_mode, cur_usdc, cur_pct = sizing(asset)
+    if mode in ("fixed", "percent"):
+        cur_mode = mode
+    if trade_size_usdc is not None:
+        cur_usdc = trade_size_usdc
+    if bankroll_pct is not None:
+        cur_pct = bankroll_pct
+    _update_asset(asset, {
+        "sizing_mode": cur_mode,
+        "trade_size_usdc": round(max(MIN_TRADE_SIZE_USDC, cur_usdc), 2),
+        "bankroll_pct": round(min(BANKROLL_PCT_MAX, max(BANKROLL_PCT_MIN, cur_pct)), 2),
+    })
+
+
+def reset_asset_sizing(asset: str) -> None:
+    _update_asset(asset, remove=SIZING_KEYS)
+
+
+def reset_asset(asset: str) -> None:
+    _update_asset(asset, remove=RANGE_KEYS + SIZING_KEYS)

@@ -193,6 +193,14 @@ _SIGNALS_MIGRATIONS = [
 _TRADES_MIGRATIONS = [
     ("token_id", "TEXT"),
     ("source", "TEXT"),  # 'strategy' (наш сигнал) | 'copytrade' (скопировано с отслеживаемого кошелька)
+    # С чем бот входил: ask на сигнале (entry_price — это потолок ордера),
+    # score и диапазон входа монеты на тот момент. Диапазон и ставку теперь
+    # можно задать каждой монете свои — без этих колонок по отчётам не понять,
+    # какие сделки сделаны при каких настройках.
+    ("signal_ask", "REAL"),
+    ("safety_score", "REAL"),
+    ("range_min", "REAL"),
+    ("range_max", "REAL"),
 ]
 
 
@@ -207,7 +215,15 @@ def _conn():
         conn.close()
 
 
+# True, если при этом запуске файла базы ещё не было (создана с нуля). При
+# каждом деплое без постоянного тома на /app/data так и будет — тогда
+# настройки из Telegram и статистика сбрасываются; main.py предупреждает.
+DB_WAS_NEW = False
+
+
 def init_db():
+    global DB_WAS_NEW
+    DB_WAS_NEW = not os.path.exists(settings.DB_PATH)
     with _conn() as conn:
         conn.executescript(_SCHEMA)
         existing = {row[1] for row in conn.execute("PRAGMA table_info(signals)")}
@@ -287,15 +303,19 @@ def get_markets_needing_outcome(exclude_slugs: set[str] | None, limit: int = 50)
 
 def log_trade(market_slug: str, condition_id: str, direction: str, entry_price: float,
               size_usdc: float, order_id: str, status: str, dry_run: bool, token_id: str = "",
-              source: str = "strategy") -> int:
+              source: str = "strategy", signal_ask: float | None = None,
+              safety_score: float | None = None, range_min: float | None = None,
+              range_max: float | None = None) -> int:
     with _conn() as conn:
         cur = conn.execute(
             """INSERT INTO trades
                (ts, market_slug, condition_id, direction, entry_price, size_usdc,
-                order_id, status, outcome, pnl_usdc, dry_run, token_id, source)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)""",
+                order_id, status, outcome, pnl_usdc, dry_run, token_id, source,
+                signal_ask, safety_score, range_min, range_max)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?)""",
             (int(time.time()), market_slug, condition_id, direction, entry_price,
-             size_usdc, order_id, status, int(dry_run), token_id, source),
+             size_usdc, order_id, status, int(dry_run), token_id, source,
+             signal_ask, safety_score, range_min, range_max),
         )
         return cur.lastrowid
 
@@ -482,6 +502,7 @@ SIGNALS_COLUMNS = [
 TRADES_COLUMNS = [
     "id", "ts", "market_slug", "condition_id", "direction", "entry_price", "size_usdc",
     "order_id", "status", "outcome", "pnl_usdc", "dry_run", "token_id", "source",
+    "signal_ask", "safety_score", "range_min", "range_max",
 ]
 
 

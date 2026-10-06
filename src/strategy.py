@@ -107,6 +107,7 @@ def evaluate(
     max_minutes_left: float,
     atr_distance_mult: float,
     atr_spike_mult: float,
+    asset: str | None = None,
 ) -> Decision:
     reasons = []
 
@@ -116,13 +117,17 @@ def evaluate(
     if book.best_ask is None:
         return Decision(False, direction, None, 0.0, minutes_left, 0.0, ["нет asks в стакане"])
 
-    min_entry = runtime_state.get("min_entry_price")
-    max_entry = runtime_state.get("max_entry_price")
+    # Диапазон входа и ставка — свои у монеты, если заданы в ⚙️ (🪙 Активы),
+    # иначе общие из главного меню.
+    min_entry, max_entry = runtime_state.entry_range(asset)
     score_threshold = runtime_state.get("safety_score_threshold")
-    trade_size = runtime_state.get("trade_size_usdc")
+    # Ликвидность оцениваем под реальную ставку этой монеты. В режиме % банка
+    # банк берём из кэша (не старше 30 с), чтобы не ходить в базу на каждом
+    # тике каждой монеты.
+    trade_size = runtime_state.compute_trade_size(asset, max_bank_age=30)
 
     if not (min_entry <= book.best_ask <= max_entry):
-        reasons.append(f"цена {book.best_ask:.3f} вне диапазона [{min_entry}, {max_entry}]")
+        reasons.append(f"цена {book.best_ask:.3f} вне диапазона [{min_entry:.2f}, {max_entry:.2f}]")
 
     atr = indicators["atr"] or 1e-9
     distance_atr = abs(current_price - strike_price) / atr

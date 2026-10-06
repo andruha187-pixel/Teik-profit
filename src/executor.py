@@ -91,7 +91,11 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
             # Виртуальные сделки DRY-монет место не занимают.
             return
 
-    base_size = runtime_state.compute_trade_size()
+    # Ставка и диапазон — свои у монеты (⚙️ в 🪙 Активах), иначе общие
+    base_size = runtime_state.compute_trade_size(market.asset)
+    range_min, range_max = runtime_state.entry_range(market.asset)
+    if base_size <= 0:
+        return  # банк в режиме % исчерпан — ставить нечего
     score_threshold = runtime_state.get("safety_score_threshold")
     if runtime_state.get("size_scaling_enabled"):
         trade_size = _scale_trade_size(base_size, decision.safety_score, score_threshold)
@@ -138,7 +142,7 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
     raw_cap = min(
         decision.entry_price + settings.LIVE_ENTRY_MAX_SLIPPAGE,
         settings.MAX_ENTRY_EXECUTION_PRICE,
-        runtime_state.get("max_entry_price"),
+        range_max,
     )
     execution_price = polymarket_client.round_price_for_buy(raw_cap, tick)
 
@@ -194,13 +198,18 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
         status=status,
         dry_run=dry_run,
         token_id=token_id,
+        signal_ask=decision.entry_price,
+        safety_score=decision.safety_score,
+        range_min=range_min,
+        range_max=range_max,
     )
 
     await _notify(market.asset, dry_run,
         f"{'🧪 [DRY RUN] ' if dry_run else '✅ '}Вход {decision.direction} по {market.slug}\n"
         f"Ask на сигнале: {decision.entry_price:.3f} | Потолок исполнения: {execution_price:.3f} "
-        f"(тик {tick:g}) | Размер: {trade_size:.2f} из {base_size:.0f} USDC (score {decision.safety_score}/{score_threshold:.0f})\n"
-        f"Расхождение: {decision.distance_atr} ATR | До конца рынка: {decision.minutes_left:.1f} мин"
+        f"(тик {tick:g}) | Размер: {trade_size:.2f} из {base_size:.2f} USDC (score {decision.safety_score}/{score_threshold:.0f})\n"
+        f"Диапазон {range_min:.2f}–{range_max:.2f} | Расхождение: {decision.distance_atr} ATR | "
+        f"До конца рынка: {decision.minutes_left:.1f} мин"
     )
 
 

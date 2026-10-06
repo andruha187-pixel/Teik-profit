@@ -103,6 +103,7 @@ async def _instance_tick(asset: str, timeframe: TimeframeProfile) -> None:
         max_minutes_left=timeframe.max_minutes_left,
         atr_distance_mult=timeframe.atr_distance_mult,
         atr_spike_mult=timeframe.atr_spike_mult,
+        asset=asset,
     )
 
     storage.log_signal(market.slug, current_price, market.strike_price, decision,
@@ -240,11 +241,23 @@ async def main():
             "принудительно откатил в DRY RUN, чтобы не пытаться торговать без ключа."
             if forced_back_to_dry_run else ""
         )
+        # Без постоянного тома каждый деплой начинается с пустой базы: режим
+        # возвращается в DRY RUN, ставка/банк — к значениям по умолчанию,
+        # статистика обнуляется. Говорим об этом сразу, а не когда заметят.
+        new_db_note = (
+            f"\n⚠️ База данных создана заново ({settings.DB_PATH}). Если бот уже работал раньше, "
+            "значит данные не сохраняются между деплоями: подключи в Coolify постоянный том "
+            "(Persistent Storage) на /app/data. Сейчас режим, ставка, банк и свои настройки "
+            "монет — по умолчанию, статистика пустая."
+            if storage.DB_WAS_NEW else ""
+        )
+        pending_note = telegram_notify._live_pending_note()
         await telegram_notify.notify(
             f"🤖 Бот запущен. Режим: {'DRY RUN (без реальных сделок)' if dry_run else 'LIVE — реальные сделки!'}\n"
             f"Активы: {assets_line} (🔴 реальные сделки, 🧪 DRY)\nТаймфреймы: {timeframes_line}\n"
-            f"Открой /menu для управления (старт/стоп, размер позиции, стоп-лосс, настройки)."
-            f"{forced_note}"
+            + (f"{pending_note}\n" if pending_note else "")
+            + "Открой /menu для управления (старт/стоп, размер позиции, стоп-лосс, настройки)."
+            f"{forced_note}{new_db_note}"
         )
 
         book_stream_task = None

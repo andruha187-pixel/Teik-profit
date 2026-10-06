@@ -33,6 +33,23 @@ _LAST_REPORT_KEY = "last_report_ts"
 TRADES_OVERLAP_SEC = 15 * 60
 
 
+# Telegram отклоняет подпись к файлу длиннее 1024 символов (считает в UTF-16,
+# эмодзи — за 2) — и тогда не уходит весь отчёт.
+CAPTION_LIMIT = 1024
+
+
+def _caption_len(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _fit_caption(text: str, limit: int = CAPTION_LIMIT) -> str:
+    if _caption_len(text) <= limit:
+        return text
+    while text and _caption_len(text) > limit - 1:
+        text = text[:-1]
+    return text + "…"
+
+
 def _write_csv(path: str, columns: list[str], rows: list[tuple]) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -114,6 +131,15 @@ async def build_and_send_report() -> None:
         f"По токенам за период:\n{asset_lines}"
         f"{honest}"
     )
+    # Свои настройки монет (диапазон/ставка) — чтобы по отчёту было видно,
+    # при каких настройках торговала каждая монета. Только если влезает.
+    try:
+        own = telegram_notify._overrides_summary()
+    except Exception:  # noqa: BLE001
+        own = ""
+    if own and _caption_len(caption + "\n⚙️ Свои настройки: " + own) <= CAPTION_LIMIT:
+        caption += "\n⚙️ Свои настройки: " + own
+    caption = _fit_caption(caption)
 
     await telegram_notify.send_document(signals_path, caption)
     await telegram_notify.send_document(trades_path, None)

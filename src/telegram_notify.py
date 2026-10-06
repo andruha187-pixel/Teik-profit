@@ -36,11 +36,90 @@ def set_state_ref(state: dict) -> None:
 
 # ---------------------------------------------------------------- меню ----
 
+def _fmt_pct(pct: float) -> str:
+    return f"{pct:g}%"
+
+
 def _size_summary() -> str:
-    if runtime_state.get("sizing_mode") == "percent":
+    """Общая ставка — для монет без своей (⚙️ в 🪙 Активах)."""
+    mode, usdc, pct = runtime_state.sizing(None)
+    if mode == "percent":
         size_now = runtime_state.compute_trade_size()
-        return f"{runtime_state.get('bankroll_pct'):.0f}% банка (сейчас {size_now:.2f} USDC)"
-    return f"{runtime_state.get('trade_size_usdc'):.2f} USDC (фикс.)"
+        return f"{_fmt_pct(pct)} банка (сейчас {size_now:.2f} USDC)"
+    return f"{usdc:.2f} USDC (фикс.)"
+
+
+def _sizing_text(asset: str | None = None) -> str:
+    """'10% банка ≈ 37.40 USDC' или '20.00 USDC фикс.' — ставка монеты (своя
+    или общая); asset=None — общая."""
+    mode, usdc, pct = runtime_state.sizing(asset)
+    if mode == "percent":
+        now = runtime_state.compute_trade_size(asset, max_bank_age=10)
+        return f"{_fmt_pct(pct)} банка ≈ {now:.2f} USDC"
+    return f"{usdc:.2f} USDC фикс."
+
+
+def _sizing_short(asset: str | None = None) -> str:
+    mode, usdc, pct = runtime_state.sizing(asset)
+    return f"{_fmt_pct(pct)} банка" if mode == "percent" else f"{usdc:g} USDC"
+
+
+def _range_text(asset: str | None = None) -> str:
+    lo, hi = runtime_state.entry_range(asset)
+    return f"{lo:.2f}–{hi:.2f}"
+
+
+def _coin_mode_badge(asset: str) -> str:
+    """Режим монеты: 🔴 LIVE, 🔴 LIVE ⏳ (помечена LIVE, но весь бот в DRY RUN —
+    реальных сделок пока нет) или 🧪 DRY."""
+    if runtime_state.is_asset_live(asset):
+        return "🔴 LIVE ⏳" if runtime_state.get("dry_run") else "🔴 LIVE"
+    return "🧪 DRY"
+
+
+def _coin_settings_short(asset: str) -> str:
+    """'вход 0.92–0.95 (свой) · ставка 10% банка ≈ 37.40 USDC'"""
+    rng = f"вход {_range_text(asset)}" + (" (свой)" if runtime_state.has_own_range(asset) else "")
+    size = f"ставка {_sizing_text(asset)}" + (" (своя)" if runtime_state.has_own_sizing(asset) else "")
+    return f"{rng} · {size}"
+
+
+def _overrides_summary() -> str:
+    """'SOL: вход 0.92–0.95; BTC: ставка 10% банка ≈ 37.40 USDC' — только монеты
+    со своими настройками; пустая строка, если таких нет."""
+    parts = []
+    for a in runtime_state.assets_with_own_settings():
+        bits = []
+        if runtime_state.has_own_range(a):
+            bits.append(f"вход {_range_text(a)}")
+        if runtime_state.has_own_sizing(a):
+            bits.append(f"ставка {_sizing_text(a)}")
+        parts.append(f"{a.upper()}: {', '.join(bits)}")
+    return "; ".join(parts)
+
+
+def _own_list(kind: str) -> str:
+    """'BTC (10% банка), SOL (5 USDC)' — монеты со своей ставкой ('size') или
+    своим диапазоном ('range')."""
+    if kind == "size":
+        return ", ".join(f"{a.upper()} ({_sizing_short(a)})" for a in settings.ASSETS
+                         if runtime_state.has_own_sizing(a))
+    return ", ".join(f"{a.upper()} ({_range_text(a)})" for a in settings.ASSETS
+                     if runtime_state.has_own_range(a))
+
+
+def _live_pending_note() -> str:
+    """Монеты помечены 🔴 LIVE, но весь бот в DRY RUN: реальных сделок нет,
+    пока не нажата «🔴 Включить LIVE» в главном меню."""
+    if not runtime_state.get("dry_run"):
+        return ""
+    marked = [a.upper() for a in settings.ASSETS
+              if runtime_state.is_asset_live(a) and runtime_state.is_asset_enabled(a)]
+    if not marked:
+        return ""
+    verb = "помечен" if len(marked) == 1 else "помечены"
+    return (f"⏳ {', '.join(marked)} {verb} 🔴 LIVE, но бот в DRY RUN: реальные сделки начнутся "
+            "после «🔴 Включить LIVE» внизу главного меню.")
 
 
 def _distance_summary() -> str:
@@ -90,14 +169,22 @@ def _main_menu_text() -> str:
         "🤖 *Polymarket Multi-Asset Bot*",
         "",
         f"Статус: {'⏸ на паузе' if paused else '▶️ активен'} | Режим: {'🧪 DRY RUN' if dry_run else '🔴 LIVE'}",
+    ]
+    pending = _live_pending_note()
+    if pending:
+        lines.append(pending)
+    lines += [
         f"Активы: {_assets_modes_line() or '(нет включённых)'}",
         f"Размер позиции: {_size_summary()}",
         f"Стоп-лосс/день: {runtime_state.get('daily_loss_limit_usdc'):.0f} USDC",
         f"Стоп-лосс позиции: {'вкл ' + str(round(runtime_state.get('position_stop_loss_pct'))) + '%' if pos_sl_on else 'выкл'}",
         f"Safety score порог: {runtime_state.get('safety_score_threshold'):.0f}",
-        f"Диапазон входа: {runtime_state.get('min_entry_price'):.2f}–{runtime_state.get('max_entry_price'):.2f}",
+        f"Диапазон входа: {_range_text()}",
         f"Мин. расстояние от страйка: {_distance_summary()}",
     ]
+    own = _overrides_summary()
+    if own:
+        lines.append(f"⚙️ Свои у монет: {own}")
     if s:
         lines.append("")
         lines.append(f"Потоков активно: {len(s)}")
@@ -140,15 +227,17 @@ def _main_menu_markup() -> InlineKeyboardMarkup:
 
 def _assets_menu_markup() -> InlineKeyboardMarkup:
     """Строка на монету: [✅/⏸ МОНЕТА] — включить/выключить поток,
-    [🔴 LIVE / 🧪 DRY] — реальные или виртуальные сделки по этой монете."""
+    [🔴 LIVE / 🧪 DRY] — реальные или виртуальные сделки по этой монете,
+    [⚙️] — свой диапазон входа и своя ставка монеты."""
     enabled = runtime_state.get_enabled_assets()
     rows = []
     for asset in settings.ASSETS:
         on = asset in enabled
-        live = runtime_state.is_asset_live(asset)
+        own = runtime_state.has_own_range(asset) or runtime_state.has_own_sizing(asset)
         rows.append([
             InlineKeyboardButton(f"{'✅' if on else '⏸'} {asset.upper()}", callback_data=f"asset_toggle:{asset}"),
-            InlineKeyboardButton("🔴 LIVE" if live else "🧪 DRY", callback_data=f"asset_mode:{asset}"),
+            InlineKeyboardButton(_coin_mode_badge(asset), callback_data=f"asset_mode:{asset}"),
+            InlineKeyboardButton("⚙️ свои" if own else "⚙️", callback_data=f"acfg:{asset}"),
         ])
     notify_on = runtime_state.get("notify_dry_assets")
     rows.append([InlineKeyboardButton(
@@ -162,14 +251,180 @@ def _assets_menu_markup() -> InlineKeyboardMarkup:
 def _assets_menu_text() -> str:
     enabled = runtime_state.get_enabled_assets()
     general = "🧪 DRY RUN — все сделки виртуальные" if runtime_state.get("dry_run") else "🔴 LIVE"
-    return (
-        f"🪙 Монеты: включено {len(enabled)} из {len(settings.ASSETS)}. Общий режим бота: {general}.\n\n"
-        "Левая кнопка — включить/выключить монету. Правая — режим монеты:\n"
-        "🔴 LIVE — реальные сделки (когда сам бот в LIVE),\n"
-        "🧪 DRY — виртуальные сделки: стратегия проверяется на этой монете без денег.\n\n"
+    lines = [f"🪙 Монеты: включено {len(enabled)} из {len(settings.ASSETS)}. Общий режим бота: {general}."]
+    pending = _live_pending_note()
+    if pending:
+        lines.append(pending)
+    coin_lines = [f"{a.upper()} {_coin_mode_badge(a)}: {_coin_settings_short(a)}"
+                  for a in settings.ASSETS if a in enabled]
+    if coin_lines:
+        lines += [""] + coin_lines
+    lines += [
+        "",
+        "Кнопки в строке монеты:",
+        "• слева — включить/выключить монету;",
+        "• посередине — режим: 🔴 LIVE — реальные сделки (только когда сам бот в LIVE, "
+        "иначе ⏳), 🧪 DRY — виртуальные: стратегия проверяется без денег;",
+        "• ⚙️ — свой диапазон входа и своя ставка монеты (% банка или фикс. сумма). "
+        "«⚙️ свои» — у монеты уже есть свои значения; без них она берёт общие из главного меню.",
+        "",
         "Новые монеты всегда начинают с DRY. Каждый тик по каждой включённой монете "
-        "попадает в 4-часовой отчёт — по нему видно, на какой монете стратегия работает."
-    )
+        "попадает в 4-часовой отчёт — по нему видно, на какой монете стратегия работает.",
+    ]
+    return "\n".join(lines)
+
+
+# ----------------------------------------------- свои настройки монеты ----
+
+def _asset_cfg_text(asset: str) -> str:
+    a = asset.upper()
+    own_r = runtime_state.has_own_range(asset)
+    own_s = runtime_state.has_own_sizing(asset)
+    mode = _coin_mode_badge(asset)
+    if not runtime_state.is_asset_enabled(asset):
+        mode += " (монета выключена ⏸)"
+    lines = [f"⚙️ {a} — настройки монеты", "", f"Режим: {mode}"]
+    if runtime_state.is_asset_live(asset) and runtime_state.get("dry_run"):
+        lines.append("⏳ Бот в DRY RUN — реальные сделки по монете начнутся после «🔴 Включить LIVE» "
+                     "в главном меню.")
+    lines += [
+        f"📈 Диапазон входа: {_range_text(asset)} — {'свой' if own_r else 'общий'}",
+        f"💰 Ставка: {_sizing_text(asset)} — {'своя' if own_s else 'общая'}",
+        "",
+        "Общий/общая — значение из главного меню, меняется вместе с ним.",
+        "Свой/своя — только для этой монеты, общие настройки на него не влияют.",
+    ]
+    return "\n".join(lines)
+
+
+def _asset_cfg_markup(asset: str) -> InlineKeyboardMarkup:
+    rows = [[
+        InlineKeyboardButton("📈 Диапазон входа", callback_data=f"arng:{asset}"),
+        InlineKeyboardButton("💰 Ставка", callback_data=f"asz:{asset}"),
+    ]]
+    if runtime_state.has_own_range(asset) or runtime_state.has_own_sizing(asset):
+        rows.append([InlineKeyboardButton("↩️ Всё как в общих", callback_data=f"arst:{asset}")])
+    rows.append([InlineKeyboardButton("◀️ К монетам", callback_data="menu:assets")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _asset_range_text(asset: str) -> str:
+    a = asset.upper()
+    own = runtime_state.has_own_range(asset)
+    lines = [f"📈 {a} — диапазон входа: {_range_text(asset)} ({'свой' if own else 'общий'})"]
+    if own:
+        lines.append(f"Общий: {_range_text(None)}.")
+    else:
+        lines.append("Сейчас монета берёт общий. Любая кнопка ниже создаст ей свой диапазон, "
+                     "начиная с общего.")
+    lines += [
+        "",
+        f"Бот входит по {a}, только если ask нужной стороны внутри диапазона. Максимум — это и "
+        f"потолок цены ордера; дороже {runtime_state.max_entry_cap():.2f} бот не покупает.",
+    ]
+    return "\n".join(lines)
+
+
+def _asset_range_markup(asset: str) -> InlineKeyboardMarkup:
+    lo, hi = runtime_state.entry_range(asset)
+    cap = runtime_state.max_entry_cap()
+    rows = [[InlineKeyboardButton("— Минимум —", callback_data="noop")]]
+    rows.append([
+        InlineKeyboardButton(f"{'✅ ' if abs(v - lo) < 0.001 else ''}{v:.2f}", callback_data=f"amin:{asset}:{v}")
+        for v in MIN_ENTRY_PRESETS
+    ])
+    rows.append([
+        InlineKeyboardButton("−0.01", callback_data=f"amind:{asset}:-0.01"),
+        InlineKeyboardButton("+0.01", callback_data=f"amind:{asset}:0.01"),
+        InlineKeyboardButton("✏️ Свой", callback_data=f"aminc:{asset}"),
+    ])
+    rows.append([InlineKeyboardButton("— Максимум —", callback_data="noop")])
+    rows.append([
+        InlineKeyboardButton(f"{'✅ ' if abs(v - hi) < 0.001 else ''}{v:.2f}", callback_data=f"amax:{asset}:{v}")
+        for v in MAX_ENTRY_PRESETS if v <= cap + 1e-9
+    ])
+    rows.append([
+        InlineKeyboardButton("−0.01", callback_data=f"amaxd:{asset}:-0.01"),
+        InlineKeyboardButton("+0.01", callback_data=f"amaxd:{asset}:0.01"),
+        InlineKeyboardButton("✏️ Свой", callback_data=f"amaxc:{asset}"),
+    ])
+    if runtime_state.has_own_range(asset):
+        rows.append([InlineKeyboardButton(f"↩️ Как в общих ({_range_text(None)})", callback_data=f"arngr:{asset}")])
+    rows.append([InlineKeyboardButton(f"◀️ Назад к {asset.upper()}", callback_data=f"acfg:{asset}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _asset_size_text(asset: str) -> str:
+    a = asset.upper()
+    own = runtime_state.has_own_sizing(asset)
+    mode, _usdc, _pct = runtime_state.sizing(asset)
+    lines = [f"💰 {a} — ставка: {_sizing_text(asset)} ({'своя' if own else 'общая'})"]
+    if own:
+        lines.append(f"Общая: {_sizing_text(None)}.")
+    else:
+        lines.append("Сейчас монета берёт общую. Любая кнопка ниже создаст ей свою ставку, "
+                     "начиная с общей.")
+    if mode == "percent":
+        bank = runtime_state.current_bankroll()
+        lines += [
+            "",
+            f"Банк один на все монеты: {bank:.2f} USDC (стартовый "
+            f"{runtime_state.get('starting_bankroll_usdc'):.2f} + реализованный PnL реальных сделок). "
+            "Стартовый банк меняется в 💰 Размер позиции главного меню.",
+        ]
+    if runtime_state.is_asset_live(asset) and runtime_state.get("dry_run"):
+        lines += ["", "Бот сейчас в DRY RUN: пока ставка влияет только на виртуальный PnL. "
+                      "После «🔴 Включить LIVE» по монете пойдут реальные ордера этого размера."]
+    elif runtime_state.trade_is_dry(asset):
+        lines += ["", "Монета в DRY: ставка влияет только на виртуальный PnL."]
+    return "\n".join(lines)
+
+
+def _asset_size_markup(asset: str) -> InlineKeyboardMarkup:
+    mode, usdc, pct = runtime_state.sizing(asset)
+    rows = [[InlineKeyboardButton(
+        "🔀 Перейти на фикс. сумму" if mode == "percent" else "🔀 Перейти на % от банка",
+        callback_data=f"aszm:{asset}",
+    )]]
+    if mode == "percent":
+        rows.append([
+            InlineKeyboardButton(f"{'✅ ' if abs(v - pct) < 0.01 else ''}{v}%", callback_data=f"aszp:{asset}:{v}")
+            for v in BANKROLL_PCT_PRESETS
+        ])
+        rows.append([
+            InlineKeyboardButton("−1%", callback_data=f"aszpd:{asset}:-1"),
+            InlineKeyboardButton("+1%", callback_data=f"aszpd:{asset}:1"),
+            InlineKeyboardButton("✏️ Свой %", callback_data=f"aszpc:{asset}"),
+        ])
+    else:
+        buttons = [
+            InlineKeyboardButton(f"{'✅ ' if abs(v - usdc) < 0.01 else ''}{v}", callback_data=f"aszu:{asset}:{v}")
+            for v in SIZE_PRESETS
+        ]
+        rows += [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+        rows.append([InlineKeyboardButton("✏️ Своя сумма", callback_data=f"aszuc:{asset}")])
+    if runtime_state.has_own_sizing(asset):
+        rows.append([InlineKeyboardButton(f"↩️ Как в общих ({_sizing_short(None)})", callback_data=f"aszr:{asset}")])
+    rows.append([InlineKeyboardButton(f"◀️ Назад к {asset.upper()}", callback_data=f"acfg:{asset}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _confirm_live_text() -> str:
+    """Подтверждение общего LIVE: по каким монетам и с какой ставкой пойдут
+    реальные ордера — чтобы не включить LIVE со сброшенной ставкой."""
+    live = [a for a in settings.ASSETS if runtime_state.is_asset_live(a) and runtime_state.is_asset_enabled(a)]
+    lines = ["⚠️ Включить LIVE-режим? Бот начнёт выставлять реальные ордера на Polymarket.", ""]
+    if live:
+        lines.append("Реальные сделки пойдут по:")
+        lines += [f"  {a.upper()}: {_coin_settings_short(a)}" for a in live]
+        dry = [a.upper() for a in settings.ASSETS if runtime_state.is_asset_enabled(a) and a not in live]
+        if dry:
+            lines.append(f"Остальные ({', '.join(dry)}) останутся в DRY — виртуально.")
+        lines += ["", "Проверь ставку: поменять её можно в ⚙️ монеты (🪙 Активы) или в 💰 Размер позиции."]
+    else:
+        lines.append("Ни одна включённая монета не помечена 🔴 LIVE в 🪙 Активах — реальных сделок "
+                     "не будет, пока не пометишь.")
+    return "\n".join(lines)
 
 
 BANKROLL_PCT_PRESETS = [3, 5, 7, 10]
@@ -249,8 +504,10 @@ def _wallet_menu_markup() -> InlineKeyboardMarkup:
 
 def _size_menu_markup() -> InlineKeyboardMarkup:
     mode = runtime_state.get("sizing_mode")
+    # Подпись — куда переключит кнопка (раньше «Режим: % от банка» читалось
+    # как текущий режим, хотя он был фиксированным).
     rows = [[InlineKeyboardButton(
-        "🔀 Режим: % от банка" if mode == "fixed" else "🔀 Режим: фикс. сумма",
+        "🔀 Перейти на % от банка" if mode == "fixed" else "🔀 Перейти на фикс. сумму",
         callback_data="sizing_mode_toggle",
     )]]
 
@@ -337,8 +594,7 @@ MAX_ENTRY_PRESETS = [0.93, 0.95, 0.97]
 
 
 def _range_menu_markup() -> InlineKeyboardMarkup:
-    cur_min = runtime_state.get("min_entry_price")
-    cur_max = runtime_state.get("max_entry_price")
+    cur_min, cur_max = runtime_state.entry_range(None)
     rows = [[InlineKeyboardButton("— Минимум —", callback_data="noop")]]
     row = []
     for val in MIN_ENTRY_PRESETS:
@@ -412,6 +668,49 @@ def _settings_menu_markup() -> InlineKeyboardMarkup:
     )])
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="menu:main")])
     return InlineKeyboardMarkup(rows)
+
+
+def _price_from_input(value: float) -> float | None:
+    """Цена входа из текста: 0.92 или в центах — 92 -> 0.92. Больше 100 — ошибка."""
+    if value > 100:
+        return None
+    return value / 100 if value > 1 else value
+
+
+def _range_menu_text() -> str:
+    text = (
+        f"📈 Диапазон входа: {_range_text()}\n\n"
+        "Бот входит, только если ask на нужной стороне попадает в этот диапазон "
+        "(и score выше порога). Шире диапазон — больше сигналов, но ниже средняя "
+        "цена входа (более рискованные, менее 'подтверждённые' рынком ситуации). "
+        f"Максимум — это и потолок цены ордера; дороже {runtime_state.max_entry_cap():.2f} бот не покупает."
+    )
+    own = _own_list("range")
+    text += ("\n\nЭто общий диапазон — для монет без своего."
+             + (f" Свой у: {own}." if own else "")
+             + " Свой диапазон монеты — 🪙 Активы → ⚙️.")
+    return text
+
+
+def _size_menu_text() -> str:
+    mode = runtime_state.get("sizing_mode")
+    if mode == "percent":
+        bank = runtime_state.current_bankroll()
+        size_now = runtime_state.compute_trade_size()
+        text = (
+            f"💰 Режим: % от банка\n"
+            f"Стартовый банк: {runtime_state.get('starting_bankroll_usdc'):.2f} USDC\n"
+            f"Текущий банк (старт + реализованный PnL): {bank:.2f} USDC\n"
+            f"Доля на сделку: {_fmt_pct(runtime_state.get('bankroll_pct'))} → сейчас это {size_now:.2f} USDC\n\n"
+            "Размер сам растёт на прибыли и сжимается на просадке."
+        )
+    else:
+        text = f"💰 Режим: фиксированная сумма — {runtime_state.get('trade_size_usdc'):.2f} USDC на сделку."
+    own = _own_list("size")
+    text += ("\n\nЭто общая ставка — для монет без своей."
+             + (f" Своя у: {own}." if own else "")
+             + " Своя ставка монеты — 🪙 Активы → ⚙️. Банк для % один на все монеты.")
+    return text
 
 
 def _confirm_live_markup() -> InlineKeyboardMarkup:
@@ -572,6 +871,34 @@ async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Не похоже на положительное число, попробуй ещё раз (например: 15.5)")
         return
 
+    if _pending_input in ("min_entry", "max_entry") or _pending_input.startswith(("a:min:", "a:max:")):
+        price = _price_from_input(value)
+        if price is None:
+            await update.message.reply_text(
+                "Цена входа — число до 1, например 0.92 (или в центах: 92). Попробуй ещё раз.")
+            return
+        value = price
+
+    if _pending_input.startswith("a:"):
+        # Свои настройки монеты: "a:<поле>:<монета>"
+        _prefix, field, asset = _pending_input.split(":", 2)
+        _pending_input = None
+        if asset not in settings.ASSETS:
+            return
+        if field == "min":
+            runtime_state.set_asset_range(asset, lo=value)
+        elif field == "max":
+            runtime_state.set_asset_range(asset, hi=value)
+        elif field == "pct":
+            runtime_state.set_asset_sizing(asset, mode="percent", bankroll_pct=value)
+        elif field == "usdc":
+            runtime_state.set_asset_sizing(asset, mode="fixed", trade_size_usdc=value)
+        if field in ("min", "max"):
+            await update.message.reply_text("✅ " + _asset_range_text(asset), reply_markup=_asset_range_markup(asset))
+        else:
+            await update.message.reply_text("✅ " + _asset_size_text(asset), reply_markup=_asset_size_markup(asset))
+        return
+
     if _pending_input == "size":
         runtime_state.set("trade_size_usdc", value)
         _pending_input = None
@@ -588,19 +915,16 @@ async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Стоп-лосс позиции: {value:.1f}%", reply_markup=_position_sl_menu_markup(),
         )
     elif _pending_input == "min_entry":
-        value = round(min(value, runtime_state.get("max_entry_price") - 0.01), 2)
-        runtime_state.set("min_entry_price", value)
+        lo, _hi = runtime_state.set_global_range(lo=value)
         _pending_input = None
         await update.message.reply_text(
-            f"✅ Минимум диапазона входа: {value:.2f}", reply_markup=_range_menu_markup(),
+            f"✅ Минимум диапазона входа: {lo:.2f}", reply_markup=_range_menu_markup(),
         )
     elif _pending_input == "max_entry":
-        value = round(max(value, runtime_state.get("min_entry_price") + 0.01), 2)
-        value = min(value, 0.99)
-        runtime_state.set("max_entry_price", value)
+        _lo, hi = runtime_state.set_global_range(hi=value)
         _pending_input = None
         await update.message.reply_text(
-            f"✅ Максимум диапазона входа: {value:.2f}", reply_markup=_range_menu_markup(),
+            f"✅ Максимум диапазона входа: {hi:.2f}", reply_markup=_range_menu_markup(),
         )
     elif _pending_input == "starting_bankroll":
         runtime_state.set("starting_bankroll_usdc", value)
@@ -629,7 +953,134 @@ async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ------------------------------------------------------------- кнопки -----
 
+async def _safe_edit(query, text: str, markup=None) -> None:
+    """edit_message_text, который не падает на «message is not modified»
+    (повторное нажатие той же кнопки)."""
+    try:
+        await query.edit_message_text(text, reply_markup=markup)
+    except Exception as exc:  # noqa: BLE001
+        if "not modified" not in str(exc).lower():
+            raise
+
+
+# Кнопки ⚙️ монеты: префикс:монета[:значение]. Короткие префиксы — у Telegram
+# лимит 64 байта на callback_data.
+_ASSET_CFG_PREFIXES = {
+    "acfg", "arst",                                   # экран монеты, сброс всего
+    "arng", "amin", "amind", "aminc",                 # диапазон: экран, минимум
+    "amax", "amaxd", "amaxc", "arngr",                # максимум, сброс диапазона
+    "asz", "aszm", "aszp", "aszpd", "aszpc",          # ставка: экран, режим, %
+    "aszu", "aszuc", "aszr",                          # фикс. сумма, сброс ставки
+}
+
+
+async def _handle_asset_cfg(query, data: str) -> bool:
+    """Свои настройки монеты (диапазон входа, ставка). True — кнопка отсюда."""
+    global _pending_input
+    prefix, _sep, rest = data.partition(":")
+    if prefix not in _ASSET_CFG_PREFIXES:
+        return False
+    asset, _sep, arg = rest.partition(":")
+    if asset not in settings.ASSETS:
+        return True
+    a = asset.upper()
+    try:
+        num = float(arg) if arg else None
+    except ValueError:
+        return True
+
+    def cancel(back: str) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data=back)]])
+
+    if prefix == "acfg":
+        await _safe_edit(query, _asset_cfg_text(asset), _asset_cfg_markup(asset))
+
+    elif prefix == "arst":
+        runtime_state.reset_asset(asset)
+        await _safe_edit(query, f"↩️ {a}: диапазон входа и ставка снова общие.\n\n" + _asset_cfg_text(asset),
+                         _asset_cfg_markup(asset))
+
+    elif prefix == "arng":
+        await _safe_edit(query, _asset_range_text(asset), _asset_range_markup(asset))
+
+    elif prefix in ("amin", "amind", "amax", "amaxd"):
+        if num is None:
+            return True
+        lo, hi = runtime_state.entry_range(asset)
+        if prefix == "amin":
+            runtime_state.set_asset_range(asset, lo=num)
+        elif prefix == "amind":
+            runtime_state.set_asset_range(asset, lo=lo + num)
+        elif prefix == "amax":
+            runtime_state.set_asset_range(asset, hi=num)
+        else:
+            runtime_state.set_asset_range(asset, hi=hi + num)
+        await _safe_edit(query, "✅ " + _asset_range_text(asset), _asset_range_markup(asset))
+
+    elif prefix in ("aminc", "amaxc"):
+        is_min = prefix == "aminc"
+        _pending_input = f"a:{'min' if is_min else 'max'}:{asset}"
+        await _safe_edit(
+            query,
+            f"✏️ Напиши {'минимальную' if is_min else 'максимальную'} цену входа для {a} следующим "
+            f"сообщением, например: {'0.90' if is_min else '0.95'} (можно в центах: {'90' if is_min else '95'})",
+            cancel(f"arng:{asset}"),
+        )
+
+    elif prefix == "arngr":
+        runtime_state.reset_asset_range(asset)
+        await _safe_edit(query, "↩️ " + _asset_range_text(asset), _asset_range_markup(asset))
+
+    elif prefix == "asz":
+        await _safe_edit(query, _asset_size_text(asset), _asset_size_markup(asset))
+
+    elif prefix == "aszm":
+        mode, _usdc, _pct = runtime_state.sizing(asset)
+        runtime_state.set_asset_sizing(asset, mode="fixed" if mode == "percent" else "percent")
+        await _safe_edit(query, "✅ " + _asset_size_text(asset), _asset_size_markup(asset))
+
+    elif prefix in ("aszp", "aszpd"):
+        if num is None:
+            return True
+        _mode, _usdc, pct = runtime_state.sizing(asset)
+        runtime_state.set_asset_sizing(asset, mode="percent", bankroll_pct=num if prefix == "aszp" else pct + num)
+        await _safe_edit(query, "✅ " + _asset_size_text(asset), _asset_size_markup(asset))
+
+    elif prefix == "aszu":
+        if num is None:
+            return True
+        runtime_state.set_asset_sizing(asset, mode="fixed", trade_size_usdc=num)
+        await _safe_edit(query, "✅ " + _asset_size_text(asset), _asset_size_markup(asset))
+
+    elif prefix in ("aszpc", "aszuc"):
+        is_pct = prefix == "aszpc"
+        _pending_input = f"a:{'pct' if is_pct else 'usdc'}:{asset}"
+        await _safe_edit(
+            query,
+            (f"✏️ Напиши процент банка на одну сделку {a} следующим сообщением, например: 2.5"
+             if is_pct else
+             f"✏️ Напиши сумму одной сделки {a} в USDC следующим сообщением, например: 15"),
+            cancel(f"asz:{asset}"),
+        )
+
+    elif prefix == "aszr":
+        runtime_state.reset_asset_sizing(asset)
+        await _safe_edit(query, "↩️ " + _asset_size_text(asset), _asset_size_markup(asset))
+
+    return True
+
+
 async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Повторное нажатие той же кнопки даёт у Telegram ошибку «message is not
+    modified» — это не ошибка бота, глушим её здесь для всех кнопок сразу."""
+    try:
+        await _on_callback_inner(update, context)
+    except Exception as exc:  # noqa: BLE001
+        if "not modified" not in str(exc).lower():
+            raise
+
+
+async def _on_callback_inner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global _pending_input
     query = update.callback_query
     if not _is_owner(update):
@@ -637,25 +1088,19 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     data = query.data
     await query.answer()
+    # Любая кнопка отменяет ожидание текстового ввода (например, «❌ Отмена»
+    # после «✏️ Свой …»): раньше ожидание оставалось, и следующее число в чате
+    # молча меняло настройку. Кнопки «✏️ …» ниже выставляют его заново.
+    _pending_input = None
+
+    if await _handle_asset_cfg(query, data):
+        return
 
     if data == "menu:main":
         await query.edit_message_text(_main_menu_text(), reply_markup=_main_menu_markup(), parse_mode="Markdown")
 
     elif data == "menu:size":
-        mode = runtime_state.get("sizing_mode")
-        if mode == "percent":
-            bank = runtime_state.current_bankroll()
-            size_now = runtime_state.compute_trade_size()
-            text = (
-                f"💰 Режим: % от банка\n"
-                f"Стартовый банк: {runtime_state.get('starting_bankroll_usdc'):.2f} USDC\n"
-                f"Текущий банк (старт + реализованный PnL): {bank:.2f} USDC\n"
-                f"Доля на сделку: {runtime_state.get('bankroll_pct'):.0f}% → сейчас это {size_now:.2f} USDC\n\n"
-                "Размер сам растёт на прибыли и сжимается на просадке."
-            )
-        else:
-            text = f"💰 Режим: фиксированная сумма — {runtime_state.get('trade_size_usdc'):.2f} USDC на сделку."
-        await query.edit_message_text(text, reply_markup=_size_menu_markup())
+        await _safe_edit(query, _size_menu_text(), _size_menu_markup())
 
     elif data == "sizing_mode_toggle":
         new_mode = "percent" if runtime_state.get("sizing_mode") == "fixed" else "fixed"
@@ -798,7 +1243,8 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"⚠️ Включить реальные сделки по {asset.upper()}?\n"
                 "Когда бот в LIVE, по этой монете пойдут настоящие ордера. Сначала стоит "
                 "убедиться в 📊 Статистике, что в DRY по ней проигрышей заметно меньше, "
-                "чем заложено в цены.",
+                "чем заложено в цены.\n\n"
+                f"Настройки {asset.upper()}: {_coin_settings_short(asset)}",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton(f"✅ Да, LIVE для {asset.upper()}", callback_data=f"asset_live_confirm:{asset}")],
                     [InlineKeyboardButton("❌ Оставить DRY", callback_data="menu:assets")],
@@ -852,32 +1298,19 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "menu:range":
-        await query.edit_message_text(
-            f"📈 Диапазон входа: {runtime_state.get('min_entry_price'):.2f} — "
-            f"{runtime_state.get('max_entry_price'):.2f}\n\n"
-            "Бот входит, только если ask на нужной стороне попадает в этот диапазон "
-            "(и score выше порога). Шире диапазон — больше сигналов, но ниже средняя "
-            "цена входа (более рискованные, менее 'подтверждённые' рынком ситуации).",
-            reply_markup=_range_menu_markup(),
-        )
+        await _safe_edit(query, _range_menu_text(), _range_menu_markup())
 
     elif data == "noop":
         pass
 
     elif data.startswith("minentry_set:"):
-        val = float(data.split(":", 1)[1])
-        runtime_state.set("min_entry_price", val)
-        await query.edit_message_text(
-            f"✅ Минимум диапазона входа: {val:.2f}", reply_markup=_range_menu_markup(),
-        )
+        lo, _hi = runtime_state.set_global_range(lo=float(data.split(":", 1)[1]))
+        await _safe_edit(query, f"✅ Минимум диапазона входа: {lo:.2f}", _range_menu_markup())
 
     elif data.startswith("minentry_delta:"):
         delta = float(data.split(":", 1)[1])
-        new_val = round(min(runtime_state.get("max_entry_price") - 0.01, max(0.5, runtime_state.get("min_entry_price") + delta)), 2)
-        runtime_state.set("min_entry_price", new_val)
-        await query.edit_message_text(
-            f"✅ Минимум диапазона входа: {new_val:.2f}", reply_markup=_range_menu_markup(),
-        )
+        lo, _hi = runtime_state.set_global_range(lo=runtime_state.entry_range(None)[0] + delta)
+        await _safe_edit(query, f"✅ Минимум диапазона входа: {lo:.2f}", _range_menu_markup())
 
     elif data == "minentry_custom":
         _pending_input = "min_entry"
@@ -887,19 +1320,13 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data.startswith("maxentry_set:"):
-        val = float(data.split(":", 1)[1])
-        runtime_state.set("max_entry_price", val)
-        await query.edit_message_text(
-            f"✅ Максимум диапазона входа: {val:.2f}", reply_markup=_range_menu_markup(),
-        )
+        _lo, hi = runtime_state.set_global_range(hi=float(data.split(":", 1)[1]))
+        await _safe_edit(query, f"✅ Максимум диапазона входа: {hi:.2f}", _range_menu_markup())
 
     elif data.startswith("maxentry_delta:"):
         delta = float(data.split(":", 1)[1])
-        new_val = round(max(runtime_state.get("min_entry_price") + 0.01, min(0.99, runtime_state.get("max_entry_price") + delta)), 2)
-        runtime_state.set("max_entry_price", new_val)
-        await query.edit_message_text(
-            f"✅ Максимум диапазона входа: {new_val:.2f}", reply_markup=_range_menu_markup(),
-        )
+        _lo, hi = runtime_state.set_global_range(hi=runtime_state.entry_range(None)[1] + delta)
+        await _safe_edit(query, f"✅ Максимум диапазона входа: {hi:.2f}", _range_menu_markup())
 
     elif data == "maxentry_custom":
         _pending_input = "max_entry"
@@ -925,10 +1352,12 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "preset_apply":
         runtime_state.apply_recommended()
+        own = _overrides_summary()
         await query.edit_message_text(
             "⭐ Применены рекомендованные настройки: порог 88, диапазон "
-            f"{runtime_state.get('min_entry_price'):.2f}–{runtime_state.get('max_entry_price'):.2f}.\n\n"
-            + _settings_text(),
+            f"{_range_text()}.\n"
+            + (f"Свои настройки монет не тронуты: {own}.\n" if own else "")
+            + "\n" + _settings_text(),
             reply_markup=_settings_menu_markup(),
         )
 
@@ -1029,10 +1458,8 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
             # DRY RUN -> LIVE — это реальные деньги, спрашиваем подтверждение
-            await query.edit_message_text(
-                "⚠️ Включить LIVE-режим? Бот начнёт выставлять реальные ордера на Polymarket.",
-                reply_markup=_confirm_live_markup(),
-            )
+            # и показываем, по каким монетам и с какой ставкой пойдут ордера.
+            await query.edit_message_text(_confirm_live_text(), reply_markup=_confirm_live_markup())
         else:
             runtime_state.set("dry_run", True)
             await query.edit_message_text(
