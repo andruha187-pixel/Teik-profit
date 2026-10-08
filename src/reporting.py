@@ -21,7 +21,7 @@ import os
 import time
 
 from config import settings
-from src import storage, telegram_notify, loss_stats
+from src import storage, telegram_notify, loss_stats, diagnostics
 
 _LAST_REPORT_KEY = "last_report_ts"
 
@@ -131,15 +131,32 @@ async def build_and_send_report() -> None:
         f"По токенам за период:\n{asset_lines}"
         f"{honest}"
     )
+    # Почему не входили: рынки без сигнала (по тикам окна) и сигналы без сделки
+    # (лимит позиций, ошибки ордеров и т.п. — см. src/diagnostics.py).
+    extra_lines = []
+    try:
+        no_sig = diagnostics.no_signal_line(diagnostics.classify_markets(signals, storage.SIGNALS_COLUMNS))
+        if no_sig:
+            extra_lines.append("🔎 " + no_sig)
+        skips = diagnostics.skip_line()
+        if skips:
+            extra_lines.append("⛔ Сигналы без сделки: " + skips)
+    except Exception:  # noqa: BLE001 — диагностика не должна ломать отчёт
+        pass
     # Свои настройки монет (диапазон/ставка) — чтобы по отчёту было видно,
-    # при каких настройках торговала каждая монета. Только если влезает.
+    # при каких настройках торговала каждая монета.
     try:
         own = telegram_notify._overrides_summary()
     except Exception:  # noqa: BLE001
         own = ""
-    if own and _caption_len(caption + "\n⚙️ Свои настройки: " + own) <= CAPTION_LIMIT:
-        caption += "\n⚙️ Свои настройки: " + own
+    if own:
+        extra_lines.append("⚙️ Свои настройки: " + own)
+    # Добавляем, пока влезает в лимит подписи
+    for line in extra_lines:
+        if _caption_len(caption + "\n" + line) <= CAPTION_LIMIT:
+            caption += "\n" + line
     caption = _fit_caption(caption)
+    diagnostics.reset_skips()
 
     await telegram_notify.send_document(signals_path, caption)
     await telegram_notify.send_document(trades_path, None)

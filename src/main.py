@@ -92,6 +92,8 @@ async def _instance_tick(asset: str, timeframe: TimeframeProfile) -> None:
     up_book = await get_book(market.up_token_id)
     down_book = await get_book(market.down_token_id)
 
+    # Окно входа — из настроек (⚙️ → ⏱ Окно входа), а не зашитое в профиль
+    win_min, win_max = runtime_state.entry_window()
     decision = strategy.evaluate(
         current_price=current_price,
         strike_price=market.strike_price,
@@ -99,8 +101,8 @@ async def _instance_tick(asset: str, timeframe: TimeframeProfile) -> None:
         indicators=ind,
         up_book=up_book,
         down_book=down_book,
-        min_minutes_left=timeframe.min_minutes_left,
-        max_minutes_left=timeframe.max_minutes_left,
+        min_minutes_left=win_min,
+        max_minutes_left=win_max,
         atr_distance_mult=timeframe.atr_distance_mult,
         atr_spike_mult=timeframe.atr_spike_mult,
         asset=asset,

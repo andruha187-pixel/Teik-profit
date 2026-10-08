@@ -161,6 +161,15 @@ def ask_liquidity_usdc(asset: str, depth_levels: int = 5) -> float:
     return sum(price * size for price, size in top)
 
 
+def ask_liquidity_upto(asset: str, max_price: float) -> float:
+    """Сумма price*size по уровням asks не дороже max_price — столько можно
+    купить FOK-ордером с этим потолком."""
+    b = _books.get(asset)
+    if not b or not b.get("asks"):
+        return 0.0
+    return sum(price * size for price, size in b["asks"].items() if price <= max_price + 1e-9)
+
+
 def book_imbalance(asset: str, depth_levels: int = 10) -> float | None:
     """
     Дисбаланс стакана: доля объёма на покупку (bid) от общего объёма

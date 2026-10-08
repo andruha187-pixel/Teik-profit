@@ -43,6 +43,9 @@ class OrderBookSnapshot:
     ask_liquidity_usdc: float  # сумма price*size по верхним уровням asks
     tick_size: float = 0.01
     source: str = "rest"       # "ws" (живой стакан) или "rest" (фолбэк)
+    # Уровни asks [(цена, размер), ...] по возрастанию цены — только у REST-
+    # снимка (у WS их берём из book_stream). Нужны для fillable_usdc.
+    asks: list | None = None
 
 
 async def _get_client():
@@ -115,7 +118,7 @@ async def get_orderbook(token_id: str, depth_levels: int = 5) -> OrderBookSnapsh
     tick = float(tick_raw) if tick_raw else 0.01
 
     return OrderBookSnapshot(best_bid=best_bid, best_ask=best_ask, ask_liquidity_usdc=ask_liquidity,
-                              tick_size=tick, source="rest")
+                              tick_size=tick, source="rest", asks=asks)
 
 
 async def get_orderbook_cached(token_id: str, depth_levels: int = 5) -> OrderBookSnapshot:
@@ -133,6 +136,18 @@ async def get_orderbook_cached(token_id: str, depth_levels: int = 5) -> OrderBoo
             return OrderBookSnapshot(best_bid=best_bid, best_ask=best_ask,
                                       ask_liquidity_usdc=liquidity, tick_size=tick, source="ws")
     return await get_orderbook(token_id, depth_levels)
+
+
+def fillable_usdc(token_id: str, max_price: float, book: OrderBookSnapshot) -> float:
+    """Сколько USDC реально можно купить FOK-ордером с потолком max_price:
+    сумма price*size по уровням asks не дороже потолка. Берём уровни из того
+    же снимка, что уже получен (REST) или из живого WS-стакана — без лишнего
+    запроса в момент входа."""
+    if book.asks is not None:
+        return sum(price * size for price, size in book.asks if price <= max_price + 1e-9)
+    if book.source == "ws":
+        return book_stream.ask_liquidity_upto(token_id, max_price)
+    return book.ask_liquidity_usdc
 
 
 def round_price_for_buy(price: float, tick_size: float) -> float:

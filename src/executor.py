@@ -1,14 +1,16 @@
 """
 Исполнение решений стратегии + учёт открытых позиций и их резолюции.
-Управление капиталом: не больше MAX_OPEN_POSITIONS одновременно, стоп по
-дневному лимиту убытков (стоп-лосс, настраивается кнопкой в Telegram) —
-при достижении лимита новые входы блокируются до следующего дня.
+Управление капиталом: не больше max_open_positions реальных позиций в ещё
+идущих рынках одновременно (⚙️ Настройки), стоп по дневному лимиту убытков
+(стоп-лосс, настраивается кнопкой в Telegram) — при достижении лимита новые
+входы блокируются до следующего дня. Каждый сигнал, который не стал сделкой,
+учитывается с причиной в src/diagnostics.py («🔎 Почему нет сделок»).
 """
 from __future__ import annotations
 import time
 
 from config import settings
-from src import storage, polymarket_client, telegram_notify, book_stream, runtime_state, loss_stats
+from src import storage, polymarket_client, telegram_notify, book_stream, runtime_state, loss_stats, diagnostics
 from src.market_discovery import ActiveMarket, get_resolution
 from src.strategy import Decision
 
@@ -67,6 +69,7 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
     if not decision.should_enter:
         return
     if runtime_state.get("paused"):
+        diagnostics.record_skip(market.slug, market.asset, "paused")
         return
     if storage.get_open_trade_for_market(market.slug):
         return  # уже есть позиция в этом рынке
@@ -84,17 +87,21 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
                     f"реальные входы заблокированы до конца дня (DRY-монеты продолжают). "
                     f"Поменять лимит можно в 🛑 Стоп-лосс в меню."
                 )
+            diagnostics.record_skip(market.slug, market.asset, "daily")
             return
-        if storage.count_open_trades(live_only=True) >= settings.MAX_OPEN_POSITIONS:
+        if storage.count_open_trades(live_only=True, running_only=True) >= runtime_state.get("max_open_positions"):
             # Общий потолок РЕАЛЬНЫХ позиций по всем активам разом — при
             # нескольких потоках несколько сигналов могут совпасть по времени.
-            # Виртуальные сделки DRY-монет место не занимают.
+            # Виртуальные сделки DRY-монет место не занимают; позиции в уже
+            # закончившихся рынках (ждут резолюции) — тоже.
+            diagnostics.record_skip(market.slug, market.asset, "cap")
             return
 
     # Ставка и диапазон — свои у монеты (⚙️ в 🪙 Активах), иначе общие
     base_size = runtime_state.compute_trade_size(market.asset)
     range_min, range_max = runtime_state.entry_range(market.asset)
     if base_size <= 0:
+        diagnostics.record_skip(market.slug, market.asset, "no_bank")
         return  # банк в режиме % исчерпан — ставить нечего
     score_threshold = runtime_state.get("safety_score_threshold")
     if runtime_state.get("size_scaling_enabled"):
@@ -116,17 +123,6 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
     # одной сделки — у всех сигналов book_source был "rest". Теперь берём
     # стакан так же, как стратегия: WS, если свежий, иначе REST.
     book = await polymarket_client.get_orderbook_cached(token_id, depth_levels=10)
-    available_liquidity = book.ask_liquidity_usdc
-    if available_liquidity < settings.MIN_VIABLE_TRADE_USDC:
-        if market.slug not in _liquidity_skip_notified:
-            _liquidity_skip_notified.add(market.slug)
-            await _notify(market.asset, dry_run,
-                f"⚠️ Сигнал по {market.slug} пропущен: в стакане всего "
-                f"{available_liquidity:.2f} USDC (источник: {book.source})."
-            )
-        return
-    if available_liquidity < trade_size:
-        trade_size = round(available_liquidity * 0.9, 2)
 
     # Между тем, как strategy.evaluate() прочитала ask, и моментом реальной
     # отправки ордера проходит какое-то время (сеть + подпись). Даём себе
@@ -145,6 +141,23 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
         range_max,
     )
     execution_price = polymarket_client.round_price_for_buy(raw_cap, tick)
+
+    # Ликвидность считаем только по уровням НЕ дороже потолка: FOK-ордер
+    # исполняется целиком или никак, а раньше в расчёт шли все 10 уровней
+    # стакана, в том числе дороже потолка. На тонких стаканах (DOGE, HYPE) и
+    # на сигналах по 0.95 ордер на полную ставку тогда отменялся.
+    available_liquidity = polymarket_client.fillable_usdc(token_id, execution_price, book)
+    if available_liquidity < settings.MIN_VIABLE_TRADE_USDC:
+        diagnostics.record_skip(market.slug, market.asset, "liquidity")
+        if market.slug not in _liquidity_skip_notified:
+            _liquidity_skip_notified.add(market.slug)
+            await _notify(market.asset, dry_run,
+                f"⚠️ Сигнал по {market.slug} пропущен: в стакане по цене до {execution_price:.2f} всего "
+                f"{available_liquidity:.2f} USDC (источник: {book.source})."
+            )
+        return
+    if available_liquidity < trade_size:
+        trade_size = round(available_liquidity * 0.9, 2)
 
     status = "DRY_RUN"
     order_id = "dry-run"
@@ -168,6 +181,7 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
                 # один раз, не зацикливаемся.
                 retry_size = round(trade_size * 0.5, 2)
                 if retry_size < settings.MIN_VIABLE_TRADE_USDC:
+                    diagnostics.record_skip(market.slug, market.asset, "liquidity")
                     await telegram_notify.notify(
                         f"⚠️ Сигнал по {market.slug} пропущен: не хватило ликвидности в стакане "
                         f"даже для уменьшенного объёма (FOK отменил ордер)."
@@ -177,12 +191,14 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
                     resp = await polymarket_client.place_buy_order(token_id, execution_price, retry_size, tick)
                     trade_size = retry_size
                 except Exception as exc2:  # noqa: BLE001
+                    diagnostics.record_skip(market.slug, market.asset, "liquidity", f"FOK: {exc2}")
                     await telegram_notify.notify(
                         f"⚠️ Сигнал по {market.slug} пропущен: не хватило ликвидности даже после "
                         f"снижения размера до {retry_size:.2f} USDC ({exc2})."
                     )
                     return
             else:
+                diagnostics.record_skip(market.slug, market.asset, "order_error", str(exc))
                 await telegram_notify.notify(f"❌ Ошибка при выставлении ордера: {exc}")
                 return
         order_id = polymarket_client.response_field(resp, "order_id") or polymarket_client.response_field(resp, "orderID") or str(resp)
@@ -230,7 +246,7 @@ async def execute_copytrade(token_id: str, direction: str, slug: str, condition_
     if not dry_run:
         if _daily_loss_exceeded():
             return  # дневной лимит уже сработал — не копируем, пока не настанет новый день
-        if storage.count_open_trades(live_only=True) >= settings.MAX_OPEN_POSITIONS:
+        if storage.count_open_trades(live_only=True, running_only=True) >= runtime_state.get("max_open_positions"):
             return
 
     trade_size = runtime_state.get("copytrade_size_usdc")

@@ -14,6 +14,7 @@ import time
 
 from config import settings
 from src import storage
+from src.timeframes import TIMEFRAMES
 
 # Ключи «своих» настроек монеты (см. asset_overrides ниже)
 RANGE_KEYS = ("min_entry_price", "max_entry_price")
@@ -58,6 +59,16 @@ _DEFAULTS = {
     "max_entry_price": settings.MAX_ENTRY_PRICE,
     # Мин. расстояние цены от страйка, % от цены (0 = выкл) — см. config.py.
     "min_distance_pct": settings.MIN_DISTANCE_PCT,
+    # Окно входа: за сколько минут до конца 5-минутного рынка бот может войти.
+    # Было зашито в профиль таймфрейма (1.0–3.5, пропорция от 15m, ни разу не
+    # проверялось на 5m). Теперь меняется кнопкой в ⚙️ Настройках.
+    "entry_window_min": TIMEFRAMES[0].min_minutes_left,
+    "entry_window_max": TIMEFRAMES[0].max_minutes_left,
+    # Сколько РЕАЛЬНЫХ позиций может быть открыто одновременно (по всем
+    # монетам). Считаются только позиции в ещё идущих рынках: после конца
+    # рынка исход уже не меняется, и слот не должен ждать, пока Gamma API
+    # отметит рынок закрытым.
+    "max_open_positions": settings.MAX_OPEN_POSITIONS,
     # Версия применённого набора рекомендованных настроек (см. RECOMMENDED ниже).
     "preset_version": 0,
     # По умолчанию выключено: каждая прошедшая порог сделка идёт полным
@@ -126,6 +137,9 @@ _CASTERS = {
     "min_entry_price": float,
     "max_entry_price": float,
     "min_distance_pct": float,
+    "entry_window_min": float,
+    "entry_window_max": float,
+    "max_open_positions": int,
     "preset_version": int,
     "size_scaling_enabled": lambda v: str(v).lower() == "true",
     "position_stop_loss_enabled": lambda v: str(v).lower() == "true",
@@ -167,7 +181,16 @@ def init_from_db() -> None:
 # порог 92, так и остались бы). Дальше можно спокойно менять из Telegram —
 # повторно не перезапишутся, пока не поднимем PRESET_VERSION. Кнопка
 # "⭐ Рекомендованные" в ⚙️ Настройках применяет их вручную ещё раз.
-PRESET_VERSION = 1
+PRESET_VERSION = 2
+
+# v2 (08.10): окно входа 1.0–4.5 мин вместо 1.0–3.5. История BTC 5m 25.09–06.10
+# (2447 рынков): 28 входов в день вместо 23, прибыль на ту же ставку +40%,
+# лучше в 9 днях из 11; добавочные входы — 2 проигрыша при 5.2 ожидаемых.
+# Проверка на новых данных 06.10–08.10 (7 монет, 3638 рынков, в подборе не
+# участвовали): 96 входов вместо 62, 3 проигрыша при 6.5 ожидаемых против
+# 4 при 4.2; добавочные 42 входа — 0 проигрышей при 2.7 ожидаемых.
+RECOMMENDED_WINDOW = (1.0, 4.5)
+_OLD_DEFAULT_WINDOW_MAX = 3.5
 
 
 def recommended() -> dict:
@@ -176,6 +199,8 @@ def recommended() -> dict:
         "min_entry_price": 0.90,
         "max_entry_price": 0.95,
         "min_distance_pct": settings.MIN_DISTANCE_PCT,
+        "entry_window_min": RECOMMENDED_WINDOW[0],
+        "entry_window_max": RECOMMENDED_WINDOW[1],
         # Хедж вынесен в отдельный бот; здесь он тратил бы тот же кошелёк
         # и в LIVE покупал бы по $5 на каждом рынке, где цена прошла 0.70.
         "hedge_bot_enabled": False,
@@ -190,9 +215,17 @@ def apply_recommended() -> dict:
 
 
 def _apply_preset_if_new() -> None:
-    if int(_state.get("preset_version") or 0) >= PRESET_VERSION:
+    current = int(_state.get("preset_version") or 0)
+    if current >= PRESET_VERSION:
         return
-    apply_recommended()
+    if current < 1:
+        apply_recommended()          # новая база — весь набор
+    else:
+        # База уже настроена из Telegram — порог, диапазон и прочее не трогаем,
+        # меняем только окно входа, и только если оно старое по умолчанию.
+        if abs(float(_state.get("entry_window_max") or 0) - _OLD_DEFAULT_WINDOW_MAX) < 1e-9:
+            set("entry_window_min", RECOMMENDED_WINDOW[0])
+            set("entry_window_max", RECOMMENDED_WINDOW[1])
     set("preset_version", PRESET_VERSION)
 
 
@@ -210,6 +243,24 @@ def set(key: str, value) -> None:
 
 def snapshot() -> dict:
     return dict(_state)
+
+
+# --- Окно входа ---
+
+ENTRY_WINDOW_LIMITS = (0.5, 4.9)   # 5-минутный рынок: не раньше 4.9 и не позже 0.5 мин до конца
+
+
+def entry_window() -> tuple[float, float]:
+    """(минимум, максимум) минут до конца рынка, когда разрешён вход."""
+    return float(get("entry_window_min")), float(get("entry_window_max"))
+
+
+def set_entry_window(lo: float, hi: float) -> tuple[float, float]:
+    lo = round(max(ENTRY_WINDOW_LIMITS[0], min(lo, ENTRY_WINDOW_LIMITS[1] - 0.5)), 2)
+    hi = round(min(ENTRY_WINDOW_LIMITS[1], max(hi, lo + 0.5)), 2)
+    set("entry_window_min", lo)
+    set("entry_window_max", hi)
+    return lo, hi
 
 
 # --- Включение/выключение отдельных активов ---

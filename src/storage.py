@@ -342,17 +342,44 @@ def get_open_trade_for_market(market_slug: str):
         return cur.fetchone()
 
 
-def count_open_trades(live_only: bool = False) -> int:
+_INTERVAL_SEC = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400}
+
+
+def market_end_ts(slug: str) -> int | None:
+    """'btc-updown-5m-1791306300' -> 1791306600 (начало окна + длина). None,
+    если слаг другого формата."""
+    try:
+        _asset, label = parse_market_slug(slug)
+        start = int(slug.rsplit("-", 1)[1])
+    except (ValueError, IndexError, AttributeError):
+        return None
+    interval = _INTERVAL_SEC.get(label)
+    return start + interval if interval else None
+
+
+def count_open_trades(live_only: bool = False, running_only: bool = False, now: float | None = None) -> int:
     """Общее число сейчас открытых позиций по ВСЕМ активам/таймфреймам —
-    используется для общего лимита MAX_OPEN_POSITIONS (см. executor.py).
+    используется для общего лимита позиций (см. executor.py).
     live_only=True — только реальные: виртуальные (DRY) сделки монет в
-    режиме DRY не должны занимать место реальных."""
+    режиме DRY не должны занимать место реальных.
+    running_only=True — только позиции в рынках, которые ещё идут. Отчёты
+    07.10 показали: рынок закончился, исход уже не меняется, а Gamma API
+    отмечает его закрытым через несколько минут — и всё это время позиция
+    занимала слот, а сигналы других монет пропускались."""
     with _conn() as conn:
-        q = "SELECT COUNT(*) FROM trades WHERE outcome IS NULL"
+        q = "SELECT market_slug FROM trades WHERE outcome IS NULL"
         if live_only:
             q += " AND dry_run = 0"
-        cur = conn.execute(q)
-        return cur.fetchone()[0]
+        slugs = [row[0] for row in conn.execute(q).fetchall()]
+    if not running_only:
+        return len(slugs)
+    now = time.time() if now is None else now
+    count = 0
+    for slug in slugs:
+        end = market_end_ts(slug)
+        if end is None or end > now:   # формат неизвестен — считаем, как раньше
+            count += 1
+    return count
 
 
 def parse_market_slug(slug: str) -> tuple[str, str]:
@@ -568,6 +595,17 @@ def get_signals_since(since_ts: int) -> list[tuple]:
         cols = ", ".join(SIGNALS_COLUMNS)
         cur = conn.execute(f"SELECT {cols} FROM signals WHERE ts >= ? ORDER BY ts ASC", (since_ts,))
         return cur.fetchall()
+
+
+def last_trade() -> tuple[str, int] | None:
+    """(market_slug, ts) последней сделки бота по своим сигналам — для
+    «🔎 Почему нет сделок»."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT market_slug, ts FROM trades WHERE COALESCE(source, 'strategy') = 'strategy' "
+            "ORDER BY ts DESC LIMIT 1"
+        ).fetchone()
+    return (row[0], int(row[1])) if row else None
 
 
 def get_trades_since(since_ts: int) -> list[tuple]:

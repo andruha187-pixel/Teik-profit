@@ -15,7 +15,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKe
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
 from config import settings
-from src import storage, runtime_state, loss_stats
+from src import storage, runtime_state, loss_stats, diagnostics
 
 _app: Application | None = None
 _state_ref: dict = {}  # заполняется из main.py: последний сигнал/статус для меню
@@ -27,6 +27,9 @@ POSITION_SL_PRESETS = [20, 30, 50, 70]
 SCORE_PRESETS = [75, 85, 88, 92]
 # Мин. расстояние от страйка, % от цены (0 = выкл). Для BTC ~84k: 0.05% ≈ $42, 0.07% ≈ $59, 0.10% ≈ $84.
 DISTANCE_PRESETS = [0.0, 0.05, 0.07, 0.10]
+# Окно входа (минут до конца рынка). 1–4.5 — рекомендованное по отчётам 25.09–08.10.
+WINDOW_PRESETS = [(1.0, 3.5), (1.0, 4.0), (1.0, 4.5)]
+MAX_POS_PRESETS = [2, 3, 4, 6]
 
 
 def set_state_ref(state: dict) -> None:
@@ -138,9 +141,17 @@ def _settings_text() -> str:
         if scaling_on else
         "Масштабирование выключено — любая прошедшая порог сделка идёт полным размером."
     )
+    lo, hi = runtime_state.entry_window()
     return (
         f"⚙️ Safety score порог: {runtime_state.get('safety_score_threshold'):.0f}\n"
         "Чем выше — тем реже и осторожнее входы.\n\n"
+        f"⏱ Окно входа: за {lo:g}–{hi:g} мин до конца рынка.\n"
+        "Шире окно — больше входов. 1–4.5 вместо 1–3.5 на истории 25.09–06.10 дало "
+        "28 входов в день вместо 23 и +40% прибыли на ту же ставку; на новых данных "
+        "06–08.10 добавочные входы были без проигрышей.\n\n"
+        f"📦 Реальных позиций одновременно: до {runtime_state.get('max_open_positions')}\n"
+        "Считаются только позиции в ещё идущих рынках. Монеты двигаются вместе, "
+        "поэтому больше позиций — больше проигрышей разом в плохие 5 минут.\n\n"
         f"📏 Мин. расстояние от страйка: {_distance_summary()}\n"
         "Не входить, если цена ближе к страйку, чем этот % от цены.\n\n"
         + scaling_line
@@ -180,6 +191,8 @@ def _main_menu_text() -> str:
         f"Стоп-лосс позиции: {'вкл ' + str(round(runtime_state.get('position_stop_loss_pct'))) + '%' if pos_sl_on else 'выкл'}",
         f"Safety score порог: {runtime_state.get('safety_score_threshold'):.0f}",
         f"Диапазон входа: {_range_text()}",
+        f"Окно входа: за {runtime_state.entry_window()[0]:g}–{runtime_state.entry_window()[1]:g} мин до конца | "
+        f"позиций до {runtime_state.get('max_open_positions')}",
         f"Мин. расстояние от страйка: {_distance_summary()}",
     ]
     own = _overrides_summary()
@@ -217,6 +230,7 @@ def _main_menu_markup() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📊 Статистика", callback_data="stats"),
             InlineKeyboardButton("⚙️ Настройки", callback_data="menu:settings"),
         ],
+        [InlineKeyboardButton("🔎 Почему нет сделок", callback_data="why")],
         [InlineKeyboardButton(
             "🔴 Включить LIVE" if runtime_state.get("dry_run") else "🧪 Переключить в DRY RUN",
             callback_data="mode_toggle",
@@ -650,6 +664,20 @@ def _settings_menu_markup() -> InlineKeyboardMarkup:
     rows.append([
         InlineKeyboardButton("−1", callback_data="score_delta:-1"),
         InlineKeyboardButton("+1", callback_data="score_delta:+1"),
+    ])
+    rows.append([InlineKeyboardButton("— ⏱ Окно входа, мин до конца —", callback_data="noop")])
+    wlo, whi = runtime_state.entry_window()
+    rows.append([
+        InlineKeyboardButton(("✅ " if abs(a - wlo) < 1e-6 and abs(b - whi) < 1e-6 else "") + f"{a:g}–{b:g}"
+                             + (" ⭐" if (a, b) == runtime_state.RECOMMENDED_WINDOW else ""),
+                             callback_data=f"win_set:{a}:{b}")
+        for a, b in WINDOW_PRESETS
+    ])
+    rows.append([InlineKeyboardButton("— 📦 Реальных позиций одновременно —", callback_data="noop")])
+    cur_pos = runtime_state.get("max_open_positions")
+    rows.append([
+        InlineKeyboardButton(("✅ " if n == cur_pos else "") + str(n), callback_data=f"maxpos_set:{n}")
+        for n in MAX_POS_PRESETS
     ])
     rows.append([InlineKeyboardButton("— 📏 Мин. расстояние от страйка —", callback_data="noop")])
     cur_dist = runtime_state.get("min_distance_pct") or 0.0
@@ -1338,6 +1366,40 @@ async def _on_callback_inner(update: Update, context: ContextTypes.DEFAULT_TYPE)
     elif data == "menu:settings":
         await query.edit_message_text(_settings_text(), reply_markup=_settings_menu_markup())
 
+    elif data.startswith("win_set:"):
+        try:
+            _p, a, b = data.split(":")
+            runtime_state.set_entry_window(float(a), float(b))
+        except ValueError:
+            return
+        await query.edit_message_text("✅ " + _settings_text(), reply_markup=_settings_menu_markup())
+
+    elif data.startswith("maxpos_set:"):
+        try:
+            n = int(data.split(":", 1)[1])
+        except ValueError:
+            return
+        runtime_state.set("max_open_positions", max(1, min(n, 10)))
+        await query.edit_message_text("✅ " + _settings_text(), reply_markup=_settings_menu_markup())
+
+    elif data == "why":
+        await query.edit_message_text(
+            diagnostics.why_text(),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Обновить", callback_data="why_refresh")],
+                [InlineKeyboardButton("◀️ Назад", callback_data="menu:main")],
+            ]),
+        )
+
+    elif data == "why_refresh":
+        await query.edit_message_text(
+            diagnostics.why_text(),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Обновить", callback_data="why")],
+                [InlineKeyboardButton("◀️ Назад", callback_data="menu:main")],
+            ]),
+        )
+
     elif data.startswith("dist_set:"):
         runtime_state.set("min_distance_pct", float(data.split(":", 1)[1]))
         await query.edit_message_text("✅ " + _settings_text(), reply_markup=_settings_menu_markup())
@@ -1355,7 +1417,8 @@ async def _on_callback_inner(update: Update, context: ContextTypes.DEFAULT_TYPE)
         own = _overrides_summary()
         await query.edit_message_text(
             "⭐ Применены рекомендованные настройки: порог 88, диапазон "
-            f"{_range_text()}.\n"
+            f"{_range_text()}, окно входа {runtime_state.entry_window()[0]:g}–"
+            f"{runtime_state.entry_window()[1]:g} мин.\n"
             + (f"Свои настройки монет не тронуты: {own}.\n" if own else "")
             + "\n" + _settings_text(),
             reply_markup=_settings_menu_markup(),
