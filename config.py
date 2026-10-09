@@ -40,7 +40,22 @@ class Settings:
     # Фьючерсный хост — фолбэк для монет без спотовой пары на Binance (HYPE
     # на споте под вопросом на момент написания; на фьючерсах есть точно).
     BINANCE_FUTURES_URL: str = os.getenv("BINANCE_FUTURES_URL", "https://fapi.binance.com")
+    # Цена потоком (WebSocket, сделки aggTrade) — для быстрой проверки сигнала,
+    # см. src/price_stream.py. Фьючерсные потоки Binance с 23.04.2026 живут
+    # по адресу /market (старый wss://fstream.binance.com/stream отключён).
+    BINANCE_WS_URL: str = os.getenv("BINANCE_WS_URL", "wss://stream.binance.com:443")
+    BINANCE_FUTURES_WS_URL: str = os.getenv("BINANCE_FUTURES_WS_URL", "wss://fstream.binance.com/market")
     ATR_LOOKBACK_FOR_REGIME: int = _get_int("ATR_LOOKBACK_FOR_REGIME", 60)
+
+    # --- Быстрая проверка сигнала (src/fast_signal.py) ---
+    # Кроме обычной проверки раз в 3 с (REST-свечи Binance + стакан) бот раз в
+    # FAST_LOOP_INTERVAL_SEC проверяет сигнал по данным в памяти: цена Binance
+    # из потока, живой стакан Polymarket, свечи из последнего запроса. По
+    # отчётам 25.09–08.10 у 32% рынков с сигналом условия входа держались не
+    # дольше одной 3-секундной проверки. Включается/выключается и в Telegram
+    # (⚙️ Настройки → ⚡ Быстрый вход).
+    FAST_ENTRY_ENABLED: bool = _get_bool("FAST_ENTRY_ENABLED", True)
+    FAST_LOOP_INTERVAL_SEC: float = _get_float("FAST_LOOP_INTERVAL_SEC", 0.3)
 
     # --- Polymarket / CLOB ---
     POLY_HOST: str = os.getenv("POLY_HOST", "https://clob.polymarket.com")
