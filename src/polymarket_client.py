@@ -24,6 +24,7 @@ Polymarket) — если после обновления вылезет что-�
 в самом боте. Перед LIVE обязательно прогони scripts/test_live_order.py.
 """
 from __future__ import annotations
+import inspect
 import math
 import time
 from dataclasses import dataclass
@@ -121,20 +122,31 @@ async def get_orderbook(token_id: str, depth_levels: int = 5) -> OrderBookSnapsh
                               tick_size=tick, source="rest", asks=asks)
 
 
+def ws_snapshot(token_id: str, depth_levels: int = 5,
+                max_age_ms: int = book_stream.MAX_BOOK_AGE_MS) -> OrderBookSnapshot | None:
+    """Стакан только из живого WS-кэша, без запроса. None — если по токену
+    нет свежего стакана или в нём нет asks. Быстрая проверка сигнала
+    (src/fast_signal.py) зовёт это до трёх раз в секунду на монету, поэтому
+    в REST отсюда не ходим никогда."""
+    if not book_stream.is_fresh(token_id, max_age_ms):
+        return None
+    best_ask = book_stream.best_ask(token_id)
+    if best_ask is None:
+        return None
+    return OrderBookSnapshot(best_bid=book_stream.best_bid(token_id), best_ask=best_ask,
+                             ask_liquidity_usdc=book_stream.ask_liquidity_usdc(token_id, depth_levels),
+                             tick_size=book_stream.tick_size(token_id), source="ws")
+
+
 async def get_orderbook_cached(token_id: str, depth_levels: int = 5) -> OrderBookSnapshot:
     """
     Стакан "из прогрева": сначала смотрим в живой WS-кэш (book_stream) — там
     цена обновляется пушем с сервера без дополнительного сетевого раунд-трипа
     в момент принятия решения. Если кэш пуст или протух — падаем в REST.
     """
-    if book_stream.is_fresh(token_id):
-        best_ask = book_stream.best_ask(token_id)
-        best_bid = book_stream.best_bid(token_id)
-        liquidity = book_stream.ask_liquidity_usdc(token_id, depth_levels)
-        tick = book_stream.tick_size(token_id)
-        if best_ask is not None:
-            return OrderBookSnapshot(best_bid=best_bid, best_ask=best_ask,
-                                      ask_liquidity_usdc=liquidity, tick_size=tick, source="ws")
+    snap = ws_snapshot(token_id, depth_levels)
+    if snap is not None:
+        return snap
     return await get_orderbook(token_id, depth_levels)
 
 
@@ -185,14 +197,18 @@ async def prewarm_transport() -> bool:
         return False
 
 
-async def place_buy_order(token_id: str, price_cap: float, amount_usdc: float, tick_size: float = 0.01) -> dict:
+async def place_buy_order(token_id: str, price_cap: float, amount_usdc: float, tick_size: float = 0.01,
+                          order_type: str = "FOK") -> dict:
     """
-    Market-ордер BUY с исполнением FOK (Fill-Or-Kill) — либо полностью
-    исполняется прямо сейчас, либо целиком отменяется. amount_usdc — это
-    ДОЛЛАРОВАЯ сумма к трате (для BUY market-ордеров в этом SDK amount — это
-    USD-номинал, а не количество акций — конвертация не нужна). max_price
-    задаёт худшую допустимую цену исполнения (защита от слиппеджа) —
-    именно так называется параметр в этом SDK, не "price".
+    Market-ордер BUY. amount_usdc — ДОЛЛАРОВАЯ сумма к трате (для BUY
+    market-ордеров в этом SDK amount — USD-номинал до комиссии, а не
+    количество акций). max_price — худшая допустимая цена исполнения:
+    с ним SDK ставит ордер ровно по этой цене и не запрашивает стакан.
+
+    order_type:
+      "FOK" — всё или ничего (так работают хедж и копитрейдинг);
+      "FAK" — исполнить сколько есть по цене не хуже потолка, остаток
+              отменить (так входит стратегия — см. executor._execute_live_buy).
     """
     client = await _get_client()
     return await client.place_market_order(
@@ -200,8 +216,72 @@ async def place_buy_order(token_id: str, price_cap: float, amount_usdc: float, t
         side="BUY",
         amount=str(round(amount_usdc, 2)),
         max_price=str(price_cap),
-        order_type="FOK",
+        order_type=order_type,
     )
+
+
+def filled_amounts(resp) -> tuple[float, float] | None:
+    """(USDC потрачено, акций получено) из ответа на BUY-ордер: makingAmount /
+    takingAmount (в SDK — making_amount / taking_amount). None — если сумм в
+    ответе нет или они не числа."""
+    making = _field(resp, "making_amount")
+    if making is None:
+        making = _field(resp, "makingAmount")
+    taking = _field(resp, "taking_amount")
+    if taking is None:
+        taking = _field(resp, "takingAmount")
+    try:
+        return float(making), float(taking)
+    except (TypeError, ValueError):
+        return None
+
+
+_NO_FILL_MARKERS = ("fully filled", "no orders found", "no match", "insufficientliquidity",
+                    "insufficient liquidity", "couldn't be", "could not be", "fok order", "fak order")
+
+
+def is_no_fill_error(exc: BaseException) -> bool:
+    """Ордер отклонён, потому что по нашей цене в стакане уже нечего купить
+    (цена ушла, заявки сняли) — такое имеет смысл повторить по свежему
+    стакану. Ошибки баланса, подписи и т.п. повторять бессмысленно."""
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(marker in text for marker in _NO_FILL_MARKERS)
+
+
+_warmed_tokens: set[str] = set()
+
+
+async def prewarm_market(token_ids: list[str]) -> int:
+    """Прогрев рынка в SDK для токенов нового окна. Перед первым ордером по
+    токену SDK запрашивает метаданные рынка (шаг цены, тип рынка, комиссию) —
+    лишний сетевой запрос ровно в момент сигнала, а 5m-рынок новый каждые
+    5 минут. create_market_order подписывает ордер локально и НЕ отправляет
+    его, но по пути кладёт метаданные в кэш SDK. Ошибки игнорируем: прогрев
+    необязателен."""
+    if not settings.POLY_PRIVATE_KEY:
+        return 0
+    try:
+        client = await _get_client()
+    except Exception:  # noqa: BLE001
+        return 0
+    create = getattr(client, "create_market_order", None)
+    if create is None:
+        return 0
+    if len(_warmed_tokens) > 5000:
+        _warmed_tokens.clear()
+    warmed = 0
+    for token_id in token_ids:
+        if not token_id or token_id in _warmed_tokens:
+            continue
+        _warmed_tokens.add(token_id)
+        try:
+            res = create(token_id=token_id, side="BUY", amount="5", max_price="0.5", order_type="FAK")
+            if inspect.isawaitable(res):
+                await res
+            warmed += 1
+        except Exception:  # noqa: BLE001
+            pass
+    return warmed
 
 
 async def place_sell_order(token_id: str, shares: float, min_price: float | None = None) -> dict:

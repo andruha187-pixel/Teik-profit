@@ -34,6 +34,16 @@ def symbol_for(asset: str) -> str:
     return SYMBOL_MAP.get(asset.lower(), f"{asset.upper()}USDT")
 
 
+# Где у символа реально нашлись свечи: "spot" или "futures" (HYPE). Поток
+# цены (src/price_stream.py) берёт сделки с той же площадки, иначе цена из
+# потока и свечи были бы с разных рынков.
+_venue: dict[str, str] = {}
+
+
+def venue_for(symbol: str) -> str:
+    return _venue.get(symbol.upper(), "spot")
+
+
 async def _get_klines_from(base_url: str, symbol: str, interval: str, limit: int,
                             start_time_ms: int | None) -> pd.DataFrame:
     params = {"symbol": symbol, "interval": interval, "limit": limit}
@@ -56,9 +66,13 @@ async def get_klines(symbol: str, limit: int = 100, interval: str = "1m",
                       start_time_ms: int | None = None) -> pd.DataFrame:
     """Тянем свечи с Binance; при ошибке на споте пробуем фьючерсы тем же символом."""
     try:
-        return await _get_klines_from(settings.BINANCE_BASE_URL, symbol, interval, limit, start_time_ms)
+        df = await _get_klines_from(settings.BINANCE_BASE_URL, symbol, interval, limit, start_time_ms)
+        _venue[symbol.upper()] = "spot"
+        return df
     except httpx.HTTPStatusError:
-        return await _get_klines_from(settings.BINANCE_FUTURES_URL, symbol, interval, limit, start_time_ms)
+        df = await _get_klines_from(settings.BINANCE_FUTURES_URL, symbol, interval, limit, start_time_ms)
+        _venue[symbol.upper()] = "futures"
+        return df
 
 
 async def get_price_at(symbol: str, timestamp_sec: int) -> float:

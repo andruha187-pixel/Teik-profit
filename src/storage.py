@@ -188,6 +188,10 @@ _SIGNALS_MIGRATIONS = [
     ("timeframe", "TEXT"),
     ("macd_histogram", "REAL"),
     ("macd_bullish", "INTEGER"),
+    # Какая проверка записала тик: "slow" — обычная раз в 3 с (REST-свечи),
+    # "fast" — быстрая (цена Binance из потока, см. src/fast_signal.py; пишет
+    # только тики с сигналом, не чаще раза в 3 с на рынок).
+    ("tick_source", "TEXT"),
 ]
 
 _TRADES_MIGRATIONS = [
@@ -201,6 +205,8 @@ _TRADES_MIGRATIONS = [
     ("safety_score", "REAL"),
     ("range_min", "REAL"),
     ("range_max", "REAL"),
+    # Какая проверка нашла сигнал: "slow" (раз в 3 с) или "fast" (быстрая)
+    ("entry_path", "TEXT"),
 ]
 
 
@@ -237,7 +243,8 @@ def init_db():
 
 
 def log_signal(market_slug: str, current_price: float, strike_price: float, decision,
-               indicators: dict | None = None, up_book=None, down_book=None) -> None:
+               indicators: dict | None = None, up_book=None, down_book=None,
+               tick_source: str = "slow") -> None:
     """
     indicators/up_book/down_book необязательны (обратная совместимость), но
     без них отчёт для анализа будет неполным — main.py всегда должен их
@@ -253,8 +260,8 @@ def log_signal(market_slug: str, current_price: float, strike_price: float, deci
                 atr, atr_ratio_to_avg, ema_fast, ema_slow, ema_fast_slope, trend_up,
                 time_score, distance_score, trend_score, vol_score, liq_score,
                 ask_liquidity_usdc, up_best_ask, down_best_ask, book_source, asset, timeframe,
-                macd_histogram, macd_bullish)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                macd_histogram, macd_bullish, tick_source)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 int(time.time()), market_slug, current_price, strike_price, decision.direction,
                 decision.entry_price, decision.safety_score, decision.minutes_left,
@@ -273,6 +280,7 @@ def log_signal(market_slug: str, current_price: float, strike_price: float, deci
                 asset, timeframe_label,
                 indicators.get("macd_histogram"),
                 int(indicators.get("macd_bullish")) if indicators.get("macd_bullish") is not None else None,
+                tick_source,
             ),
         )
 
@@ -305,17 +313,17 @@ def log_trade(market_slug: str, condition_id: str, direction: str, entry_price: 
               size_usdc: float, order_id: str, status: str, dry_run: bool, token_id: str = "",
               source: str = "strategy", signal_ask: float | None = None,
               safety_score: float | None = None, range_min: float | None = None,
-              range_max: float | None = None) -> int:
+              range_max: float | None = None, entry_path: str | None = None) -> int:
     with _conn() as conn:
         cur = conn.execute(
             """INSERT INTO trades
                (ts, market_slug, condition_id, direction, entry_price, size_usdc,
                 order_id, status, outcome, pnl_usdc, dry_run, token_id, source,
-                signal_ask, safety_score, range_min, range_max)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?)""",
+                signal_ask, safety_score, range_min, range_max, entry_path)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (int(time.time()), market_slug, condition_id, direction, entry_price,
              size_usdc, order_id, status, int(dry_run), token_id, source,
-             signal_ask, safety_score, range_min, range_max),
+             signal_ask, safety_score, range_min, range_max, entry_path),
         )
         return cur.lastrowid
 
@@ -523,13 +531,13 @@ SIGNALS_COLUMNS = [
     "atr", "atr_ratio_to_avg", "ema_fast", "ema_slow", "ema_fast_slope", "trend_up",
     "time_score", "distance_score", "trend_score", "vol_score", "liq_score",
     "ask_liquidity_usdc", "up_best_ask", "down_best_ask", "book_source", "outcome",
-    "macd_histogram", "macd_bullish",
+    "macd_histogram", "macd_bullish", "tick_source",
 ]
 
 TRADES_COLUMNS = [
     "id", "ts", "market_slug", "condition_id", "direction", "entry_price", "size_usdc",
     "order_id", "status", "outcome", "pnl_usdc", "dry_run", "token_id", "source",
-    "signal_ask", "safety_score", "range_min", "range_max",
+    "signal_ask", "safety_score", "range_min", "range_max", "entry_path",
 ]
 
 

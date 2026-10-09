@@ -154,6 +154,11 @@ def _settings_text() -> str:
         "поэтому больше позиций — больше проигрышей разом в плохие 5 минут.\n\n"
         f"📏 Мин. расстояние от страйка: {_distance_summary()}\n"
         "Не входить, если цена ближе к страйку, чем этот % от цены.\n\n"
+        f"⚡ Быстрый вход: {'вкл' if runtime_state.get('fast_entry_enabled') else 'выкл'}\n"
+        f"Кроме проверки раз в 3 с бот раз в {max(0.1, settings.FAST_LOOP_INTERVAL_SEC):g} с проверяет сигнал "
+        "по цене Binance из потока и живому стакану — те же условия входа, без запросов. "
+        "У трети рынков с сигналом вход держался не дольше одной 3-секундной проверки; "
+        "по отчётам это примерно +10% входов.\n\n"
         + scaling_line
     )
 
@@ -168,6 +173,15 @@ def _assets_modes_line() -> str:
         f"{a.upper()} {_MODE_ICON[runtime_state.asset_mode(a)]}"
         for a in settings.ASSETS if runtime_state.is_asset_enabled(a)
     )
+
+
+def _fast_status_line() -> str:
+    """Состояние быстрой проверки и потока цены Binance (src/fast_signal.py)."""
+    try:
+        from src import fast_signal  # здесь, а не наверху: fast_signal -> executor -> telegram_notify
+        return fast_signal.status_line()
+    except Exception:  # noqa: BLE001 — строка статуса не должна ломать меню
+        return "⚡ Быстрый вход: " + ("вкл" if runtime_state.get("fast_entry_enabled") else "выкл")
 
 
 def _main_menu_text() -> str:
@@ -198,6 +212,7 @@ def _main_menu_text() -> str:
     own = _overrides_summary()
     if own:
         lines.append(f"⚙️ Свои у монет: {own}")
+    lines.append(_fast_status_line())
     if s:
         lines.append("")
         lines.append(f"Потоков активно: {len(s)}")
@@ -688,6 +703,11 @@ def _settings_menu_markup() -> InlineKeyboardMarkup:
         drow.append(InlineKeyboardButton(f"{mark}{label}", callback_data=f"dist_set:{val}"))
     rows.append(drow)
     rows.append([InlineKeyboardButton("✏️ Своё расстояние, %", callback_data="dist_custom")])
+    rows.append([InlineKeyboardButton(
+        "⚡ Быстрый вход: вкл — выключить" if runtime_state.get("fast_entry_enabled")
+        else "⚡ Быстрый вход: выкл — включить",
+        callback_data="fast_toggle",
+    )])
     rows.append([InlineKeyboardButton("⭐ Рекомендованные настройки", callback_data="preset_apply")])
     scaling_on = runtime_state.get("size_scaling_enabled")
     rows.append([InlineKeyboardButton(
@@ -1418,7 +1438,7 @@ async def _on_callback_inner(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_text(
             "⭐ Применены рекомендованные настройки: порог 88, диапазон "
             f"{_range_text()}, окно входа {runtime_state.entry_window()[0]:g}–"
-            f"{runtime_state.entry_window()[1]:g} мин.\n"
+            f"{runtime_state.entry_window()[1]:g} мин, быстрый вход вкл.\n"
             + (f"Свои настройки монет не тронуты: {own}.\n" if own else "")
             + "\n" + _settings_text(),
             reply_markup=_settings_menu_markup(),
@@ -1502,6 +1522,14 @@ async def _on_callback_inner(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_text(
             f"⚙️ Safety score порог: {new_val:.0f}", reply_markup=_settings_menu_markup(),
         )
+
+    elif data == "fast_toggle":
+        new_val = not runtime_state.get("fast_entry_enabled")
+        runtime_state.set("fast_entry_enabled", new_val)
+        msg = ("⚡ Быстрый вход включён — сигнал проверяется и между 3-секундными тиками."
+               if new_val else
+               "⚡ Быстрый вход выключен — сигнал проверяется только раз в 3 с, как раньше.")
+        await query.edit_message_text(msg + "\n\n" + _settings_text(), reply_markup=_settings_menu_markup())
 
     elif data == "scaling_toggle":
         new_val = not runtime_state.get("size_scaling_enabled")

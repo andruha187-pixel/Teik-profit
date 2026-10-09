@@ -7,6 +7,7 @@
 учитывается с причиной в src/diagnostics.py («🔎 Почему нет сделок»).
 """
 from __future__ import annotations
+import asyncio
 import time
 
 from config import settings
@@ -58,16 +59,157 @@ def _scale_trade_size(base_size: float, score: float, threshold: float) -> float
 
 
 _liquidity_skip_notified: set[str] = set()
+
+# Вход в рынок ищут две проверки: обычная раз в 3 с (main.py) и быстрая раз в
+# ~0.3 с (src/fast_signal.py). Обе зовут maybe_enter, а между проверкой «нет
+# открытой сделки» и записью сделки в базу проходит время исполнения ордера —
+# без блокировки на рынок они могли бы купить один рынок дважды.
+_entry_locks: dict[str, asyncio.Lock] = {}
+# Рынок -> время, раньше которого не повторяем вход после неудачного ордера
+# (быстрая проверка иначе слала бы новую серию ордеров каждые 0.3 с).
+_retry_after: dict[str, float] = {}
+ENTRY_RETRY_COOLDOWN_SEC = 1.0
+# Рынки, по которым прямо сейчас исполняется реальный ордер, — занимают слот
+# лимита позиций до записи сделки в базу: иначе два сигнала по разным монетам
+# в одну секунду оба прошли бы проверку лимита.
+_inflight_live: set[str] = set()
+
+
+def _lock_for(slug: str) -> asyncio.Lock:
+    lock = _entry_locks.get(slug)
+    if lock is None:
+        if len(_entry_locks) > 500:
+            for key in [k for k, v in _entry_locks.items() if not v.locked()]:
+                _entry_locks.pop(key, None)
+            for key in [k for k, t in _retry_after.items() if t < time.time()]:
+                _retry_after.pop(key, None)
+        lock = _entry_locks[slug] = asyncio.Lock()
+    return lock
+
+
+def _cool_down(slug: str) -> None:
+    """Не повторять вход по рынку ENTRY_RETRY_COOLDOWN_SEC: ордер не исполнился
+    или вход упёрся в лимит позиций / дневной стоп / пустой стакан. Быстрая
+    проверка иначе повторяла бы то же самое каждые 0.3 с."""
+    _retry_after[slug] = time.time() + ENTRY_RETRY_COOLDOWN_SEC
+
+
+def entry_busy(slug: str, now: float | None = None) -> bool:
+    """По рынку уже идёт вход или недавно не исполнился ордер — новый вход
+    сейчас не начинаем."""
+    lock = _entry_locks.get(slug)
+    if lock is not None and lock.locked():
+        return True
+    return (time.time() if now is None else now) < _retry_after.get(slug, 0.0)
+
+
 # id сделок, по которым уже сообщили о неудачной продаже по стоп-лоссу
 _sl_fail_notified: set[int] = set()
 # день (unix_ts // 86400), за который уже сообщили о дневном стоп-лоссе
 _daily_limit_notified_day: int | None = None
 
 
-async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
-    global _daily_limit_notified_day
+# Попытки исполнить вход: первая по потолку сигнала, следующие — по свежему
+# стакану и только пока цена в диапазоне входа монеты. Раньше после отказа
+# FOK бот повторял ту же цену с половиной ставки: 08.10 в 22:07 отказали оба
+# ордера BTC и BNB ($9 и $4.50) — цена уже ушла, а половина ставки по 0.95
+# ($4.50 = 4.7 акции) даже меньше минимального ордера в 5 акций.
+MAX_FILL_ATTEMPTS = 3
+RETRY_PAUSE_SEC = 0.3
+MIN_ORDER_SHARES = 5.0
+
+
+async def _execute_live_buy(market: ActiveMarket, token_id: str, amount: float, cap: float, tick: float,
+                            range_max: float):
+    """Реальная покупка FAK-ордерами: исполняется всё, что есть в стакане по
+    цене не выше потолка, остаток отменяется — без «всё или ничего». Если
+    исполнилось не всё или ничего — до двух повторов по свежему стакану через
+    0.3 с, пока лучший ask не выше максимума диапазона и до конца рынка
+    больше 45 с. Возвращает (USDC, акций, id ордеров, статус, попыток,
+    последний потолок) или None, если не исполнилось ничего."""
+    filled_usdc = filled_shares = 0.0
+    order_ids: list[str] = []
+    status = None
+    last_err = None
+    remaining = round(amount, 2)
+    attempts = 0
+    while attempts < MAX_FILL_ATTEMPTS:
+        attempts += 1
+        try:
+            resp = await polymarket_client.place_buy_order(token_id, cap, remaining, tick, order_type="FAK")
+        except Exception as exc:  # noqa: BLE001
+            if not polymarket_client.is_no_fill_error(exc):
+                diagnostics.record_skip(market.slug, market.asset, "order_error", str(exc))
+                await telegram_notify.notify(f"❌ Ошибка при выставлении ордера ({market.slug}): {exc}")
+                break
+            last_err = exc
+        else:
+            oid = polymarket_client.response_field(resp, "order_id") or polymarket_client.response_field(resp, "orderID")
+            if oid:
+                order_ids.append(str(oid))
+            status = polymarket_client.response_field(resp, "status") or "SUBMITTED"
+            amounts = polymarket_client.filled_amounts(resp)
+            if amounts is None or str(status).lower() == "delayed" or (amounts[0] <= 0 and str(status).lower() == "matched"):
+                # Сумм исполнения в ответе нет (или ордер принят с задержкой) —
+                # считаем, что исполнился целиком, как было с FOK.
+                usdc, shares = remaining, remaining / cap
+            else:
+                usdc, shares = amounts
+            if usdc > 0:
+                filled_usdc += usdc
+                filled_shares += shares
+                remaining = round(amount - filled_usdc, 2)
+            else:
+                last_err = f"исполнено 0 (статус {status})"
+        if attempts >= MAX_FILL_ATTEMPTS:
+            break
+        if filled_usdc > 0 and remaining < max(settings.MIN_VIABLE_TRADE_USDC, MIN_ORDER_SHARES * cap):
+            break  # остаток меньше минимального ордера — хватит
+        if market.end_time - time.time() < 45:
+            break
+        await asyncio.sleep(RETRY_PAUSE_SEC)
+        book = await polymarket_client.get_orderbook_cached(token_id, depth_levels=10)
+        if book.best_ask is None or book.best_ask > range_max + 1e-9:
+            last_err = last_err or "цена ушла выше диапазона"
+            break
+        cap = polymarket_client.round_price_for_buy(
+            min(book.best_ask + settings.LIVE_ENTRY_MAX_SLIPPAGE, settings.MAX_ENTRY_EXECUTION_PRICE, range_max),
+            book.tick_size or tick,
+        )
+        available = polymarket_client.fillable_usdc(token_id, cap, book)
+        if available < settings.MIN_VIABLE_TRADE_USDC:
+            last_err = f"в стакане по цене до {cap:.2f} всего {available:.2f} USDC"
+            continue
+        remaining = min(remaining, round(available * 0.9, 2))
+
+    if filled_usdc <= 0:
+        if last_err is not None:
+            diagnostics.record_skip(market.slug, market.asset, "liquidity", f"{attempts} попыток: {last_err}")
+            if market.slug not in _liquidity_skip_notified:
+                _liquidity_skip_notified.add(market.slug)
+                await telegram_notify.notify(
+                    f"⚠️ Сигнал по {market.slug} пропущен: ордер не исполнился за {attempts} "
+                    f"попытки — цена ушла или заявки сняли ({last_err})."
+                )
+        return None
+    return filled_usdc, filled_shares, ",".join(order_ids) or "matched", status or "matched", attempts, cap
+
+
+async def maybe_enter(market: ActiveMarket, decision: Decision, path: str = "slow") -> None:
+    """Вход по сигналу. path — какая проверка нашла сигнал: "slow" (раз в
+    3 с) или "fast" (быстрая, src/fast_signal.py); пишется в сделку."""
     if not decision.should_enter:
         return
+    if entry_busy(market.slug):
+        return
+    # Между entry_busy и захватом блокировки нет await — второй вызов по тому
+    # же рынку увидит блокировку занятой и выйдет сразу, а не будет ждать.
+    async with _lock_for(market.slug):
+        await _enter_locked(market, decision, path)
+
+
+async def _enter_locked(market: ActiveMarket, decision: Decision, path: str) -> None:
+    global _daily_limit_notified_day
     if runtime_state.get("paused"):
         diagnostics.record_skip(market.slug, market.asset, "paused")
         return
@@ -88,20 +230,32 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
                     f"Поменять лимит можно в 🛑 Стоп-лосс в меню."
                 )
             diagnostics.record_skip(market.slug, market.asset, "daily")
+            _cool_down(market.slug)
             return
-        if storage.count_open_trades(live_only=True, running_only=True) >= runtime_state.get("max_open_positions"):
+        open_live = storage.count_open_trades(live_only=True, running_only=True)
+        if open_live + len(_inflight_live - {market.slug}) >= runtime_state.get("max_open_positions"):
             # Общий потолок РЕАЛЬНЫХ позиций по всем активам разом — при
             # нескольких потоках несколько сигналов могут совпасть по времени.
             # Виртуальные сделки DRY-монет место не занимают; позиции в уже
-            # закончившихся рынках (ждут резолюции) — тоже.
+            # закончившихся рынках (ждут резолюции) — тоже. Рынки, по которым
+            # ордер исполняется прямо сейчас, место уже занимают.
             diagnostics.record_skip(market.slug, market.asset, "cap")
+            _cool_down(market.slug)
             return
+        _inflight_live.add(market.slug)
+    try:
+        await _enter_sized(market, decision, path, dry_run)
+    finally:
+        _inflight_live.discard(market.slug)
 
+
+async def _enter_sized(market: ActiveMarket, decision: Decision, path: str, dry_run: bool) -> None:
     # Ставка и диапазон — свои у монеты (⚙️ в 🪙 Активах), иначе общие
     base_size = runtime_state.compute_trade_size(market.asset)
     range_min, range_max = runtime_state.entry_range(market.asset)
     if base_size <= 0:
         diagnostics.record_skip(market.slug, market.asset, "no_bank")
+        _cool_down(market.slug)
         return  # банк в режиме % исчерпан — ставить нечего
     score_threshold = runtime_state.get("safety_score_threshold")
     if runtime_state.get("size_scaling_enabled"):
@@ -149,6 +303,7 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
     available_liquidity = polymarket_client.fillable_usdc(token_id, execution_price, book)
     if available_liquidity < settings.MIN_VIABLE_TRADE_USDC:
         diagnostics.record_skip(market.slug, market.asset, "liquidity")
+        _cool_down(market.slug)
         if market.slug not in _liquidity_skip_notified:
             _liquidity_skip_notified.add(market.slug)
             await _notify(market.asset, dry_run,
@@ -161,6 +316,9 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
 
     status = "DRY_RUN"
     order_id = "dry-run"
+    first_cap = execution_price
+    attempts = 1
+    entry_logged = execution_price
     if not dry_run:
         if not settings.POLY_PRIVATE_KEY:
             # Не должно случиться благодаря проверкам в telegram_notify/main.py,
@@ -170,45 +328,20 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
                 "Проверь переменные окружения и передеплой."
             )
             return
-        try:
-            # amount_usdc — это ДОЛЛАРОВАЯ сумма для BUY market-ордера, не
-            # количество акций: конвертация не нужна, SDK делает это сам.
-            resp = await polymarket_client.place_buy_order(token_id, execution_price, trade_size, tick)
-        except Exception as exc:  # noqa: BLE001
-            if "fully filled" in str(exc).lower() or "fok" in str(exc).lower():
-                # Гонка: между нашей проверкой глубины и отправкой ордера кто-то
-                # успел забрать ликвидность. Пробуем ещё раз меньшим объёмом —
-                # один раз, не зацикливаемся.
-                retry_size = round(trade_size * 0.5, 2)
-                if retry_size < settings.MIN_VIABLE_TRADE_USDC:
-                    diagnostics.record_skip(market.slug, market.asset, "liquidity")
-                    await telegram_notify.notify(
-                        f"⚠️ Сигнал по {market.slug} пропущен: не хватило ликвидности в стакане "
-                        f"даже для уменьшенного объёма (FOK отменил ордер)."
-                    )
-                    return
-                try:
-                    resp = await polymarket_client.place_buy_order(token_id, execution_price, retry_size, tick)
-                    trade_size = retry_size
-                except Exception as exc2:  # noqa: BLE001
-                    diagnostics.record_skip(market.slug, market.asset, "liquidity", f"FOK: {exc2}")
-                    await telegram_notify.notify(
-                        f"⚠️ Сигнал по {market.slug} пропущен: не хватило ликвидности даже после "
-                        f"снижения размера до {retry_size:.2f} USDC ({exc2})."
-                    )
-                    return
-            else:
-                diagnostics.record_skip(market.slug, market.asset, "order_error", str(exc))
-                await telegram_notify.notify(f"❌ Ошибка при выставлении ордера: {exc}")
-                return
-        order_id = polymarket_client.response_field(resp, "order_id") or polymarket_client.response_field(resp, "orderID") or str(resp)
-        status = polymarket_client.response_field(resp, "status") or "SUBMITTED"
+        result = await _execute_live_buy(market, token_id, trade_size, execution_price, tick, range_max)
+        if result is None:
+            _cool_down(market.slug)
+            return
+        filled_usdc, filled_shares, order_id, status, attempts, execution_price = result
+        trade_size = round(filled_usdc, 2)
+        # Реальная средняя цена исполнения (раньше в базу шёл потолок ордера)
+        entry_logged = round(filled_usdc / filled_shares, 4) if filled_shares > 0 else execution_price
 
     storage.log_trade(
         market_slug=market.slug,
         condition_id=market.condition_id,
         direction=decision.direction,
-        entry_price=execution_price,
+        entry_price=entry_logged,
         size_usdc=trade_size,
         order_id=order_id,
         status=status,
@@ -218,13 +351,16 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
         safety_score=decision.safety_score,
         range_min=range_min,
         range_max=range_max,
+        entry_path=path,
     )
 
     await _notify(market.asset, dry_run,
-        f"{'🧪 [DRY RUN] ' if dry_run else '✅ '}Вход {decision.direction} по {market.slug}\n"
-        f"Ask на сигнале: {decision.entry_price:.3f} | Потолок исполнения: {execution_price:.3f} "
+        f"{'🧪 [DRY RUN] ' if dry_run else '✅ '}Вход {decision.direction} по {market.slug}"
+        f"{' ⚡ быстрая проверка' if path == 'fast' else ''}\n"
+        f"Ask на сигнале: {decision.entry_price:.3f} | Потолок исполнения: {first_cap:.3f} "
         f"(тик {tick:g}) | Размер: {trade_size:.2f} из {base_size:.2f} USDC (score {decision.safety_score}/{score_threshold:.0f})\n"
-        f"Диапазон {range_min:.2f}–{range_max:.2f} | Расхождение: {decision.distance_atr} ATR | "
+        + (f"Исполнено по средней {entry_logged:.3f} за {attempts} попытки\n" if not dry_run and attempts > 1 else "")
+        + f"Диапазон {range_min:.2f}–{range_max:.2f} | Расхождение: {decision.distance_atr} ATR | "
         f"До конца рынка: {decision.minutes_left:.1f} мин"
     )
 

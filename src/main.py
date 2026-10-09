@@ -3,6 +3,11 @@
 пару (актив, таймфрейм) — например, "btc/5m", "sol/5m" и т.д. Все потоки
 делят общий book_stream (WS-стакан), общий Telegram-бот и общую БД.
 
+Плюс быстрая проверка сигнала (src/fast_signal.py): раз в ~0.3 с по всем
+монетам по данным в памяти — цена Binance из потока (src/price_stream.py),
+живой стакан и свечи последнего тика. Обычный тик раз в 3 с остаётся: он
+находит рынок, тянет свечи, пишет тики в базу и тоже может войти.
+
 Плюс две общие фоновые задачи, которые не привязаны к конкретному потоку:
 - settlement_loop: резолюция сделок и разметка исходов сигналов по ВСЕМ
   активам/таймфреймам разом (если делать это в каждом из 12 потоков
@@ -19,6 +24,7 @@ from config import settings
 from src import binance_feed, market_discovery, indicators, strategy
 from src.market_discovery import ActiveMarket
 from src import polymarket_client, storage, telegram_notify, executor, book_stream, runtime_state, reporting, wallet_tracker, momentum_tracker, hedge_bot
+from src import price_stream, fast_signal
 from src.timeframes import TIMEFRAMES, TimeframeProfile
 
 logging.basicConfig(
@@ -71,16 +77,26 @@ async def _instance_tick(asset: str, timeframe: TimeframeProfile) -> None:
         _active_markets[key] = market
         if settings.USE_LIVE_BOOK_STREAM:
             book_stream.subscribe([market.up_token_id, market.down_token_id])
+        # Новое окно — сразу прогреваем рынок в SDK (метаданные для ордера),
+        # чтобы в момент сигнала ордер уходил без лишнего запроса. Только для
+        # монет, по которым сейчас идут реальные сделки.
+        if not runtime_state.trade_is_dry(asset):
+            asyncio.create_task(polymarket_client.prewarm_market([market.up_token_id, market.down_token_id]))
 
     if not runtime_state.get("dry_run"):
         asyncio.create_task(polymarket_client.prewarm_transport())
 
     symbol = binance_feed.symbol_for(asset)
+    fetch_ms = int(time.time() * 1000)
     klines = await binance_feed.get_klines(
         symbol,
         limit=max(100, timeframe.atr_lookback_for_regime + timeframe.atr_period + 5),
         interval=timeframe.kline_interval,
     )
+    # Свечи и монету — быстрой проверке: между тиками она досчитывает
+    # последнюю свечу сделками из потока Binance (той же площадки, что свечи).
+    fast_signal.remember_klines(asset, klines, fetch_ms)
+    price_stream.watch(symbol, binance_feed.venue_for(symbol))
     ind = indicators.compute_indicator_snapshot(
         klines, timeframe.atr_period, timeframe.ema_fast, timeframe.ema_slow, timeframe.atr_lookback_for_regime,
     )
@@ -254,10 +270,17 @@ async def main():
             if storage.DB_WAS_NEW else ""
         )
         pending_note = telegram_notify._live_pending_note()
+        fast_note = (
+            f"⚡ Быстрый вход: вкл — сигнал проверяется раз в {max(0.1, settings.FAST_LOOP_INTERVAL_SEC):g} с "
+            "по цене Binance из потока (⚙️ Настройки)."
+            if runtime_state.get("fast_entry_enabled") and settings.USE_LIVE_BOOK_STREAM else
+            "⚡ Быстрый вход: выкл — сигнал проверяется раз в 3 с."
+        )
         await telegram_notify.notify(
             f"🤖 Бот запущен. Режим: {'DRY RUN (без реальных сделок)' if dry_run else 'LIVE — реальные сделки!'}\n"
             f"Активы: {assets_line} (🔴 реальные сделки, 🧪 DRY)\nТаймфреймы: {timeframes_line}\n"
             + (f"{pending_note}\n" if pending_note else "")
+            + f"{fast_note}\n"
             + "Открой /menu для управления (старт/стоп, размер позиции, стоп-лосс, настройки)."
             f"{forced_note}{new_db_note}"
         )
@@ -265,6 +288,11 @@ async def main():
         book_stream_task = None
         if settings.USE_LIVE_BOOK_STREAM:
             book_stream_task = asyncio.create_task(book_stream.run_forever())
+        # Цена Binance потоком и быстрая проверка сигнала (раз в ~0.3 с).
+        # Без живого стакана быстрой проверке не на что смотреть.
+        price_stream_task = asyncio.create_task(price_stream.run_forever())
+        fast_task = (asyncio.create_task(fast_signal.run_forever(_active_markets))
+                     if settings.USE_LIVE_BOOK_STREAM else None)
 
         report_task = asyncio.create_task(reporting.report_loop())
         settlement_task = asyncio.create_task(settlement_loop())
@@ -282,6 +310,9 @@ async def main():
         finally:
             if book_stream_task:
                 book_stream_task.cancel()
+            price_stream_task.cancel()
+            if fast_task:
+                fast_task.cancel()
             report_task.cancel()
             settlement_task.cancel()
             stop_loss_task.cancel()

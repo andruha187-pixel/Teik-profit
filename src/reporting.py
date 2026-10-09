@@ -143,6 +143,18 @@ async def build_and_send_report() -> None:
             extra_lines.append("⛔ Сигналы без сделки: " + skips)
     except Exception:  # noqa: BLE001 — диагностика не должна ломать отчёт
         pass
+    # Сколько входов нашла быстрая проверка (раз в ~0.3 с) и работает ли поток
+    # цены Binance — чтобы по отчётам было видно, что она даёт.
+    try:
+        from src import fast_signal  # здесь: fast_signal -> executor -> telegram_notify
+        fast_entries = fast_signal.entries_line(trades, storage.TRADES_COLUMNS)
+        status = fast_signal.status_line()
+        if fast_entries:
+            extra_lines.append(fast_entries + " (" + status.replace("⚡ ", "", 1) + ")")
+        else:
+            extra_lines.append(status)
+    except Exception:  # noqa: BLE001
+        pass
     # Свои настройки монет (диапазон/ставка) — чтобы по отчёту было видно,
     # при каких настройках торговала каждая монета.
     try:

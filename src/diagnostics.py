@@ -186,6 +186,15 @@ def why_text(hours: float = 4.0, now: float | None = None) -> str:
     lines.append(f"Сигналы без сделки (с {time.strftime('%H:%M', time.gmtime(_since))} UTC): {skips or 'нет'}")
     for asset, err in last_errors().items():
         lines.append(f"  последняя ошибка ордера {asset.upper()}: {err}")
+    try:
+        from src import fast_signal  # здесь: fast_signal -> executor -> diagnostics
+        lines.append("")
+        lines.append(fast_signal.status_line())
+        fast_entries = fast_signal.entries_line(trades, storage.TRADES_COLUMNS)
+        if fast_entries:
+            lines.append(fast_entries + f" за {hours:g} ч")
+    except Exception:  # noqa: BLE001 — строка статуса не должна ломать экран
+        pass
     mult = TIMEFRAMES[0].atr_distance_mult
     lines += [
         "",
