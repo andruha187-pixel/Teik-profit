@@ -57,6 +57,14 @@ class Settings:
     FAST_ENTRY_ENABLED: bool = _get_bool("FAST_ENTRY_ENABLED", True)
     FAST_LOOP_INTERVAL_SEC: float = _get_float("FAST_LOOP_INTERVAL_SEC", 0.3)
 
+    # --- Подтверждение сигнала (src/entry_confirm.py) ---
+    # Вход, только если сигнал был и ENTRY_CONFIRM_SEC секунд назад (в ту же
+    # сторону). Архив 25.09–11.10, 240 входов: проигрышей 7 → 1, прибыль
+    # +$209 → +$237 на ставке $30, входов на 37% меньше. Включается/выключается
+    # и в Telegram (⚙️ Настройки → ⏱ Подтверждение сигнала).
+    ENTRY_CONFIRM_ENABLED: bool = _get_bool("ENTRY_CONFIRM_ENABLED", True)
+    ENTRY_CONFIRM_SEC: float = _get_float("ENTRY_CONFIRM_SEC", 3.0)
+
     # --- Polymarket / CLOB ---
     POLY_HOST: str = os.getenv("POLY_HOST", "https://clob.polymarket.com")
     GAMMA_HOST: str = os.getenv("GAMMA_HOST", "https://gamma-api.polymarket.com")
@@ -79,9 +87,12 @@ class Settings:
     # "3-4 ATR" это всего $40-70 для BTC, и за 5-7 минут до конца 15m-рынка
     # такое расстояние легко съедается. Бэктест 15m BTC (25-28.09, 139 рынков):
     # без фильтра −$17, с минимумом ~$60 (0.07% при BTC ~84k) — +$38, из 4
-    # проигрышей остался 1. На 5m фильтр ничего не дал (там вход за 1.5-3 мин),
-    # поэтому для 5m по умолчанию выключен. Меняется из Telegram (⚙️ Настройки).
-    MIN_DISTANCE_PCT: float = _get_float("MIN_DISTANCE_PCT", 0.0)
+    # проигрышей остался 1. На 5m по отчётам 25.09–08.10 сначала ничего не дал,
+    # но по всем архивам до 10.10 минимум 0.05% срезал проигрыши примерно в 4
+    # раза при той же прибыли (в выходные ATR маленький, и 1.5 ATR — это всего
+    # несколько долларов BTC). С 10.10 по умолчанию 0.05% — в том числе для
+    # кнопки «⭐ Рекомендованные». Меняется из Telegram (⚙️ Настройки).
+    MIN_DISTANCE_PCT: float = _get_float("MIN_DISTANCE_PCT", 0.05)
 
     # --- Латентность / исполнение (прогрев стакана и транспорта) ---
     USE_LIVE_BOOK_STREAM: bool = _get_bool("USE_LIVE_BOOK_STREAM", True)
