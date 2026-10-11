@@ -195,6 +195,11 @@ def why_text(hours: float = 4.0, now: float | None = None) -> str:
             lines.append(fast_entries + f" за {hours:g} ч")
     except Exception:  # noqa: BLE001 — строка статуса не должна ломать экран
         pass
+    try:
+        from src import entry_confirm  # здесь: entry_confirm -> runtime_state -> storage
+        lines.append(entry_confirm.status_line())
+    except Exception:  # noqa: BLE001
+        pass
     mult = TIMEFRAMES[0].atr_distance_mult
     lines += [
         "",

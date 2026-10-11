@@ -72,6 +72,8 @@ _DEFAULTS = {
     # Быстрая проверка сигнала раз в ~0.3 с по цене Binance из потока (см.
     # src/fast_signal.py). Обычная проверка раз в 3 с работает всегда.
     "fast_entry_enabled": settings.FAST_ENTRY_ENABLED,
+    # Вход, только если сигнал был и ~3 с назад (см. src/entry_confirm.py).
+    "entry_confirm_enabled": settings.ENTRY_CONFIRM_ENABLED,
     # Версия применённого набора рекомендованных настроек (см. RECOMMENDED ниже).
     "preset_version": 0,
     # По умолчанию выключено: каждая прошедшая порог сделка идёт полным
@@ -144,6 +146,7 @@ _CASTERS = {
     "entry_window_max": float,
     "max_open_positions": int,
     "fast_entry_enabled": lambda v: str(v).lower() == "true",
+    "entry_confirm_enabled": lambda v: str(v).lower() == "true",
     "preset_version": int,
     "size_scaling_enabled": lambda v: str(v).lower() == "true",
     "position_stop_loss_enabled": lambda v: str(v).lower() == "true",
@@ -206,6 +209,7 @@ def recommended() -> dict:
         "entry_window_min": RECOMMENDED_WINDOW[0],
         "entry_window_max": RECOMMENDED_WINDOW[1],
         "fast_entry_enabled": True,
+        "entry_confirm_enabled": True,
         # Хедж вынесен в отдельный бот; здесь он тратил бы тот же кошелёк
         # и в LIVE покупал бы по $5 на каждом рынке, где цена прошла 0.70.
         "hedge_bot_enabled": False,

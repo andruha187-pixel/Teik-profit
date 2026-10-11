@@ -21,7 +21,9 @@
 индикаторы — только если они прошли.
 
 Вход — тот же executor.maybe_enter; блокировка на рынок (см. executor) не
-даёт обеим проверкам купить один рынок дважды. В базу быстрая проверка пишет
+даёт обеим проверкам купить один рынок дважды. С 11.10 вход ещё и ждёт
+подтверждения (src/entry_confirm.py): сигнал должен быть и ~3 с назад —
+быстрая проверка записывает туда результат каждой оценки рынка. В базу быстрая проверка пишет
 только тики с сигналом (tick_source = "fast", не чаще раза в 3 с на рынок), а
 сделку помечает entry_path = "fast" — ряд тиков раз в 3 с для анализа прежний.
 
@@ -39,6 +41,7 @@ import pandas as pd
 
 from config import settings
 from src import binance_feed, executor, indicators, polymarket_client, price_stream, runtime_state, storage, strategy
+from src import entry_confirm
 from src.market_discovery import ActiveMarket
 from src.polymarket_client import OrderBookSnapshot
 from src.timeframes import TIMEFRAMES, TimeframeProfile
@@ -182,13 +185,15 @@ def _spawn(coro) -> None:
 
 def check(asset: str, timeframe: TimeframeProfile, market: ActiveMarket, now: float | None = None) -> str:
     """Одна быстрая проверка одного рынка. Возвращает, чем закончилась:
-    "enter" — сигнал, вход запущен; остальное — почему нет (stats)."""
+    "enter" — сигнал, вход запущен; "wait" — сигнал есть, но ещё не
+    подтверждён (~3 с назад его не было); остальное — почему нет (stats)."""
     now = time.time() if now is None else now
     if now >= market.end_time:
         return "expired"
     minutes_left = (market.end_time - now) / 60
     win_min, win_max = runtime_state.entry_window()
     if not (win_min <= minutes_left <= win_max):
+        entry_confirm.record(market.slug, None, False, now)
         return "window"
     ticker = price_stream.latest(binance_feed.symbol_for(asset))
     if ticker is None:
@@ -201,6 +206,8 @@ def check(asset: str, timeframe: TimeframeProfile, market: ActiveMarket, now: fl
         return "no_book"
     lo, hi = runtime_state.entry_range(asset)
     if not (lo - 1e-9 <= book.best_ask <= hi + 1e-9):
+        # Цена стороны вне диапазона — сигнала нет (для подтверждения входа)
+        entry_confirm.record(market.slug, "UP" if up else "DOWN", False, now)
         return "range"
     if executor.entry_busy(market.slug, now):
         return "busy"
@@ -225,6 +232,7 @@ def check(asset: str, timeframe: TimeframeProfile, market: ActiveMarket, now: fl
         atr_spike_mult=timeframe.atr_spike_mult,
         asset=asset,
     )
+    entry_confirm.record(market.slug, decision.direction, decision.should_enter, now)
     if not decision.should_enter:
         return "no_signal"
     if now - _last_logged.get(market.slug, 0.0) >= SIGNAL_LOG_EVERY_SEC:
@@ -236,6 +244,9 @@ def check(asset: str, timeframe: TimeframeProfile, market: ActiveMarket, now: fl
         log.info("⚡ %s | price=%.4f strike=%.4f dir=%s left=%.2fm score=%.1f ask=%.3f — сигнал быстрой проверки",
                  market.slug, ind["close"], market.strike_price, decision.direction, minutes_left,
                  decision.safety_score, book.best_ask)
+    if not entry_confirm.confirmed(market.slug, decision.direction, now):
+        # Сигнал есть, но ~3 с назад его не было — ждём, держится ли он
+        return "wait"
     _spawn(executor.maybe_enter(market, decision, path="fast"))
     return "enter"
 

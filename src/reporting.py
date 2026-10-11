@@ -155,6 +155,12 @@ async def build_and_send_report() -> None:
             extra_lines.append(status)
     except Exception:  # noqa: BLE001
         pass
+    # Сколько сигналов отсеяло подтверждение (сигнал должен держаться ~3 с)
+    try:
+        from src import entry_confirm
+        extra_lines.append(entry_confirm.status_line())
+    except Exception:  # noqa: BLE001
+        pass
     # Свои настройки монет (диапазон/ставка) — чтобы по отчёту было видно,
     # при каких настройках торговала каждая монета.
     try:

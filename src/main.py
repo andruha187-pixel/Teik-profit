@@ -24,7 +24,7 @@ from config import settings
 from src import binance_feed, market_discovery, indicators, strategy
 from src.market_discovery import ActiveMarket
 from src import polymarket_client, storage, telegram_notify, executor, book_stream, runtime_state, reporting, wallet_tracker, momentum_tracker, hedge_bot
-from src import price_stream, fast_signal
+from src import price_stream, fast_signal, entry_confirm
 from src.timeframes import TIMEFRAMES, TimeframeProfile
 
 logging.basicConfig(
@@ -123,6 +123,9 @@ async def _instance_tick(asset: str, timeframe: TimeframeProfile) -> None:
         atr_spike_mult=timeframe.atr_spike_mult,
         asset=asset,
     )
+    # Результат оценки — для подтверждения сигнала (вход, только если сигнал
+    # был и ~3 с назад, см. src/entry_confirm.py)
+    entry_confirm.record(market.slug, decision.direction, decision.should_enter)
 
     storage.log_signal(market.slug, current_price, market.strike_price, decision,
                         indicators=ind, up_book=up_book, down_book=down_book)
@@ -275,6 +278,11 @@ async def main():
             "по цене Binance из потока (⚙️ Настройки)."
             if runtime_state.get("fast_entry_enabled") and settings.USE_LIVE_BOOK_STREAM else
             "⚡ Быстрый вход: выкл — сигнал проверяется раз в 3 с."
+        )
+        fast_note += "\n" + (
+            f"⏱ Подтверждение сигнала: вкл — вход, только если сигнал был и {settings.ENTRY_CONFIRM_SEC:g} с назад."
+            if entry_confirm.enabled() else
+            "⏱ Подтверждение сигнала: выкл — вход на первой проверке с сигналом."
         )
         await telegram_notify.notify(
             f"🤖 Бот запущен. Режим: {'DRY RUN (без реальных сделок)' if dry_run else 'LIVE — реальные сделки!'}\n"

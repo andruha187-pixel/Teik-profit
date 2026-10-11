@@ -12,6 +12,7 @@ import time
 
 from config import settings
 from src import storage, polymarket_client, telegram_notify, book_stream, runtime_state, loss_stats, diagnostics
+from src import entry_confirm
 from src.market_discovery import ActiveMarket, get_resolution
 from src.strategy import Decision
 
@@ -199,6 +200,10 @@ async def maybe_enter(market: ActiveMarket, decision: Decision, path: str = "slo
     """Вход по сигналу. path — какая проверка нашла сигнал: "slow" (раз в
     3 с) или "fast" (быстрая, src/fast_signal.py); пишется в сделку."""
     if not decision.should_enter:
+        return
+    # Сигнал должен держаться ~3 с: был и в оценке рынка ~3 с назад, в ту же
+    # сторону (src/entry_confirm.py). Иначе — ждём следующей проверки.
+    if not entry_confirm.confirmed(market.slug, decision.direction):
         return
     if entry_busy(market.slug):
         return

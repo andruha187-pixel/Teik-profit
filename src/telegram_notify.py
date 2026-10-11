@@ -159,6 +159,10 @@ def _settings_text() -> str:
         "по цене Binance из потока и живому стакану — те же условия входа, без запросов. "
         "У трети рынков с сигналом вход держался не дольше одной 3-секундной проверки; "
         "по отчётам это примерно +10% входов.\n\n"
+        f"⏱ Подтверждение сигнала: {'вкл' if runtime_state.get('entry_confirm_enabled') else 'выкл'}\n"
+        f"Вход, только если сигнал был и {max(0.0, settings.ENTRY_CONFIRM_SEC):g} с назад, в ту же сторону. "
+        "Все 4 проигрыша 11.10 были на сигнале, который не продержался и 3 с. "
+        "Архив 25.09–11.10: проигрышей 1 вместо 7, прибыль +13%, входов на 37% меньше.\n\n"
         + scaling_line
     )
 
@@ -182,6 +186,15 @@ def _fast_status_line() -> str:
         return fast_signal.status_line()
     except Exception:  # noqa: BLE001 — строка статуса не должна ломать меню
         return "⚡ Быстрый вход: " + ("вкл" if runtime_state.get("fast_entry_enabled") else "выкл")
+
+
+def _confirm_status_line() -> str:
+    """Подтверждение сигнала (src/entry_confirm.py): вкл/выкл и сколько отсеяно."""
+    try:
+        from src import entry_confirm  # здесь: единообразно с быстрой проверкой
+        return entry_confirm.status_line()
+    except Exception:  # noqa: BLE001 — строка статуса не должна ломать меню
+        return "⏱ Подтверждение сигнала: " + ("вкл" if runtime_state.get("entry_confirm_enabled") else "выкл")
 
 
 def _main_menu_text() -> str:
@@ -213,6 +226,7 @@ def _main_menu_text() -> str:
     if own:
         lines.append(f"⚙️ Свои у монет: {own}")
     lines.append(_fast_status_line())
+    lines.append(_confirm_status_line())
     if s:
         lines.append("")
         lines.append(f"Потоков активно: {len(s)}")
@@ -707,6 +721,11 @@ def _settings_menu_markup() -> InlineKeyboardMarkup:
         "⚡ Быстрый вход: вкл — выключить" if runtime_state.get("fast_entry_enabled")
         else "⚡ Быстрый вход: выкл — включить",
         callback_data="fast_toggle",
+    )])
+    rows.append([InlineKeyboardButton(
+        "⏱ Подтверждение сигнала: вкл — выключить" if runtime_state.get("entry_confirm_enabled")
+        else "⏱ Подтверждение сигнала: выкл — включить",
+        callback_data="confirm_toggle",
     )])
     rows.append([InlineKeyboardButton("⭐ Рекомендованные настройки", callback_data="preset_apply")])
     scaling_on = runtime_state.get("size_scaling_enabled")
@@ -1438,7 +1457,8 @@ async def _on_callback_inner(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_text(
             "⭐ Применены рекомендованные настройки: порог 88, диапазон "
             f"{_range_text()}, окно входа {runtime_state.entry_window()[0]:g}–"
-            f"{runtime_state.entry_window()[1]:g} мин, быстрый вход вкл.\n"
+            f"{runtime_state.entry_window()[1]:g} мин, мин. расстояние {_distance_summary()}, "
+            "быстрый вход вкл, подтверждение сигнала вкл.\n"
             + (f"Свои настройки монет не тронуты: {own}.\n" if own else "")
             + "\n" + _settings_text(),
             reply_markup=_settings_menu_markup(),
@@ -1529,6 +1549,15 @@ async def _on_callback_inner(update: Update, context: ContextTypes.DEFAULT_TYPE)
         msg = ("⚡ Быстрый вход включён — сигнал проверяется и между 3-секундными тиками."
                if new_val else
                "⚡ Быстрый вход выключен — сигнал проверяется только раз в 3 с, как раньше.")
+        await query.edit_message_text(msg + "\n\n" + _settings_text(), reply_markup=_settings_menu_markup())
+
+    elif data == "confirm_toggle":
+        new_val = not runtime_state.get("entry_confirm_enabled")
+        runtime_state.set("entry_confirm_enabled", new_val)
+        sec = f"{max(0.0, settings.ENTRY_CONFIRM_SEC):g}"
+        msg = (f"⏱ Подтверждение включено — вход, только если сигнал был и {sec} с назад."
+               if new_val else
+               "⏱ Подтверждение выключено — вход на первой проверке с сигналом, как раньше.")
         await query.edit_message_text(msg + "\n\n" + _settings_text(), reply_markup=_settings_menu_markup())
 
     elif data == "scaling_toggle":
