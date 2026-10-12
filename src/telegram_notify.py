@@ -159,6 +159,10 @@ def _settings_text() -> str:
         "по цене Binance из потока и живому стакану — те же условия входа, без запросов. "
         "У трети рынков с сигналом вход держался не дольше одной 3-секундной проверки; "
         "по отчётам это примерно +10% входов.\n\n"
+        f"📡 Цена сигнала: {'Chainlink' if runtime_state.get('price_source') == 'chainlink' else 'Binance'}\n"
+        "Chainlink — цена, по которой Polymarket решает исход: и текущая цена, и страйк "
+        "(цена на начало окна) берутся из неё, Binance остаётся для ATR и тренда. Нет свежей "
+        "цены Chainlink или бот не застал начало окна — входа нет. Binance — как было до 12.10.\n\n"
         f"⏱ Подтверждение сигнала: {'вкл' if runtime_state.get('entry_confirm_enabled') else 'выкл'}\n"
         f"Вход, только если сигнал был и {max(0.0, settings.ENTRY_CONFIRM_SEC):g} с назад, в ту же сторону. "
         "Все 4 проигрыша 11.10 были на сигнале, который не продержался и 3 с. "
@@ -186,6 +190,15 @@ def _fast_status_line() -> str:
         return fast_signal.status_line()
     except Exception:  # noqa: BLE001 — строка статуса не должна ломать меню
         return "⚡ Быстрый вход: " + ("вкл" if runtime_state.get("fast_entry_enabled") else "выкл")
+
+
+def _price_status_line() -> str:
+    """Источник цены сигнала и состояние потока Chainlink (src/chainlink_feed.py)."""
+    try:
+        from src import chainlink_feed
+        return chainlink_feed.status_line()
+    except Exception:  # noqa: BLE001 — строка статуса не должна ломать меню
+        return "📡 Цена сигнала: " + ("Chainlink" if runtime_state.get("price_source") == "chainlink" else "Binance")
 
 
 def _confirm_status_line() -> str:
@@ -227,6 +240,7 @@ def _main_menu_text() -> str:
         lines.append(f"⚙️ Свои у монет: {own}")
     lines.append(_fast_status_line())
     lines.append(_confirm_status_line())
+    lines.append(_price_status_line())
     if s:
         lines.append("")
         lines.append(f"Потоков активно: {len(s)}")
@@ -721,6 +735,11 @@ def _settings_menu_markup() -> InlineKeyboardMarkup:
         "⚡ Быстрый вход: вкл — выключить" if runtime_state.get("fast_entry_enabled")
         else "⚡ Быстрый вход: выкл — включить",
         callback_data="fast_toggle",
+    )])
+    rows.append([InlineKeyboardButton(
+        "📡 Цена сигнала: Chainlink — сменить на Binance" if runtime_state.get("price_source") == "chainlink"
+        else "📡 Цена сигнала: Binance — сменить на Chainlink",
+        callback_data="price_src_toggle",
     )])
     rows.append([InlineKeyboardButton(
         "⏱ Подтверждение сигнала: вкл — выключить" if runtime_state.get("entry_confirm_enabled")
@@ -1458,7 +1477,7 @@ async def _on_callback_inner(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "⭐ Применены рекомендованные настройки: порог 88, диапазон "
             f"{_range_text()}, окно входа {runtime_state.entry_window()[0]:g}–"
             f"{runtime_state.entry_window()[1]:g} мин, мин. расстояние {_distance_summary()}, "
-            "быстрый вход вкл, подтверждение сигнала вкл.\n"
+            "быстрый вход вкл, подтверждение сигнала вкл, цена сигнала — Chainlink.\n"
             + (f"Свои настройки монет не тронуты: {own}.\n" if own else "")
             + "\n" + _settings_text(),
             reply_markup=_settings_menu_markup(),
@@ -1549,6 +1568,14 @@ async def _on_callback_inner(update: Update, context: ContextTypes.DEFAULT_TYPE)
         msg = ("⚡ Быстрый вход включён — сигнал проверяется и между 3-секундными тиками."
                if new_val else
                "⚡ Быстрый вход выключен — сигнал проверяется только раз в 3 с, как раньше.")
+        await query.edit_message_text(msg + "\n\n" + _settings_text(), reply_markup=_settings_menu_markup())
+
+    elif data == "price_src_toggle":
+        new_val = "binance" if runtime_state.get("price_source") == "chainlink" else "chainlink"
+        runtime_state.set("price_source", new_val)
+        msg = ("📡 Цена сигнала — Chainlink: цена и страйк как у Polymarket при расчёте исхода."
+               if new_val == "chainlink" else
+               "📡 Цена сигнала — Binance, как было до 12.10.")
         await query.edit_message_text(msg + "\n\n" + _settings_text(), reply_markup=_settings_menu_markup())
 
     elif data == "confirm_toggle":

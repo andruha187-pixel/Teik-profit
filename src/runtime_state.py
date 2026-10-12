@@ -74,6 +74,9 @@ _DEFAULTS = {
     "fast_entry_enabled": settings.FAST_ENTRY_ENABLED,
     # Вход, только если сигнал был и ~3 с назад (см. src/entry_confirm.py).
     "entry_confirm_enabled": settings.ENTRY_CONFIRM_ENABLED,
+    # По какой цене считать сигнал: "chainlink" (как Polymarket) или "binance"
+    # (см. src/chainlink_feed.py).
+    "price_source": settings.PRICE_SOURCE if settings.PRICE_SOURCE in ("chainlink", "binance") else "chainlink",
     # Версия применённого набора рекомендованных настроек (см. RECOMMENDED ниже).
     "preset_version": 0,
     # По умолчанию выключено: каждая прошедшая порог сделка идёт полным
@@ -87,13 +90,14 @@ _DEFAULTS = {
     # Какие активы сейчас реально торгуются — можно включать/выключать
     # по одному через Telegram, не трогая остальные и не передеплоя.
     # Хранится как строка через запятую (см. get/set_enabled_assets ниже).
-    "enabled_assets": ",".join(settings.ASSETS),
+    "enabled_assets": ",".join(a for a in (x.strip().lower() for x in settings.ENABLED_ASSETS.split(","))
+                               if a in settings.ASSETS),
     # Режим по каждой монете. Реальные ордера идут только по монетам из этого
     # списка (и только когда сам бот в LIVE); остальные включённые монеты
     # торгуют в DRY RUN — виртуальные сделки, чтобы проверить стратегию на
     # каждой монете отдельно, не рискуя деньгами. По умолчанию LIVE только
     # BTC: любая новая монета начинает с DRY.
-    "live_assets": "btc",
+    "live_assets": ",".join(a for a in (x.strip().lower() for x in settings.LIVE_ASSETS.split(",")) if a),
     # Уведомления о виртуальных сделках монет в режиме DRY. По умолчанию
     # выключены, чтобы 5–6 монет не засыпали чат; всё видно в 📊 Статистике
     # и в 4-часовых отчётах.
@@ -103,16 +107,16 @@ _DEFAULTS = {
     # реализованная прибыль/убыток с начала). Percent-режим сам сжимается
     # при просадке и растёт при выигрышах — в отличие от fixed, который на
     # похудевшем банке становится относительно только агрессивнее.
-    "sizing_mode": "fixed",
-    "bankroll_pct": 5.0,
-    "starting_bankroll_usdc": 60.0,
+    "sizing_mode": settings.SIZING_MODE if settings.SIZING_MODE in ("fixed", "percent") else "percent",
+    "bankroll_pct": settings.BANKROLL_PCT,
+    "starting_bankroll_usdc": settings.STARTING_BANKROLL_USDC,
     # Свои настройки отдельных монет поверх общих: диапазон входа и размер
     # ставки (режим fixed/percent со своими значениями). Пример:
     #   {"sol": {"min_entry_price": 0.92, "max_entry_price": 0.95},
     #    "btc": {"sizing_mode": "percent", "bankroll_pct": 10.0, "trade_size_usdc": 20.0}}
     # Чего у монеты нет — берётся общее значение и меняется вместе с ним.
     # Банк для режима % один на все монеты (кошелёк один).
-    "asset_overrides": {},
+    "asset_overrides": _parse_overrides(settings.ASSET_OVERRIDES),
     # Отслеживание чужого кошелька: уведомления всегда можно включить
     # отдельно от реального копирования сделок (copytrade) — по умолчанию
     # только уведомляем, ничего не покупаем автоматически.
@@ -147,6 +151,7 @@ _CASTERS = {
     "max_open_positions": int,
     "fast_entry_enabled": lambda v: str(v).lower() == "true",
     "entry_confirm_enabled": lambda v: str(v).lower() == "true",
+    "price_source": lambda v: str(v).lower() if str(v).lower() in ("chainlink", "binance") else "chainlink",
     "preset_version": int,
     "size_scaling_enabled": lambda v: str(v).lower() == "true",
     "position_stop_loss_enabled": lambda v: str(v).lower() == "true",
@@ -210,6 +215,7 @@ def recommended() -> dict:
         "entry_window_max": RECOMMENDED_WINDOW[1],
         "fast_entry_enabled": True,
         "entry_confirm_enabled": True,
+        "price_source": "chainlink",
         # Хедж вынесен в отдельный бот; здесь он тратил бы тот же кошелёк
         # и в LIVE покупал бы по $5 на каждом рынке, где цена прошла 0.70.
         "hedge_bot_enabled": False,

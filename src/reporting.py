@@ -161,6 +161,12 @@ async def build_and_send_report() -> None:
         extra_lines.append(entry_confirm.status_line())
     except Exception:  # noqa: BLE001
         pass
+    # Источник цены сигнала и состояние потока Chainlink
+    try:
+        from src import chainlink_feed
+        extra_lines.append(chainlink_feed.status_line())
+    except Exception:  # noqa: BLE001
+        pass
     # Свои настройки монет (диапазон/ставка) — чтобы по отчёту было видно,
     # при каких настройках торговала каждая монета.
     try:

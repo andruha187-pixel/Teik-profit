@@ -41,7 +41,7 @@ import pandas as pd
 
 from config import settings
 from src import binance_feed, executor, indicators, polymarket_client, price_stream, runtime_state, storage, strategy
-from src import entry_confirm
+from src import entry_confirm, chainlink_feed
 from src.market_discovery import ActiveMarket
 from src.polymarket_client import OrderBookSnapshot
 from src.timeframes import TIMEFRAMES, TimeframeProfile
@@ -198,7 +198,13 @@ def check(asset: str, timeframe: TimeframeProfile, market: ActiveMarket, now: fl
     ticker = price_stream.latest(binance_feed.symbol_for(asset))
     if ticker is None:
         return "no_price"
-    up = ticker.price >= market.strike_price
+    # Цена и страйк для сигнала: Chainlink (как Polymarket) или Binance. Свечи
+    # (ATR/EMA/MACD) — всегда Binance, из потока выше.
+    pv = chainlink_feed.view(asset, market, ticker.price, now)
+    if pv.problem:
+        entry_confirm.record(market.slug, None, False, now)
+        return "no_chainlink"
+    up = pv.price >= pv.strike
     token = market.up_token_id if up else market.down_token_id
     other_token = market.down_token_id if up else market.up_token_id
     book = polymarket_client.ws_snapshot(token)
@@ -219,9 +225,10 @@ def check(asset: str, timeframe: TimeframeProfile, market: ActiveMarket, now: fl
     other = (polymarket_client.ws_snapshot(other_token, max_age_ms=OTHER_BOOK_MAX_AGE_MS)
              or OrderBookSnapshot(best_bid=None, best_ask=None, ask_liquidity_usdc=0.0, source="ws"))
     up_book, down_book = (book, other) if up else (other, book)
+    price = ind["close"] if pv.source == "binance" else pv.price
     decision = strategy.evaluate(
-        current_price=ind["close"],
-        strike_price=market.strike_price,
+        current_price=price,
+        strike_price=pv.strike,
         minutes_left=minutes_left,
         indicators=ind,
         up_book=up_book,
@@ -239,10 +246,12 @@ def check(asset: str, timeframe: TimeframeProfile, market: ActiveMarket, now: fl
         if len(_last_logged) > 2000:
             _last_logged.clear()
         _last_logged[market.slug] = now
-        storage.log_signal(market.slug, ind["close"], market.strike_price, decision,
-                           indicators=ind, up_book=up_book, down_book=down_book, tick_source="fast")
-        log.info("⚡ %s | price=%.4f strike=%.4f dir=%s left=%.2fm score=%.1f ask=%.3f — сигнал быстрой проверки",
-                 market.slug, ind["close"], market.strike_price, decision.direction, minutes_left,
+        storage.log_signal(market.slug, price, pv.strike, decision,
+                           indicators=ind, up_book=up_book, down_book=down_book, tick_source="fast",
+                           price_source=pv.log_source, binance_price=ind["close"],
+                           binance_strike=market.strike_price)
+        log.info("⚡ %s | %s price=%.4f strike=%.4f dir=%s left=%.2fm score=%.1f ask=%.3f — сигнал быстрой проверки",
+                 market.slug, pv.source, price, pv.strike, decision.direction, minutes_left,
                  decision.safety_score, book.best_ask)
     if not entry_confirm.confirmed(market.slug, decision.direction, now):
         # Сигнал есть, но ~3 с назад его не было — ждём, держится ли он

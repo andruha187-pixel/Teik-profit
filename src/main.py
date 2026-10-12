@@ -24,7 +24,7 @@ from config import settings
 from src import binance_feed, market_discovery, indicators, strategy
 from src.market_discovery import ActiveMarket
 from src import polymarket_client, storage, telegram_notify, executor, book_stream, runtime_state, reporting, wallet_tracker, momentum_tracker, hedge_bot
-from src import price_stream, fast_signal, entry_confirm
+from src import price_stream, fast_signal, entry_confirm, chainlink_feed
 from src.timeframes import TIMEFRAMES, TimeframeProfile
 
 logging.basicConfig(
@@ -100,7 +100,7 @@ async def _instance_tick(asset: str, timeframe: TimeframeProfile) -> None:
     ind = indicators.compute_indicator_snapshot(
         klines, timeframe.atr_period, timeframe.ema_fast, timeframe.ema_slow, timeframe.atr_lookback_for_regime,
     )
-    current_price = ind["close"]
+    binance_price = ind["close"]
 
     minutes_left = max(0.0, (market.end_time - time.time()) / 60)
 
@@ -110,25 +110,35 @@ async def _instance_tick(asset: str, timeframe: TimeframeProfile) -> None:
 
     # Окно входа — из настроек (⚙️ → ⏱ Окно входа), а не зашитое в профиль
     win_min, win_max = runtime_state.entry_window()
-    decision = strategy.evaluate(
-        current_price=current_price,
-        strike_price=market.strike_price,
-        minutes_left=minutes_left,
-        indicators=ind,
-        up_book=up_book,
-        down_book=down_book,
-        min_minutes_left=win_min,
-        max_minutes_left=win_max,
-        atr_distance_mult=timeframe.atr_distance_mult,
-        atr_spike_mult=timeframe.atr_spike_mult,
-        asset=asset,
-    )
+    # Цена и страйк: Chainlink (как Polymarket при расчёте исхода) или Binance —
+    # по настройке; без свежей цены/страйка Chainlink сигнал не считается.
+    pv = chainlink_feed.view(asset, market, binance_price)
+    if pv.problem:
+        decision = strategy.Decision(False, None, None, 0.0, minutes_left, 0.0, reasons=[pv.problem])
+    else:
+        decision = strategy.evaluate(
+            current_price=pv.price,
+            strike_price=pv.strike,
+            minutes_left=minutes_left,
+            indicators=ind,
+            up_book=up_book,
+            down_book=down_book,
+            min_minutes_left=win_min,
+            max_minutes_left=win_max,
+            atr_distance_mult=timeframe.atr_distance_mult,
+            atr_spike_mult=timeframe.atr_spike_mult,
+            asset=asset,
+        )
+    current_price = pv.price if pv.price is not None else binance_price
+    strike_price = pv.strike if pv.strike is not None else market.strike_price
     # Результат оценки — для подтверждения сигнала (вход, только если сигнал
     # был и ~3 с назад, см. src/entry_confirm.py)
     entry_confirm.record(market.slug, decision.direction, decision.should_enter)
 
-    storage.log_signal(market.slug, current_price, market.strike_price, decision,
-                        indicators=ind, up_book=up_book, down_book=down_book)
+    storage.log_signal(market.slug, current_price, strike_price, decision,
+                        indicators=ind, up_book=up_book, down_book=down_book,
+                        price_source=pv.log_source, binance_price=binance_price,
+                        binance_strike=market.strike_price)
 
     _instance_state[key] = {
         "market_slug": market.slug,
@@ -136,7 +146,7 @@ async def _instance_tick(asset: str, timeframe: TimeframeProfile) -> None:
         "timeframe": timeframe.label,
         "direction": decision.direction,
         "current_price": round(current_price, 2),
-        "strike_price": round(market.strike_price, 2),
+        "strike_price": round(strike_price, 2),
         "minutes_left": round(minutes_left, 2),
         "safety_score": decision.safety_score,
         "up_token_id": market.up_token_id,
@@ -146,8 +156,8 @@ async def _instance_tick(asset: str, timeframe: TimeframeProfile) -> None:
 
     active_book = up_book if decision.direction == "UP" else down_book
     log.info(
-        "%s | price=%.4f strike=%.4f dir=%s left=%.1fm score=%.1f enter=%s book=%s reasons=%s",
-        market.slug, current_price, market.strike_price, decision.direction,
+        "%s | %s price=%.4f strike=%.4f dir=%s left=%.1fm score=%.1f enter=%s book=%s reasons=%s",
+        market.slug, pv.log_source, current_price, strike_price, decision.direction,
         minutes_left, decision.safety_score, decision.should_enter, active_book.source, decision.reasons,
     )
 
@@ -284,6 +294,12 @@ async def main():
             if entry_confirm.enabled() else
             "⏱ Подтверждение сигнала: выкл — вход на первой проверке с сигналом."
         )
+        fast_note += "\n" + (
+            "📡 Цена сигнала: Chainlink — как у Polymarket. Первое окно после запуска по каждой "
+            "монете бот пропустит: страйк Chainlink берётся из потока, а он начал писать только сейчас."
+            if chainlink_feed.mode() == "chainlink" else
+            "📡 Цена сигнала: Binance."
+        )
         await telegram_notify.notify(
             f"🤖 Бот запущен. Режим: {'DRY RUN (без реальных сделок)' if dry_run else 'LIVE — реальные сделки!'}\n"
             f"Активы: {assets_line} (🔴 реальные сделки, 🧪 DRY)\nТаймфреймы: {timeframes_line}\n"
@@ -299,6 +315,8 @@ async def main():
         # Цена Binance потоком и быстрая проверка сигнала (раз в ~0.3 с).
         # Без живого стакана быстрой проверке не на что смотреть.
         price_stream_task = asyncio.create_task(price_stream.run_forever())
+        # Цена Chainlink — потоки цен Polymarket (PolyBolt и старый RTDS)
+        chainlink_task = asyncio.create_task(chainlink_feed.run_forever())
         fast_task = (asyncio.create_task(fast_signal.run_forever(_active_markets))
                      if settings.USE_LIVE_BOOK_STREAM else None)
 
@@ -319,6 +337,7 @@ async def main():
             if book_stream_task:
                 book_stream_task.cancel()
             price_stream_task.cancel()
+            chainlink_task.cancel()
             if fast_task:
                 fast_task.cancel()
             report_task.cancel()

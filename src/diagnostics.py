@@ -76,7 +76,7 @@ def skips_since() -> float:
 
 # --- рынки без сигнала ---
 
-NO_SIGNAL_ORDER = ("dist", "score", "below", "jump", "above", "vol")
+NO_SIGNAL_ORDER = ("chainlink", "dist", "score", "below", "jump", "above", "vol")
 
 
 def _no_signal_labels() -> dict:
@@ -88,6 +88,7 @@ def _no_signal_labels() -> dict:
         "jump": "цена перескочила диапазон",
         "above": "цена выше диапазона входа",
         "vol": "всплеск волатильности",
+        "chainlink": "нет цены или страйка Chainlink",
     }
 
 
@@ -106,6 +107,10 @@ def classify_markets(rows: list, columns: list) -> Counter:
     for slug, ticks in by_market.items():
         if any(t[i["should_enter"]] for t in ticks):
             counts["entered"] += 1
+            continue
+        # Режим Chainlink, а его цены/страйка не было ни на одном тике
+        if "price_source" in i and all(t[i["price_source"]] == "none" for t in ticks):
+            counts["chainlink"] += 1
             continue
         lo, hi = runtime_state.entry_range(slug.split("-")[0])
         prices = [t[i["entry_price"]] for t in ticks if t[i["entry_price"]] is not None]
@@ -198,6 +203,11 @@ def why_text(hours: float = 4.0, now: float | None = None) -> str:
     try:
         from src import entry_confirm  # здесь: entry_confirm -> runtime_state -> storage
         lines.append(entry_confirm.status_line())
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from src import chainlink_feed
+        lines.append(chainlink_feed.status_line())
     except Exception:  # noqa: BLE001
         pass
     mult = TIMEFRAMES[0].atr_distance_mult
