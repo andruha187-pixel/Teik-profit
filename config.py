@@ -2,6 +2,7 @@
 Централизованная конфигурация бота. Все настройки берутся из переменных
 окружения (.env), см. .env.example. Ничего не хардкодим — особенно ключи.
 """
+import json
 import os
 from dataclasses import dataclass, field
 from dotenv import load_dotenv
@@ -57,6 +58,25 @@ class Settings:
     FAST_ENTRY_ENABLED: bool = _get_bool("FAST_ENTRY_ENABLED", True)
     FAST_LOOP_INTERVAL_SEC: float = _get_float("FAST_LOOP_INTERVAL_SEC", 0.3)
 
+    # --- Цена Chainlink (src/chainlink_feed.py) ---
+    # По какой цене считать сигнал: "chainlink" — как Polymarket при расчёте
+    # исхода (цена и страйк Chainlink, Binance только для свечей), "binance" —
+    # как раньше. Переключается и в Telegram (⚙️ Настройки → 📡 Цена сигнала).
+    PRICE_SOURCE: str = os.getenv("PRICE_SOURCE", "chainlink").strip().lower()
+    # Цена Chainlink старше этого — сигнала нет (вход запрещён)
+    CHAINLINK_MAX_AGE_SEC: float = _get_float("CHAINLINK_MAX_AGE_SEC", 5.0)
+    # Новый поток цен Polymarket (PolyBolt, нужны API-ключи CLOB) и старый
+    # RTDS (без ключей, объявлен устаревшим). Работают оба, цены сливаются.
+    CHAINLINK_USE_POLYBOLT: bool = _get_bool("CHAINLINK_USE_POLYBOLT", True)
+    CHAINLINK_POLYBOLT_URL: str = os.getenv("CHAINLINK_POLYBOLT_URL", "wss://ws-live-v2.polymarket.com/ws")
+    CHAINLINK_USE_RTDS: bool = _get_bool("CHAINLINK_USE_RTDS", True)
+    CHAINLINK_RTDS_URL: str = os.getenv("CHAINLINK_RTDS_URL", "wss://ws-live-data.polymarket.com")
+    # API-ключи CLOB для PolyBolt. Не заданы — бот берёт их из SDK-клиента или
+    # выводит из POLY_PRIVATE_KEY (только чтение существующих).
+    POLY_API_KEY: str = os.getenv("POLY_API_KEY", "")
+    POLY_API_SECRET: str = os.getenv("POLY_API_SECRET", "")
+    POLY_API_PASSPHRASE: str = os.getenv("POLY_API_PASSPHRASE", "")
+
     # --- Подтверждение сигнала (src/entry_confirm.py) ---
     # Вход, только если сигнал был и ENTRY_CONFIRM_SEC секунд назад (в ту же
     # сторону). Архив 25.09–11.10, 240 входов: проигрышей 7 → 1, прибыль
@@ -105,7 +125,31 @@ class Settings:
     # чтобы не разгонять риск компаундингом на непроверенной вживую
     # стратегии. Меняй TRADE_SIZE_USDC пропорционально своему реальному
     # депозиту — это НЕ универсальная константа.
-    TRADE_SIZE_USDC: float = _get_float("TRADE_SIZE_USDC", 2.0)
+    TRADE_SIZE_USDC: float = _get_float("TRADE_SIZE_USDC", 20.0)
+    # Наши настройки по умолчанию (11–12.10): ставка — % от банка, 8% (у XRP 5%,
+    # тонкий стакан — см. ASSET_OVERRIDES). Банк = STARTING_BANKROLL_USDC +
+    # реальный результат с начала базы; поставь свой реальный баланс.
+    SIZING_MODE: str = os.getenv("SIZING_MODE", "percent").strip().lower()
+    BANKROLL_PCT: float = _get_float("BANKROLL_PCT", 8.0)
+    STARTING_BANKROLL_USDC: float = _get_float("STARTING_BANKROLL_USDC", 300.0)
+    # Какие монеты включены и какие торгуют реальными деньгами. По умолчанию
+    # реальных нет — все в DRY: 122 реальные сделки 09–12.10 перевеса не
+    # показали, версия с ценой Chainlink сначала проверяется виртуально.
+    # Реальные включаются в Telegram (🪙 Активы) или LIVE_ASSETS=btc,eth,xrp.
+    ENABLED_ASSETS: str = os.getenv("ENABLED_ASSETS", "btc,eth,xrp,sol,bnb,doge")
+    LIVE_ASSETS: str = os.getenv("LIVE_ASSETS", "")
+    # Свои диапазоны и ставки монет (JSON). На альтах вход по 0.95 не окупался
+    # (архив 25.09–11.10: 51 вход по 0.95 — 5 проигрышей при 2.6 ожидаемых),
+    # поэтому у всех, кроме BTC, максимум 0.94.
+    ASSET_OVERRIDES: str = os.getenv("ASSET_OVERRIDES", json.dumps({
+        "eth": {"min_entry_price": 0.90, "max_entry_price": 0.94},
+        "xrp": {"min_entry_price": 0.90, "max_entry_price": 0.94,
+                "sizing_mode": "percent", "bankroll_pct": 5.0, "trade_size_usdc": 20.0},
+        "sol": {"min_entry_price": 0.90, "max_entry_price": 0.94},
+        "bnb": {"min_entry_price": 0.90, "max_entry_price": 0.94},
+        "doge": {"min_entry_price": 0.90, "max_entry_price": 0.94},
+        "hype": {"min_entry_price": 0.90, "max_entry_price": 0.94},
+    }))
     # Общий потолок ОДНОВРЕМЕННО открытых позиций по ВСЕМ активам/таймфреймам
     # разом — без этого при 12 параллельных потоках (6 монет x 2 таймфрейма)
     # можно случайно открыть 12 позиций разом, если все совпадут по времени.
@@ -114,7 +158,7 @@ class Settings:
     # выгоду. Если в стакане меньше этого объёма по нужной цене — тик тихо
     # пропускается (не считается ошибкой, просто рынок сейчас неликвиден).
     MIN_VIABLE_TRADE_USDC: float = _get_float("MIN_VIABLE_TRADE_USDC", 2.0)
-    DAILY_LOSS_LIMIT_USDC: float = _get_float("DAILY_LOSS_LIMIT_USDC", 6.0)
+    DAILY_LOSS_LIMIT_USDC: float = _get_float("DAILY_LOSS_LIMIT_USDC", 60.0)
 
     # --- Исследовательский модуль (momentum_tracker) ---
     # Не торгует — просто пишет, при каких условиях (RSI/MACD/дисбаланс
