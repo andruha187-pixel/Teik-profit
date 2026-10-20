@@ -1,18 +1,10 @@
 """
-Живой стакан по WebSocket вместо REST-поллинга.
+Живой стакан Polymarket по WebSocket.
 
-Раньше (v1) бот на каждом тике дёргал REST `GET /book` — это лишние
-100-300ms сетевого раунд-трипа именно в момент принятия решения о входе,
-и цена, на которую мы смотрим, могла на несколько сотен мс отставать от
-реальной. Плюс Polymarket сам по себе обновляет свою книгу с задержкой
-относительно бирж типа Binance — так что "прогретый" WS-стакан не убирает
-этот системный лаг, но убирает НАШУ собственную задержку поверх него.
-
-Идея "прогрева": подписываемся на токены рынка сразу, как только рынок
-обнаружен (за много минут до возможного входа), и держим соединение
-открытым. К моменту, когда strategy.evaluate() реально нужна цена аска,
-она уже лежит в памяти, обновлённая пушем с сервера, а не тем, что мы
-только что сходили и спросили.
+Токены рынка подписываем заранее — 🔁 запись окон находит рынок следующего
+окна за полторы минуты до старта, — и держим соединение открытым: к моменту
+входа цена уже лежит в памяти, обновлённая пушем с сервера, без REST-запроса
+в момент решения.
 
 Формат сообщений — по официальной документации Polymarket
 (wss://ws-subscriptions-clob.polymarket.com/ws/market):
@@ -27,8 +19,6 @@ import time
 
 import websockets
 
-from config import settings
-
 log = logging.getLogger("book_stream")
 
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -42,9 +32,38 @@ _ws_ready = asyncio.Event()
 # Когда токен добавлен в подписку — чтобы сторож мог понять, что данные по
 # нему так и не пришли (см. _watchdog).
 _subscribed_at: dict[str, int] = {}
+# Рынок, который ещё не начался (бот подписывает следующее окно 5m
+# заранее): стакана по нему может не быть до старта — сторож до этого момента
+# (мс) на такие токены не смотрит, иначе рвал бы сокет всем каждые 30 с.
+_watch_after: dict[str, int] = {}
 _last_forced_reconnect_ms = 0
 WATCHDOG_NO_DATA_MS = 8000        # подписаны столько, а стакана так и нет — переподключаемся
 WATCHDOG_MIN_INTERVAL_MS = 30000  # не чаще раза в 30 с
+# Кому сообщать об изменении стакана токена: fn(asset_id, recv_ms, server_ms).
+# server_ms — поле timestamp сообщения Polymarket (их часы), может быть None.
+# Сейчас слушателей нет — крючок оставлен для исследований.
+_listeners: list = []
+
+
+def add_listener(fn) -> None:
+    if fn not in _listeners:
+        _listeners.append(fn)
+
+
+def remove_listener(fn) -> None:
+    if fn in _listeners:
+        _listeners.remove(fn)
+
+
+def _server_ms(msg: dict) -> int | None:
+    raw = msg.get("timestamp")
+    try:
+        ts = int(float(raw))
+    except (TypeError, ValueError):
+        return None
+    if ts <= 0:
+        return None
+    return ts * 1000 if ts < 10**12 else ts
 
 
 def now_ms() -> int:
@@ -74,11 +93,15 @@ def _apply_snapshot(asset: str, msg: dict) -> None:
     }
 
 
-def _apply_delta(msg: dict) -> None:
+def _apply_delta(msg: dict) -> list[str]:
+    """Применить изменения уровней. Возвращает токены, которых они коснулись."""
+    touched: list[str] = []
     for ch in msg.get("price_changes", []):
         asset = str(ch.get("asset_id") or "")
         if not asset:
             continue
+        if asset not in touched:
+            touched.append(asset)
         book = _books.setdefault(asset, {"bids": {}, "asks": {}, "received_ms": now_ms(), "tick_size": 0.01})
         try:
             price = float(ch.get("price"))
@@ -92,11 +115,18 @@ def _apply_delta(msg: dict) -> None:
         else:
             target[price] = size
         book["received_ms"] = now_ms()
+    return touched
 
 
-def subscribe(asset_ids: list[str]) -> None:
+def subscribe(asset_ids: list[str], watch_after_ms: int | None = None) -> None:
     """Идемпотентно добавляем токены в подписку. Реально уходит в сокет,
-    когда соединение поднято — если сокета ещё нет, он подхватит при коннекте."""
+    когда соединение поднято — если сокета ещё нет, он подхватит при коннекте.
+    watch_after_ms — не ждать стакан по этим токенам раньше этого момента
+    (рынок следующего окна, подписанный заранее; см. _watchdog)."""
+    if watch_after_ms:
+        for a in asset_ids:
+            if a:
+                _watch_after[a] = int(watch_after_ms)
     new_ids = [a for a in asset_ids if a and a not in _subscribed]
     if not new_ids:
         return
@@ -128,6 +158,7 @@ def unsubscribe(asset_ids: list[str]) -> None:
     for a in removed:
         _subscribed.discard(a)
         _subscribed_at.pop(a, None)
+        _watch_after.pop(a, None)
         _books.pop(a, None)
     try:
         _send_queue.put_nowait({"operation": "unsubscribe", "assets_ids": removed})
@@ -170,27 +201,6 @@ def ask_liquidity_upto(asset: str, max_price: float) -> float:
     return sum(price * size for price, size in b["asks"].items() if price <= max_price + 1e-9)
 
 
-def book_imbalance(asset: str, depth_levels: int = 10) -> float | None:
-    """
-    Дисбаланс стакана: доля объёма на покупку (bid) от общего объёма
-    (bid+ask) в первых depth_levels уровнях. >0.5 — давление вверх
-    (больше желающих купить, чем продать по видимым ценам), <0.5 — вниз.
-    Используется в momentum_tracker как один из индикаторов возможного
-    продолжения движения цены — сырой сигнал давления, которого нет ни
-    в ATR/EMA (это про историю цены), ни в объёме свечи Binance (это
-    вообще про другой рынок, BTC/USDT, а не про сам контракт Polymarket).
-    """
-    b = _books.get(asset)
-    if not b or (not b.get("bids") and not b.get("asks")):
-        return None
-    bid_vol = sum(size for _, size in sorted(b.get("bids", {}).items(), reverse=True)[:depth_levels])
-    ask_vol = sum(size for _, size in sorted(b.get("asks", {}).items())[:depth_levels])
-    total = bid_vol + ask_vol
-    if total <= 0:
-        return None
-    return bid_vol / total
-
-
 def tick_size(asset: str) -> float:
     b = _books.get(asset)
     return float(b["tick_size"]) if b and b.get("tick_size") else 0.01
@@ -209,6 +219,13 @@ async def _sender(ws) -> None:
         await ws.send(json.dumps(payload))
 
 
+def _missing_books(ts: int) -> list[str]:
+    """Подписанные токены без стакана дольше WATCHDOG_NO_DATA_MS — считая от
+    подписки, а у рынка следующего окна — от его старта (_watch_after)."""
+    return [a for a in _subscribed if a not in _books
+            and ts - max(_subscribed_at.get(a, ts), _watch_after.get(a, 0)) > WATCHDOG_NO_DATA_MS]
+
+
 async def _watchdog(ws) -> None:
     """Страховка на случай, если сервер всё равно не прислал стакан по новому
     токену: переподключаемся — при коннекте уходит стартовое сообщение с
@@ -217,8 +234,7 @@ async def _watchdog(ws) -> None:
     while True:
         await asyncio.sleep(3)
         ts = now_ms()
-        missing = [a for a in _subscribed
-                   if a not in _books and ts - _subscribed_at.get(a, ts) > WATCHDOG_NO_DATA_MS]
+        missing = _missing_books(ts)
         if missing and ts - _last_forced_reconnect_ms > WATCHDOG_MIN_INTERVAL_MS:
             _last_forced_reconnect_ms = ts
             log.warning("Нет стакана по %d токенам после подписки — переподключаю WS", len(missing))
@@ -226,21 +242,33 @@ async def _watchdog(ws) -> None:
             return
 
 
-def _handle_message(msg: dict) -> None:
+def _handle_message(msg: dict, recv_ms: int | None = None) -> None:
     """Обработка ОДНОГО объекта сообщения. Вызывается и напрямую (обычный
-    dict), и поэлементно, если сервер прислал JSON-массив (см. ниже)."""
+    dict), и поэлементно, если сервер прислал JSON-массив (см. ниже).
+    recv_ms — когда сообщение пришло (наши часы)."""
     event_type = msg.get("event_type")
+    touched: list[str] = []
     if event_type == "book":
         asset = str(msg.get("asset_id") or "")
         if asset:
             _apply_snapshot(asset, msg)
+            touched = [asset]
     elif event_type == "price_change":
-        _apply_delta(msg)
+        touched = _apply_delta(msg)
     elif event_type == "tick_size_change":
         asset = str(msg.get("asset_id") or "")
         new_tick = msg.get("new_tick_size")
         if asset in _books and new_tick:
             _books[asset]["tick_size"] = float(new_tick)
+    if touched and _listeners:
+        recv = now_ms() if recv_ms is None else recv_ms
+        server = _server_ms(msg)
+        for asset in touched:
+            for fn in _listeners:
+                try:
+                    fn(asset, recv, server)
+                except Exception as exc:  # noqa: BLE001 — слушатель не должен ронять поток
+                    log.debug("Слушатель стакана упал: %s", exc)
 
 
 async def run_forever() -> None:
@@ -269,6 +297,7 @@ async def run_forever() -> None:
                     async for raw in ws:
                         if not raw or raw == "PONG":
                             continue
+                        recv_ms = now_ms()
                         try:
                             parsed = json.loads(raw)
                         except (json.JSONDecodeError, ValueError) as exc:
@@ -286,7 +315,7 @@ async def run_forever() -> None:
                         messages = parsed if isinstance(parsed, list) else [parsed]
                         for msg in messages:
                             if isinstance(msg, dict):
-                                _handle_message(msg)
+                                _handle_message(msg, recv_ms)
                 finally:
                     sender_task.cancel()
                     watchdog_task.cancel()

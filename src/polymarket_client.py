@@ -26,15 +26,12 @@ Polymarket) — если после обновления вылезет что-�
 from __future__ import annotations
 import inspect
 import math
-import time
 from dataclasses import dataclass
 
 from config import settings
 from src import book_stream
 
 _client = None
-_last_prewarm_ms = 0
-PREWARM_INTERVAL_MS = 20_000
 
 
 @dataclass
@@ -85,7 +82,7 @@ def _field(obj, key):
     return getattr(obj, key, None)
 
 
-# Публичный алиас — executor.py читает поля ответа ордера тем же способом,
+# Публичный алиас — late_bot.py читает поля ответа ордера тем же способом,
 # не дублируя логику dict-vs-объект у себя.
 response_field = _field
 
@@ -125,9 +122,7 @@ async def get_orderbook(token_id: str, depth_levels: int = 5) -> OrderBookSnapsh
 def ws_snapshot(token_id: str, depth_levels: int = 5,
                 max_age_ms: int = book_stream.MAX_BOOK_AGE_MS) -> OrderBookSnapshot | None:
     """Стакан только из живого WS-кэша, без запроса. None — если по токену
-    нет свежего стакана или в нём нет asks. Быстрая проверка сигнала
-    (src/fast_signal.py) зовёт это до трёх раз в секунду на монету, поэтому
-    в REST отсюда не ходим никогда."""
+    нет свежего стакана или в нём нет asks. В REST отсюда не ходим никогда."""
     if not book_stream.is_fresh(token_id, max_age_ms):
         return None
     best_ask = book_stream.best_ask(token_id)
@@ -174,29 +169,6 @@ def round_price_for_buy(price: float, tick_size: float) -> float:
     return round(steps * tick_size, 6)
 
 
-async def prewarm_transport() -> bool:
-    """
-    Прогрев авторизованного HTTP-транспорта: безобидный read-only запрос
-    баланса, который выполняет тот же путь (соединение, TLS, аутентификация),
-    что и реальный ордер, но не имеет торгового эффекта. Вызывается фоновой
-    задачей (fire-and-forget), только когда DRY_RUN=false и ключ настроен.
-    """
-    global _last_prewarm_ms
-    now = int(time.time() * 1000)
-    if now - _last_prewarm_ms < PREWARM_INTERVAL_MS:
-        return False
-    if not settings.POLY_PRIVATE_KEY:
-        return False
-    try:
-        client = await _get_client()
-        await client.get_balance_allowance(asset_type="COLLATERAL")
-        _last_prewarm_ms = now
-        return True
-    except Exception:
-        _last_prewarm_ms = now
-        return False
-
-
 async def place_buy_order(token_id: str, price_cap: float, amount_usdc: float, tick_size: float = 0.01,
                           order_type: str = "FOK") -> dict:
     """
@@ -206,9 +178,9 @@ async def place_buy_order(token_id: str, price_cap: float, amount_usdc: float, t
     с ним SDK ставит ордер ровно по этой цене и не запрашивает стакан.
 
     order_type:
-      "FOK" — всё или ничего (так работают хедж и копитрейдинг);
+      "FOK" — всё или ничего;
       "FAK" — исполнить сколько есть по цене не хуже потолка, остаток
-              отменить (так входит стратегия — см. executor._execute_live_buy).
+              отменить (так входит ⏱ бот — см. late_bot._live_buy).
     """
     client = await _get_client()
     return await client.place_market_order(
@@ -254,7 +226,7 @@ _warmed_tokens: set[str] = set()
 async def prewarm_market(token_ids: list[str]) -> int:
     """Прогрев рынка в SDK для токенов нового окна. Перед первым ордером по
     токену SDK запрашивает метаданные рынка (шаг цены, тип рынка, комиссию) —
-    лишний сетевой запрос ровно в момент сигнала, а 5m-рынок новый каждые
+    лишний сетевой запрос ровно в момент сигнала, а рынок 5m новый каждые
     5 минут. create_market_order подписывает ордер локально и НЕ отправляет
     его, но по пути кладёт метаданные в кэш SDK. Ошибки игнорируем: прогрев
     необязателен."""
@@ -282,35 +254,3 @@ async def prewarm_market(token_ids: list[str]) -> int:
         except Exception:  # noqa: BLE001
             pass
     return warmed
-
-
-async def place_sell_order(token_id: str, shares: float, min_price: float | None = None) -> dict:
-    """
-    Market-ордер SELL с исполнением FOK — досрочное закрытие позиции
-    (стоп-лосс по проценту, см. executor.check_position_stop_losses).
-
-    ВАЖНО: для SELL этот SDK использует параметр `shares` (количество акций),
-    а не `amount`, как для BUY (доллары) — это подтверждено официальной
-    документацией Polymarket отдельно от BUY-примеров, не мой домысел по
-    аналогии. min_price — защита от слиппеджа на продаже (не даём продать
-    дешевле этой цены); если конкретная версия SDK не примет этот kwarg,
-    отправляем без него — не хотим падать всей функцией из-за
-    необязательного параметра защиты в SDK, который всё ещё в статусе beta.
-    """
-    # Округляем через Decimal, а не float: 14.29*0.94 как float даёт
-    # 13.432599999999999 (артефакт двоичного представления десятичных
-    # дробей), а не чисто 13.4326 — биржа отклоняет такие "грязные" числа
-    # (реальный случай на хедж-боте, 2026-09-22: "invalid amounts...
-    # max accuracy of 2 decimals... max of 4 decimals").
-    from decimal import Decimal, ROUND_DOWN
-    shares_dec = Decimal(str(shares)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-    client = await _get_client()
-    kwargs = dict(token_id=token_id, side="SELL", shares=str(shares_dec), order_type="FOK")
-    if min_price is not None:
-        price_dec = Decimal(str(min_price)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-        kwargs["min_price"] = str(price_dec)
-    try:
-        return await client.place_market_order(**kwargs)
-    except TypeError:
-        kwargs.pop("min_price", None)
-        return await client.place_market_order(**kwargs)

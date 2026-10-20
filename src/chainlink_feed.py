@@ -1,20 +1,11 @@
 """
 Цена Chainlink — та, по которой Polymarket закрывает Up/Down-рынки.
 
-Зачем. Рынок «Up» выигрывает, если цена Chainlink в конце окна не ниже, чем
-в начале. Бот же мерил расстояние до страйка по Binance (BTCUSDT): и страйк,
-и текущая цена — с другой биржи и в USDT. Разница с Chainlink бывает в
-несколько bp — ровно столько, сколько отделяет вход по 0.90–0.95 от
-проигрыша. По 122 реальным сделкам 09–12.10 проигрышей было 16 при 8.5
-заложенных в цену — бот входил, когда «по Binance» было далеко от страйка,
-а по Chainlink, на которую смотрят остальные участники рынка, — нет.
-
-Теперь в режиме Chainlink (по умолчанию):
-  - текущая цена — последняя цена Chainlink;
-  - страйк — цена Chainlink на момент начала окна (из истории потока);
-  - Binance остаётся для свечей: ATR, EMA, MACD;
-  - нет свежей цены Chainlink или бот не застал начало окна — сигнала нет,
-    вход запрещён (в отчёте причина).
+Зачем боту. Исход окна 5m — «Up», если цена Chainlink в конце не ниже, чем в
+начале (страйк). Бот ⏱ берёт отсюда страйк (цена на начало окна), текущую цену
+(насколько она ушла от страйка — главное условие входа) и цену на конце окна
+(ранний исход, если стакан в последние секунды его не показал). Официальный
+исход приходит позже из Gamma API.
 
 Источники — оба от самого Polymarket, без сторонних ключей:
 1. PolyBolt — новый поток цен Polymarket: wss://ws-live-v2.polymarket.com/ws,
@@ -40,7 +31,6 @@ from dataclasses import dataclass, field
 import websockets
 
 from config import settings
-from src import runtime_state
 
 log = logging.getLogger("chainlink_feed")
 
@@ -79,6 +69,19 @@ _last_rx: dict[str, float] = {}      # монета -> наше время по�
 _source: dict[str, str] = {}         # монета -> поставщик цены (chainlink, …)
 _strikes: dict[str, float] = {}      # слаг рынка -> страйк Chainlink
 _transports: dict[str, Transport] = {"polybolt": Transport("polybolt"), "rtds": Transport("rtds")}
+# Кому ещё отдавать точки цены: fn(монета, время оракула с, цена, наше время с).
+# Сейчас слушателей нет — крючок оставлен для исследований.
+_listeners: list = []
+
+
+def add_listener(fn) -> None:
+    if fn not in _listeners:
+        _listeners.append(fn)
+
+
+def remove_listener(fn) -> None:
+    if fn in _listeners:
+        _listeners.remove(fn)
 
 
 def reset() -> None:
@@ -118,15 +121,29 @@ def _to_sec(ts) -> float | None:
     return v / 1000.0 if v > 1e11 else v
 
 
+# PolyBolt отдаёт цену Chainlink Data Streams целым числом с 18 знаками
+# (84019.04 приходит как 8.4019e22). 12.10 бот смешивал такие точки с
+# обычными из старого RTDS: страйк и цена оказывались в разных единицах,
+# расстояние до страйка — «бесконечным», фильтр по ATR не работал, и бот
+# входил почти в каждый рынок, где одна из сторон стоила 0.90–0.94.
+SCALED_ABOVE = 1e15          # ни одна наша монета не стоит дороже $1e15
+SCALE = 1e18
+
+
+def normalize_price(v: float) -> float:
+    return v / SCALE if v > SCALED_ABOVE else v
+
+
 def _to_price(p: dict):
-    for key in ("full_accuracy_value", "fullAccuracyValue", "value", "price"):
+    # value — обычные единицы; full_accuracy_value — запасной (может быть ×10^18)
+    for key in ("value", "price", "full_accuracy_value", "fullAccuracyValue"):
         if p.get(key) is not None:
             try:
                 v = float(p[key])
             except (TypeError, ValueError):
                 continue
             if v > 0:
-                return v
+                return normalize_price(v)
     return None
 
 
@@ -238,6 +255,11 @@ def _store(points, transport: Transport) -> int:
     for asset, ts, val, src in points:
         add_point(asset, ts, val, src, rx=rx)
         transport.symbols.add(asset)
+        for fn in _listeners:
+            try:
+                fn(asset, ts, val, rx)
+            except Exception as exc:  # noqa: BLE001 — слушатель не должен ронять поток
+                log.debug("Слушатель Chainlink упал: %s", exc)
     if points:
         transport.last_data = rx
         transport.points += len(points)
@@ -273,6 +295,20 @@ def price_at(asset: str, ts_sec: float, tolerance_sec: float = STRIKE_TOLERANCE_
     return None
 
 
+def price_after(asset: str, ts_sec: float, tolerance_sec: float = STRIKE_TOLERANCE_SEC) -> float | None:
+    """Первая точка не раньше ts_sec (не дальше tolerance). В отличие от
+    price_at не берёт точку ДО ts_sec: цена на конце окна известна только
+    когда пришла точка после его конца (иначе это ещё не цена закрытия)."""
+    a = asset.lower()
+    tss = _hist_ts.get(a)
+    if not tss:
+        return None
+    i = bisect.bisect_left(tss, ts_sec)
+    if i < len(tss) and tss[i] - ts_sec <= tolerance_sec:
+        return _hist_val[a][i]
+    return None
+
+
 def strike_for(slug: str, asset: str, start_ts: float) -> float | None:
     """Страйк рынка по Chainlink: цена на момент начала окна. Найденный
     запоминаем — дальше рынок его не меняет."""
@@ -289,69 +325,6 @@ def strike_for(slug: str, asset: str, start_ts: float) -> float | None:
 
 def source_of(asset: str) -> str | None:
     return _source.get(asset.lower())
-
-
-def max_age_sec() -> float:
-    return max(0.5, float(settings.CHAINLINK_MAX_AGE_SEC))
-
-
-def mode() -> str:
-    return "chainlink" if str(runtime_state.get("price_source") or "").lower() == "chainlink" else "binance"
-
-
-@dataclass
-class PriceView:
-    """Цена и страйк, по которым считается сигнал."""
-    source: str                   # "chainlink" | "binance"
-    price: float | None
-    strike: float | None
-    binance_price: float | None
-    binance_strike: float | None
-    problem: str | None = None    # почему сигнал не считается (режим Chainlink без данных)
-
-    @property
-    def log_source(self) -> str:
-        return "none" if self.problem else self.source
-
-
-def view(asset: str, market, binance_price: float | None, now: float | None = None) -> PriceView:
-    """Режим Binance — как раньше. Режим Chainlink — цена и страйк Chainlink;
-    если их нет или цена несвежая — problem (вход запрещён)."""
-    b_strike = getattr(market, "strike_price", None)
-    if mode() != "chainlink":
-        return PriceView("binance", binance_price, b_strike, binance_price, b_strike)
-    price, age = latest(asset, now)
-    strike = strike_for(market.slug, asset, market.start_time)
-    problem = None
-    if price is None:
-        problem = "нет цены Chainlink"
-    elif age > max_age_sec():
-        problem = f"цена Chainlink старше {max_age_sec():g} с"
-    elif strike is None:
-        problem = "нет страйка Chainlink (бот не застал начало окна)"
-    return PriceView("chainlink", price, strike, binance_price, b_strike, problem)
-
-
-def status_line(assets=None, now: float | None = None) -> str:
-    """Строка для меню, «🔎 Почему нет сделок» и отчёта (без Markdown-символов)."""
-    if mode() != "chainlink":
-        return "📡 Цена сигнала: Binance (как раньше)"
-    now = _now() if now is None else now
-    assets = [a for a in (assets if assets is not None else settings.ASSETS) if runtime_state.is_asset_enabled(a)]
-    parts = []
-    for a in assets:
-        price, age = latest(a, now)
-        ok = price is not None and age <= max_age_sec()
-        parts.append(f"{a.upper()} {'✅' if ok else '❌'}")
-    tr = []
-    for t in _transports.values():
-        if t.disabled:
-            tr.append(f"{'PolyBolt' if t.name == 'polybolt' else 'старый RTDS'}: {t.disabled}")
-        else:
-            alive = t.connected and now - t.last_data <= 30
-            tr.append(f"{'PolyBolt' if t.name == 'polybolt' else 'старый RTDS'} {'✅' if alive else '❌'}")
-    line = "📡 Цена сигнала: Chainlink — " + (", ".join(parts) if parts else "нет включённых монет")
-    return (line + " | " + ", ".join(tr)).replace("_", " ")
 
 
 def transports() -> dict:
