@@ -6,6 +6,7 @@
   - chainlink_feed — цена Chainlink (страйк, текущая цена, исход окна);
   - atr_feed       — ATR по 1-минутным свечам Binance;
   - late_bot       — 🔁 запись окон всех монет и ⏱ ставки (тест и реальные);
+  - late15         — ⏱15 запись окон 15m и тестовые ставки по ним (реальных нет; свой цикл);
   - reporting      — файлы в Telegram раз в REPORT_INTERVAL_HOURS;
   - Telegram       — меню и уведомления.
 """
@@ -14,7 +15,8 @@ import asyncio
 import logging
 
 from config import settings
-from src import atr_feed, book_stream, chainlink_feed, late_bot, reporting, runtime_state, storage, telegram_notify
+from src import (atr_feed, book_stream, chainlink_feed, late15, late_bot, reporting, runtime_state, storage,
+                 telegram_notify)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("polymarket-5m-late-bot")
@@ -41,7 +43,8 @@ async def main():
         except Exception as exc:  # noqa: BLE001
             log.warning("Стартовое сообщение не ушло: %s", exc)
 
-        jobs = [chainlink_feed.run_forever(), atr_feed.run_forever(), late_bot.run_forever(), reporting.report_loop()]
+        jobs = [chainlink_feed.run_forever(), atr_feed.run_forever(), late_bot.run_forever(), late15.run_forever(),
+                reporting.report_loop()]
         if settings.USE_LIVE_BOOK_STREAM:
             jobs.append(book_stream.run_forever())
         tasks = [asyncio.create_task(j) for j in jobs]

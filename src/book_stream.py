@@ -184,6 +184,19 @@ def best_bid(asset: str) -> float | None:
     return max(b["bids"])
 
 
+def top_of_book(asset: str) -> tuple:
+    """(лучший бид, объём на нём, лучший аск, объём на нём). None по отсутствующей стороне.
+    Один проход по стакану — для записи точки пути (симуляция мейкера хочет и бид, и объёмы)."""
+    b = _books.get(asset)
+    if not b:
+        return (None, None, None, None)
+    bids, asks = b.get("bids") or {}, b.get("asks") or {}
+    bid = max(bids) if bids else None
+    ask = min(asks) if asks else None
+    return (bid, bids.get(bid) if bid is not None else None,
+            ask, asks.get(ask) if ask is not None else None)
+
+
 def ask_liquidity_usdc(asset: str, depth_levels: int = 5) -> float:
     b = _books.get(asset)
     if not b or not b.get("asks"):
