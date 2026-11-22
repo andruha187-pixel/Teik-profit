@@ -88,19 +88,30 @@ class Settings:
     # неизвестен — LATE_ADDON_USDC). 0 — фиксированная сумма.
     LATE_ADDON_PCT: float = _get_float("LATE_ADDON_PCT", 0.0)
 
-    # --- ⏱15 15-минутные рынки: ТОЛЬКО запись окон и тестовые ставки (реальных ордеров нет) ---
-    # Собираем архив 15m (как по 5m), чтобы потом подобрать для 15m своё правило. Вкл/выкл — кнопкой ⏱ 15m.
+    # --- ⏱15 15-минутные рынки: запись окон, тестовые и (по кнопке) реальные ставки с докупкой ---
+    # Окна 15m пишутся по всем ASSETS (архив для подбора правила). Вкл/выкл — кнопкой ⏱ 15m.
     LATE15_ON: bool = _get_bool("LATE15_ON", True)
-    # По каким монетам ставить тестовые ставки 15m (пишутся окна всех ASSETS)
-    LATE15_COINS: str = os.getenv("LATE15_COINS", "btc,eth,sol,xrp,doge,bnb")
-    # Правило тестовой ставки 15m — по умолчанию как у 5m-бота (без своих порогов монет)
-    LATE15_FROM_SEC: int = _get_int("LATE15_FROM_SEC", 210)
-    LATE15_TO_SEC: int = _get_int("LATE15_TO_SEC", 200)
+    # По каким монетам ставить 15m (тест и реальные). Правило подобрано по BTC — по умолчанию только он.
+    LATE15_COINS: str = os.getenv("LATE15_COINS", "btc")
+    # Правило 15m по архиву 18.09–22.11: за 8:30–8:00 до конца сторона по цене 0.96–0.97, ≥0.10% и ≥2 ATR
+    # (окно и сумма — ещё и кнопками в ⏱ 15m; цена и пороги — только здесь)
+    LATE15_FROM_SEC: int = _get_int("LATE15_FROM_SEC", 510)
+    LATE15_TO_SEC: int = _get_int("LATE15_TO_SEC", 480)
     LATE15_MIN_PRICE: float = _get_float("LATE15_MIN_PRICE", 0.96)
     LATE15_MAX_PRICE: float = _get_float("LATE15_MAX_PRICE", 0.97)
     LATE15_MIN_DIST_PCT: float = _get_float("LATE15_MIN_DIST_PCT", 0.10)
     LATE15_MIN_ATR: float = _get_float("LATE15_MIN_ATR", 2.0)
+    # Сумма входа 15m, USDC — одна для теста и реальной ставки (не меньше 5 акций)
     LATE15_STAKE_USDC: float = _get_float("LATE15_STAKE_USDC", 5.0)
+    # true — реальные ставки 15m сразу после старта (идут, только когда бот в 🔴 LIVE); по умолчанию — только
+    # тест, реальные включаются кнопкой в ⏱ 15m
+    LATE15_LIVE: bool = _get_bool("LATE15_LIVE", False)
+    # ➕ Докупка 15m: после ставки цена нашей стороны опустилась до уровня — покупка не дороже него (каждый
+    # уровень — раз за окно). Тестовая — всегда, пока включена; реальная — если по окну есть реальная ставка 15m.
+    LATE15_ADDON_ON: bool = _get_bool("LATE15_ADDON_ON", True)
+    LATE15_ADDON_LEVELS: str = os.getenv("LATE15_ADDON_LEVELS", "0.95,0.94,0.93,0.92,0.91,0.90")
+    # Сумма на уровень, USDC (реальная — не меньше 5 акций: при уровне 0.95 это ~$4.76)
+    LATE15_ADDON_USDC: float = _get_float("LATE15_ADDON_USDC", 5.0)
     # Путь окна 15m: с REC15_FROM_SEC секунд до конца (900 — всё окно) каждые REC15_STEP_SEC секунд
     # (до REC_TO_SEC, хранится REC_KEEP_DAYS дней — как у 5m)
     REC15_FROM_SEC: int = _get_int("REC15_FROM_SEC", 900)
