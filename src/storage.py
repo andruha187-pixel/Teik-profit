@@ -114,7 +114,7 @@ CREATE TABLE IF NOT EXISTS late15_windows (
 );
 CREATE INDEX IF NOT EXISTS idx_late15_windows_start ON late15_windows(start_ts);
 
--- ⏱15 Тестовые ставки по 15m-окнам (реальных нет): те же поля, что у late_trades.
+-- ⏱15 Ставки по 15m-окнам — тестовые (dry_run=1) и реальные (dry_run=0): те же поля, что у late_trades.
 CREATE TABLE IF NOT EXISTS late15_trades (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts INTEGER NOT NULL,
@@ -145,6 +145,36 @@ CREATE TABLE IF NOT EXISTS late15_trades (
     UNIQUE(asset, start_ts, dry_run)
 );
 CREATE INDEX IF NOT EXISTS idx_late15_trades_ts ON late15_trades(ts);
+
+-- ⏱15 ➕ Докупки 15m на откате: те же поля, что у late_addons (уровень 0 / ARMED — окно, где докупка ждала).
+CREATE TABLE IF NOT EXISTS late15_addons (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts INTEGER NOT NULL,
+    asset TEXT,
+    start_ts INTEGER,
+    slug TEXT,
+    side TEXT,
+    token_id TEXT,
+    level REAL,
+    entry_ask REAL,
+    t_left REAL,
+    ask REAL,
+    price REAL,
+    size_usdc REAL,
+    shares REAL,
+    fee_usdc REAL,
+    dry_run INTEGER,
+    status TEXT,
+    order_id TEXT,
+    outcome TEXT,
+    pnl_usdc REAL,
+    settled_ts INTEGER,
+    rule TEXT,
+    note TEXT,
+    UNIQUE(asset, start_ts, level, dry_run)
+);
+CREATE INDEX IF NOT EXISTS idx_late15_addons_ts ON late15_addons(ts);
+CREATE INDEX IF NOT EXISTS idx_late15_addons_win ON late15_addons(asset, start_ts);
 """
 
 
@@ -387,7 +417,7 @@ def addons_export(since_ts: int) -> list[tuple]:
 
 
 # ------------------------------------------------- ⏱15 окна и тест 15m ----
-# Отдельные таблицы: 15m не попадает ни в итоги 5m, ни в банки монет, ни в дневной стоп.
+# Отдельные таблицы: 15m не попадает ни в итоги 5m, ни в банки монет; в дневной стоп — реальные ставки 15m идут.
 
 SPAN15 = 900
 
@@ -457,10 +487,21 @@ def t15_log(**f) -> int | None:
         return cur.lastrowid if cur.rowcount else None
 
 
-def t15_exists(asset: str, start_ts: int) -> bool:
+def t15_exists(asset: str, start_ts: int, dry_run: bool | None = None) -> bool:
+    q = "SELECT 1 FROM late15_trades WHERE asset = ? AND start_ts = ?"
+    args: list = [asset, int(start_ts)]
+    if dry_run is not None:
+        q += " AND dry_run = ?"
+        args.append(int(bool(dry_run)))
     with _conn() as conn:
-        return conn.execute("SELECT 1 FROM late15_trades WHERE asset = ? AND start_ts = ? LIMIT 1",
-                            (asset, int(start_ts))).fetchone() is not None
+        return conn.execute(q + " LIMIT 1", args).fetchone() is not None
+
+
+def t15_get(asset: str, start_ts: int, dry_run: bool) -> dict | None:
+    with _conn() as conn:
+        row = conn.execute(f"SELECT {', '.join(TRADE_COLUMNS)} FROM late15_trades WHERE asset = ? AND start_ts = ? "
+                           "AND dry_run = ? LIMIT 1", (asset, int(start_ts), int(bool(dry_run)))).fetchone()
+    return dict(zip(TRADE_COLUMNS, row)) if row else None
 
 
 def t15_open(ended_before: int) -> list[dict]:
@@ -488,3 +529,46 @@ def t15_export(since_ts: int) -> list[tuple]:
     with _conn() as conn:
         return conn.execute(f"SELECT {', '.join(TRADE_COLUMNS)} FROM late15_trades WHERE ts >= ? ORDER BY ts",
                             (since_ts,)).fetchall()
+
+
+def a15_log(**f) -> int | None:
+    """Записать докупку 15m. None — по этому уровню окна такая уже есть."""
+    if "level" in f and f["level"] is not None:
+        f["level"] = round(float(f["level"]), 2)
+    cols = [c for c in ADDON_COLUMNS if c in f and c != "id"]
+    with _conn() as conn:
+        cur = conn.execute(f"INSERT OR IGNORE INTO late15_addons ({', '.join(cols)}) "
+                           f"VALUES ({', '.join('?' for _ in cols)})", [f[c] for c in cols])
+        return cur.lastrowid if cur.rowcount else None
+
+
+def _a15_rows(where: str, args: list) -> list[dict]:
+    with _conn() as conn:
+        rows = conn.execute(f"SELECT {', '.join(ADDON_COLUMNS)} FROM late15_addons WHERE {where}", args).fetchall()
+    return [dict(zip(ADDON_COLUMNS, r)) for r in rows]
+
+
+def a15_open(ended_before: int) -> list[dict]:
+    return _a15_rows(f"outcome IS NULL AND start_ts + {SPAN15} < ? ORDER BY start_ts, level DESC",
+                     [int(ended_before)])
+
+
+def a15_settle(addon_id: int, outcome: str, pnl_usdc: float) -> bool:
+    with _conn() as conn:
+        cur = conn.execute("UPDATE late15_addons SET outcome = ?, pnl_usdc = ?, settled_ts = ? "
+                           "WHERE id = ? AND outcome IS NULL", (outcome, pnl_usdc, int(time.time()), addon_id))
+        return cur.rowcount > 0
+
+
+def a15_since(since_ts: int) -> list[dict]:
+    return _a15_rows("ts >= ? ORDER BY ts, level DESC", [int(since_ts)])
+
+
+def a15_window(asset: str, start_ts: int) -> list[dict]:
+    return _a15_rows("asset = ? AND start_ts = ? ORDER BY level DESC", [asset, int(start_ts)])
+
+
+def a15_export(since_ts: int) -> list[tuple]:
+    with _conn() as conn:
+        return conn.execute(f"SELECT {', '.join(ADDON_COLUMNS)} FROM late15_addons WHERE ts >= ? "
+                            "ORDER BY ts, level DESC", (int(since_ts),)).fetchall()

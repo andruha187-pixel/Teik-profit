@@ -955,10 +955,12 @@ def dry_fill(token: str, cap: float, usdc: float, used: dict | None = None) -> t
 
 
 def today_live_pnl(now: float | None = None) -> float:
-    """Итог реальных ставок и реальных докупок, закрытых сегодня (UTC) — для дневного стопа."""
+    """Итог реальных ставок и реальных докупок, закрытых сегодня (UTC) — для дневного стопа. Вместе с ⏱15:
+    реальные ставки и докупки 15m — с того же кошелька, стоп общий."""
     now = time.time() if now is None else now
     day = int(now // 86400) * 86400
-    rows = storage.trades_since(day - 3600) + storage.addons_since(day - 3600)
+    rows = (storage.trades_since(day - 3600) + storage.addons_since(day - 3600)
+            + storage.t15_since(day - 3600) + storage.a15_since(day - 3600))
     return sum(t["pnl_usdc"] or 0.0 for t in rows if not t["dry_run"] and t["settled_ts"] and t["settled_ts"] >= day)
 
 

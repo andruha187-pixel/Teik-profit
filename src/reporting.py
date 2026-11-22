@@ -5,8 +5,8 @@
                   CSV внутри zip — путь занимает много места;
   *_trades.csv  — ставки ⏱ (тестовые и реальные);
   *_addons.csv  — ➕ докупки на откате (тестовые и реальные), если за период были;
-  *_windows15.zip, *_trades15.csv — ⏱15 окна 15m (тот же формат, путь с 15:00 до конца)
-                  и тестовые ставки 15m, если за период были.
+  *_windows15.zip, *_trades15.csv, *_addons15.csv — ⏱15 окна 15m (тот же формат, путь с 15:00 до конца),
+                  ставки 15m (тестовые и реальные) и ➕ докупки 15m, если за период были.
 В каждом — период и 30 минут прошлого (окна за это время уже с исходами).
 Кнопка 📤 Файлы — всё, что в базе: окна по дням, частями до ~40 МБ.
 Момент последнего отчёта хранится в bot_settings — переживает рестарт.
@@ -104,7 +104,7 @@ def zip_windows(base: str, since_ts: int, until_ts: int, export=None, kind: str 
 
 
 def _files15(base: str, captions: dict, rows_since: int, until_ts: int, files: list) -> int:
-    """⏱15 окна 15m (zip) и тестовые ставки 15m (CSV) — в список файлов. Ошибка здесь не мешает файлам 5m.
+    """⏱15 окна 15m (zip), ставки и докупки 15m (CSV) — в список файлов. Ошибка здесь не мешает файлам 5m.
     Захват прошлого на 15 минут больше, чем у 5m: окно 15m длиннее, его исход приходит позже."""
     n = 0
     rows_since = max(0, int(rows_since) - storage.SPAN15)
@@ -118,8 +118,14 @@ def _files15(base: str, captions: dict, rows_since: int, until_ts: int, files: l
         if t15:
             path = f"{base}_trades15.csv"
             _write_csv(path, storage.TRADE_COLUMNS, t15)
-            files.append((path, captions.get("trades15") or "⏱ Тест 15m"))
+            files.append((path, captions.get("trades15") or "⏱ Ставки 15m"))
             n += len(t15)
+        a15 = storage.a15_export(rows_since)
+        if a15:
+            path = f"{base}_addons15.csv"
+            _write_csv(path, storage.ADDON_COLUMNS, a15)
+            files.append((path, captions.get("addons15") or "➕ Докупки 15m"))
+            n += len(a15)
     except Exception as exc:  # noqa: BLE001
         log.warning("Файлы 15m не собрались: %s", exc)
     return n
@@ -191,7 +197,8 @@ async def build_and_send_report() -> int:
 def _captions15(from_label: str, to_label: str, since_ts: int) -> dict:
     try:
         return {"windows15": late15.report_caption(from_label, to_label, since_ts),
-                "trades15": late15.trades_caption()}
+                "trades15": late15.trades_caption(),
+                "addons15": late15.addons_caption(since_ts)}
     except Exception as exc:  # noqa: BLE001 — подпись 15m не должна мешать отчёту 5m
         log.warning("Подпись 15m: %s", exc)
         return {}

@@ -1,19 +1,22 @@
 """
-⏱15 15-минутные рынки Up/Down — ТОЛЬКО запись окон и тестовые ставки. Реальных ордеров здесь нет вовсе.
+⏱15 15-минутные рынки Up/Down: запись окон, тестовые и реальные ставки с ➕ докупкой на откате.
 
-Зачем. Правило 5m-бота подобрано и проверено по архиву 5m. Своего архива 15m нет (в старых логах — ~11 дней BTC
-и по ~2.5 дня у ETH, SOL, XRP), поэтому сначала копим его так же, как по 5m: по каждому окну каждой монеты (ASSETS) —
-страйк (цена Chainlink на старте окна), путь [секунд до конца, ask UP, ask DOWN, цена Chainlink, ATR, bid UP,
-bid DOWN, объём ask UP, объём ask DOWN, объём bid UP, объём bid DOWN] каждые REC15_STEP_SEC секунд с REC15_FROM_SEC
-до конца и исход (ранний — стакан / Chainlink, и официальный). По этому архиву потом подбираем для 15m время входа,
-цену и пороги и проверяем на второй половине данных.
+Запись. По каждому окну каждой монеты (ASSETS) — страйк (цена Chainlink на старте окна), путь [секунд до конца,
+ask UP, ask DOWN, цена Chainlink, ATR, bid UP, bid DOWN, объём ask UP, объём ask DOWN, объём bid UP, объём bid DOWN]
+каждые REC15_STEP_SEC секунд с REC15_FROM_SEC до конца и исход (ранний — стакан / Chainlink, и официальный).
 
-Тестовая ставка 15m (по стакану, как тест у 5m) — по монетам LATE15_COINS, по правилу LATE15_*: по умолчанию как у
-5m-бота — за 3:30–3:20 до конца сторона по цене 0.96–0.97, цена Chainlink ушла от страйка на ≥0.10% и ≥2 ATR;
-обе стороны, без своих порогов монет. Одна ставка на окно.
+Ставка 15m — по монетам LATE15_COINS (по умолчанию BTC), правило подобрано по архиву 15m 18.09–22.11: за 8:30–8:00
+до конца сторона по цене 0.96–0.97, цена Chainlink ушла от страйка на ≥0.10% и ≥2 ATR; обе стороны, одна ставка на
+окно. Тестовая (по стакану) — всегда; реальная — если 15m 🔴 (кнопка в ⏱ 15m) и бот в 🔴 LIVE: FAK не дороже
+ask + 1¢, не исполнилось — снова, пока идёт окно входа и условия держатся.
 
-Отдельно от 5m во всём: свои таблицы (late15_windows, late15_trades) — в итоги 5m, банки монет и дневной стоп 15m
-не попадает; свой цикл — ошибка здесь не задевает тик 5m. Вкл/выкл — кнопкой ⏱ 15m (LATE15_ON — по умолчанию).
+➕ Докупка 15m: после ставки цена нашей стороны опустилась до уровня (по умолчанию 0.95…0.90) — покупка не дороже
+него, каждый уровень — раз за окно, пока до конца не меньше 10 с. Тестовая — всегда (пока включена), реальная —
+только если по окну есть реальная ставка 15m.
+
+Отдельно от 5m: свои таблицы (late15_windows, late15_trades, late15_addons) — в итоги и банки монет 5m не попадает;
+свой цикл — ошибка здесь не задевает тик 5m. Общее с 5m: кошелёк, режим LIVE / DRY RUN и дневной стоп реальных
+ставок (считает реальные 5m и 15m вместе).
 """
 from __future__ import annotations
 import asyncio
@@ -25,7 +28,7 @@ from dataclasses import dataclass, field
 
 from config import settings
 from src import atr_feed, book_stream, chainlink_feed, market_discovery, runtime_state, storage
-from src import late_bot as lb          # общие помощники 5m: стакан, тестовая покупка, комиссия, тексты
+from src import late_bot as lb          # общие помощники 5m: стакан, покупка, комиссия, кошелёк, тексты
 
 log = logging.getLogger("late15")
 
@@ -52,6 +55,7 @@ class Win:
     decided: bool = False
     checked: bool = False
     why: str = ""
+    addon: dict | None = None
 
 
 _cur: dict[str, Win] = {}
@@ -68,6 +72,8 @@ _last_start: dict[str, int] = {}
 _tasks: set = set()
 _why = defaultdict(Counter)
 _stats = {"windows": 0, "striked": 0, "early": 0, "official": 0, "discovery_errors": 0, "last_error": ""}
+_trade_note = {"stop_day": None}
+_live_note = {"why": "", "ts": 0.0}       # почему последняя реальная ставка / докупка 15m не пошла (для экрана)
 
 
 def reset() -> None:
@@ -79,6 +85,8 @@ def reset() -> None:
     _supported.clear()
     for k in _stats:
         _stats[k] = "" if k == "last_error" else 0
+    _trade_note["stop_day"] = None
+    _live_note.update(why="", ts=0.0)
 
 
 # ---------------------------------------------------------- настройки ----
@@ -91,14 +99,23 @@ def set_on(value: bool) -> None:
     runtime_state.set("late15_on", bool(value))
 
 
+def live_on() -> bool:
+    """🔴 Реальные ставки 15m включены (уходят, только когда бот в 🔴 LIVE)."""
+    return bool(runtime_state.get("late15_live"))
+
+
+def set_live(value: bool) -> None:
+    runtime_state.set("late15_live", bool(value))
+
+
 def coins() -> list[str]:
-    """Монеты тестовых ставок 15m (из пишущихся ASSETS)."""
+    """Монеты ставок 15m (из пишущихся ASSETS)."""
     want = [a.strip().lower() for a in (settings.LATE15_COINS or "").split(",") if a.strip()]
     return [a for a in settings.ASSETS if a in want]
 
 
 def window() -> tuple[int, int]:
-    a, b = int(settings.LATE15_FROM_SEC), int(settings.LATE15_TO_SEC)
+    a, b = int(runtime_state.get("late15_from_sec")), int(runtime_state.get("late15_to_sec"))
     hi, lo = max(a, b), min(a, b)
     return max(hi, lo + 1), lo
 
@@ -117,7 +134,34 @@ def min_atr() -> float:
 
 
 def stake() -> float:
-    return max(lb.MIN_TRADE_USDC, float(settings.LATE15_STAKE_USDC))
+    """Сумма входа 15m — одна для теста и реальной ставки (до правила «не меньше 5 акций»)."""
+    return max(lb.MIN_TRADE_USDC, float(runtime_state.get("late15_stake")))
+
+
+def bet_usdc(cap: float) -> float:
+    return max(stake(), round(lb.MIN_ORDER_SHARES * cap + 0.01, 2))
+
+
+def addon_on() -> bool:
+    return bool(runtime_state.get("late15_addon_on"))
+
+
+def addon_levels() -> list[float]:
+    raw = str(runtime_state.get("late15_addon_levels") or "")
+    return sorted({round(float(x), 2) for x in raw.split(",") if x.strip()}, reverse=True)
+
+
+def addon_usd() -> float:
+    return float(runtime_state.get("late15_addon_usd"))
+
+
+def addon_live_usd(level: float) -> float:
+    """Реальная докупка на уровне: $ на уровень, но не меньше 5 акций по уровню."""
+    return max(addon_usd(), round(lb.MIN_ORDER_SHARES * level + 0.01, 2))
+
+
+def levels_text(levels: list[float] | None = None) -> str:
+    return lb.levels_text(addon_levels() if levels is None else levels)
 
 
 def rule_tag() -> str:
@@ -126,12 +170,37 @@ def rule_tag() -> str:
     return f"15m|{hi}-{lo}s|{pl:.2f}-{ph:.2f}|d{min_dist():g}%|atr{min_atr():g}"
 
 
-def rule_short() -> str:
-    """«за 3:20–3:30 до конца, цена 0.96–0.97, до страйка ≥0.1% и ≥2 ATR»."""
+def window_phrase() -> str:
     hi, lo = window()
+    return f"за {lb.mmss(lo)}–{lb.mmss(hi)} до конца"
+
+
+def rule_short() -> str:
+    """«за 8:00–8:30 до конца, цена 0.96–0.97, до страйка ≥0.1% и ≥2 ATR»."""
     pl, ph = price_range()
     atr = f" и ≥{min_atr():g} ATR" if min_atr() > 0 else " (без ATR)"
-    return f"за {lb.mmss(lo)}–{lb.mmss(hi)} до конца, цена {pl:.2f}–{ph:.2f}, до страйка ≥{min_dist():g}%{atr}"
+    return f"{window_phrase()}, цена {pl:.2f}–{ph:.2f}, до страйка ≥{min_dist():g}%{atr}"
+
+
+def addon_short() -> str:
+    if not addon_on():
+        return "⏸ выключена"
+    return f"✅ {levels_text()}, ${addon_usd():g} на уровень"
+
+
+def live_blocked(now: float | None = None) -> str | None:
+    """Почему реальная ставка 15m сейчас нельзя (None — можно): 15m 🧪, нет ключа, бот в DRY RUN, дневной стоп."""
+    if not live_on():
+        return "15m 🧪 — только тест"
+    return lb.live_blocked(now)
+
+
+def mode_text() -> str:
+    """«🔴 реальные $5 (идут)» / «🔴 реальные $5 — сейчас не идут: бот в DRY RUN» / «🧪 только тест»."""
+    if not live_on():
+        return "🧪 только тест"
+    why = lb.live_blocked()
+    return f"🔴 реальные ${stake():g}" + (f" — сейчас не идут: {why}" if why else "")
 
 
 def slug_for(asset: str, start: int) -> str:
@@ -398,9 +467,10 @@ async def tick(now: float | None = None) -> None:
         _tick_next(asset, start + STEP, now)
     resolve_pending(now)
     maybe_trade(now)
+    maybe_addons(now)
 
 
-# ------------------------------------------------- тестовая ставка 15m ----
+# ------------------------------------------------------------ ставка 15m ----
 
 def evaluate(w: Win, now: float) -> tuple[bool, dict]:
     price, age = chainlink_feed.latest(w.asset, now)
@@ -440,21 +510,25 @@ def _cap(ask: float) -> float:
 
 
 def _enter(w: Win, info: dict, now: float) -> int:
-    """Только тест: покупка по стакану (как тестовая ставка 5m), реальных ордеров нет."""
+    """Тестовая ставка по стакану (всегда); 15m 🔴 — ещё и реальная (в фоне, чтобы не держать тик)."""
     ask = info["ask"]
     cap = _cap(ask)
-    usdc = max(stake(), round(lb.MIN_ORDER_SHARES * cap + 0.01, 2))
+    usdc = bet_usdc(cap)
     price, spent = lb.dry_fill(info["token"], cap, usdc)
     if price is None or spent < lb.MIN_TRADE_USDC:
         w.why = "мало объёма в стакане"
         return 0
     w.decided = True
-    tid = storage.t15_log(ts=int(now), asset=w.asset, start_ts=w.start, slug=w.slug, side=info["side"],
-                          token_id=info["token"], t_left=round(w.end - now, 1), price_now=lb._num(info["price_now"]),
-                          strike=lb._num(w.strike), dist_pct=round(info["dist"], 4),
-                          dist_atr=round(info["datr"], 3) if info["datr"] else None, atr=lb._num(info["atr"], 6),
-                          ask=ask, price=price, size_usdc=spent, shares=round(spent / price, 4),
-                          fee_usdc=lb.fee_for(spent, price), dry_run=1, status="DRY", rule=rule_tag())
+    base = dict(ts=int(now), asset=w.asset, start_ts=w.start, slug=w.slug, side=info["side"], token_id=info["token"],
+                t_left=round(w.end - now, 1), price_now=lb._num(info["price_now"]), strike=lb._num(w.strike),
+                dist_pct=round(info["dist"], 4), dist_atr=round(info["datr"], 3) if info["datr"] else None,
+                atr=lb._num(info["atr"], 6), ask=ask, rule=rule_tag())
+    tid = storage.t15_log(**base, price=price, size_usdc=spent, shares=round(spent / price, 4),
+                          fee_usdc=lb.fee_for(spent, price), dry_run=1, status="DRY")
+    if tid and addon_on():
+        _arm_addon(w, info, now)
+    if live_on() and not storage.t15_exists(w.asset, w.start, dry_run=False):
+        _spawn(_enter_live(w, info, base, cap, usdc, now))
     return 1 if tid else 0
 
 
@@ -477,8 +551,8 @@ def maybe_trade(now: float | None = None) -> int:
             continue
         if not w.checked:
             w.checked = True
-            if storage.t15_exists(asset, start):
-                w.decided = True
+            if storage.t15_exists(asset, start, dry_run=True):
+                w.decided = True                  # после перезапуска в том же окне — не дублируем
                 continue
         ok, info = evaluate(w, now)
         if not ok:
@@ -488,30 +562,328 @@ def maybe_trade(now: float | None = None) -> int:
     return done
 
 
+def _wallet_target(usdc: float) -> tuple[float, bool]:
+    """Сколько реально ставить: сумма, но не больше баланса кошелька. (сумма, урезал ли кошелёк)."""
+    wallet = lb._bank["wallet"]
+    if wallet is not None and usdc > wallet:
+        return max(0.0, round(float(wallet) - 0.01, 2)), True
+    return round(usdc, 2), False
+
+
+async def _enter_live(w: Win, info: dict, base: dict, cap: float, usdc: float, now: float) -> None:
+    """Реальная ставка 15m: FAK не дороже ask + 1¢. Не исполнилось (или частично) — снова через LIVE_RETRY_SEC,
+    пока идёт окно входа и условия держатся, добирая до суммы. В Telegram — итог покупки."""
+    why = live_blocked(now)
+    if why:
+        _live_note.update(why=why, ts=now)
+        day = int(now // 86400)
+        if why.startswith("дневной стоп") and _trade_note["stop_day"] != day:
+            _trade_note["stop_day"] = day
+            await lb._notify(f"⏱15 Реальные ставки 15m остановлены до конца дня — {why}. Тестовые идут дальше.")
+        return
+    from src import polymarket_client
+    target, by_wallet = _wallet_target(usdc)
+    side, token = info["side"], info["token"]
+    lo_t = window()[1]
+    t0 = time.monotonic()
+    spent = shares = 0.0
+    oids: list[str] = []
+    status = last = ""
+    orders = errors = 0
+    first_fill = None
+    cur_cap, cur_ask = cap, info["ask"]
+    for i in range(lb.LIVE_MAX_TRIES):
+        t_now = now + (time.monotonic() - t0)
+        if i:
+            if w.end - t_now < lo_t - 1e-9:
+                last = last or "окно входа кончилось"
+                break
+            ok, again = evaluate(w, t_now)
+            if not ok or again["side"] != side:
+                last = again.get("why") or "сторона сменилась"
+                await asyncio.sleep(lb.LIVE_RETRY_SEC)
+                continue
+            cur_ask = again["ask"]
+            cur_cap = _cap(cur_ask)
+        left = round(target - spent, 2)
+        min_amt = max(lb.MIN_TRADE_USDC, round(lb.MIN_ORDER_SHARES * cur_cap + 0.01, 2))
+        if left < min_amt:
+            if not spent and by_wallet:
+                last = f"на балансе ${target + 0.01:.2f} — меньше минимального ордера ${min_amt:.2f}"
+                await lb._notify_error(w.asset, RuntimeError(f"15m: на балансе ${target + 0.01:.2f} — меньше "
+                                                             "ставки, реальная не ушла"), key="15m:wallet")
+            break
+        orders += 1
+        try:
+            res = await lb._live_buy(token, cur_cap, left)
+        except Exception as exc:  # noqa: BLE001
+            last = f"ошибка: {exc}"[:200]
+            errors += 1
+            if polymarket_client.is_fatal_error(exc) or errors >= lb.LIVE_MAX_ERRORS:
+                await lb._notify_error(w.asset, exc)
+                break
+            await asyncio.sleep(lb.LIVE_RETRY_SEC)
+            continue
+        errors = 0
+        if res is None:
+            last = f"не исполнился по ≤{cur_cap:.2f}"
+        else:
+            got, got_shares, oid, status = res
+            if first_fill is None:
+                first_fill = (t_now, cur_ask)
+            spent += got
+            shares += got_shares
+            if oid:
+                oids.append(oid)
+            if got >= left - 0.01:
+                break
+            last = f"частично: ${spent:.2f} из ${target:.2f}"
+        await asyncio.sleep(lb.LIVE_RETRY_SEC)
+    note = f"ордеров {orders}" + (f"; {last}" if last and spent < target - 0.01 else "")
+    if spent <= 0:
+        _live_note.update(why=last or "не исполнилась", ts=now)
+        storage.t15_log(**base, price=None, size_usdc=0.0, shares=0.0, fee_usdc=0.0, dry_run=0,
+                        status="SKIP_NOFILL", note=note[:300])
+        return
+    price = round(spent / shares, 4) if shares > 0 else cur_cap
+    t_fill, ask_fill = first_fill
+    storage.t15_log(**dict(base, ts=int(t_fill), t_left=round(w.end - t_fill, 1), ask=ask_fill), price=price,
+                    size_usdc=round(spent, 2), shares=round(shares, 4), fee_usdc=lb.fee_for(spent, price),
+                    dry_run=0, status=status or "matched", order_id=",".join(oids)[:500], note=note[:300])
+    _spawn(lb.refresh_bank(force=True))
+    await lb._notify(f"✅ ⏱15 {w.asset.upper()}: ставка 15m {side} ${spent:.2f} по {price:.3f} за "
+                     f"{lb.mmss(w.end - t_fill)} до конца (до страйка {info['dist']:.2f}%"
+                     + (f", {info['datr']:.1f} ATR" if info["datr"] else "") + ")")
+
+
+# ------------------------------------------------------- ➕ докупка 15m ----
+
+def _arm_addon(w: Win, info: dict, now: float) -> None:
+    """После ставки: какие уровни ждут отката — только ниже цены входа. В базу — строка ARMED (уровень 0)."""
+    entry = float(info["ask"])
+    levels = [lv for lv in addon_levels() if round(lv, 2) < round(entry, 2)]
+    w.addon = {"side": info["side"], "token": info["token"], "entry": entry, "left": levels, "lock": None}
+    storage.a15_log(ts=int(now), asset=w.asset, start_ts=w.start, slug=w.slug, side=info["side"],
+                    token_id=info["token"], level=0.0, entry_ask=entry, t_left=round(w.end - now, 1), ask=entry,
+                    size_usdc=0.0, shares=0.0, fee_usdc=0.0, dry_run=1, status="ARMED", rule=rule_tag(),
+                    note=f"уровни {levels_text(levels)}" if levels else "все уровни не ниже цены входа")
+
+
+def addon_live_why(w: Win, now: float | None = None) -> str | None:
+    """Почему реальная докупка 15m по окну не идёт (None — можно)."""
+    if not addon_on():
+        return "докупка 15m выключена"
+    why = live_blocked(now)
+    if why:
+        return why
+    real = storage.t15_get(w.asset, w.start, dry_run=False)
+    if not real or not (real["size_usdc"] or 0) > 0:
+        return "по окну нет реальной ставки 15m"
+    return None
+
+
+def maybe_addons(now: float | None = None) -> int:
+    """➕ По окнам со ставкой 15m: ask нашей стороны опустился до уровня — докупка не дороже него. Тестовая —
+    сразу, по стакану; реальная (15m 🔴 и есть реальная ставка) — в фоне. Возвращает число тестовых докупок."""
+    now = time.time() if now is None else now
+    start = int(now // STEP) * STEP
+    done = 0
+    for w in list(_cur.values()):
+        ad = w.addon
+        if not ad or not ad["left"] or w.start != start:
+            continue
+        if w.end - now < lb.ADDON_MIN_LEFT_SEC:
+            ad["left"] = []                                # последние секунды — без докупки
+            continue
+        if not addon_on():
+            continue
+        token = ad["token"]
+        ask = book_stream.best_ask(token)
+        if ask is None or not book_stream.is_fresh(token, lb.BOOK_MAX_AGE_MS):
+            continue
+        hit = [lv for lv in ad["left"] if ask <= lv + 1e-9]
+        if not hit:
+            continue
+        amt = addon_usd()
+        used: dict = {}
+        live_levels = []
+        for lv in hit:
+            price, spent = lb.dry_fill(token, lv, amt, used)
+            if price is None or spent < lb.MIN_DRY_ADDON_USDC:
+                continue                                   # объём съели уровни выше — на следующем тике
+            ad["left"].remove(lv)
+            base = dict(ts=int(now), asset=w.asset, start_ts=w.start, slug=w.slug, side=ad["side"], token_id=token,
+                        level=lv, entry_ask=ad["entry"], t_left=round(w.end - now, 1), ask=ask, rule=rule_tag())
+            if storage.a15_log(**base, price=price, size_usdc=spent, shares=round(spent / price, 4),
+                               fee_usdc=lb.fee_for(spent, price), dry_run=1, status="DRY"):
+                done += 1
+            if live_on():
+                live_levels.append((lv, base))
+        if live_levels:
+            why = addon_live_why(w, now)
+            if why is None:
+                for lv, base in live_levels:
+                    _spawn(_addon_live(w, base, lv, now))
+            else:
+                _live_note.update(why=f"докупка: {why}", ts=now)
+    return done
+
+
+async def _addon_live(w: Win, base: dict, lv: float, now: float) -> None:
+    """Реальная докупка 15m на уровне lv. Уровни одного окна — по очереди (кошелёк — с учётом купленного)."""
+    t_spawn = time.monotonic()
+    ad = w.addon if w.addon is not None else {}
+    if ad.get("lock") is None:
+        ad["lock"] = asyncio.Lock()
+    async with ad["lock"]:
+        await _addon_live_run(w, base, lv, now, t_spawn)
+
+
+async def _addon_live_run(w: Win, base: dict, lv: float, now: float, t_spawn: float) -> None:
+    """FAK не дороже уровня на $ уровня (не меньше 5 акций, не больше кошелька). Цену перебили — ждём возврата к
+    уровню до ADDON_LIVE_WAIT_SEC, не больше ADDON_LIVE_TRIES ордеров. Не купилось — строка SKIP_… с причиной."""
+    from src import polymarket_client
+
+    def t_now() -> float:
+        return now + (time.monotonic() - t_spawn)
+
+    why = addon_live_why(w, t_now())                      # пока ждали очереди, могли выключить
+    if why:
+        _live_note.update(why=f"докупка: {why}", ts=t_now())
+        return
+    token, side, a = base["token_id"], base["side"], w.asset.upper()
+    min_amt = max(lb.MIN_TRADE_USDC, round(lb.MIN_ORDER_SHARES * lv + 0.01, 2))
+    target, _by_wallet = _wallet_target(addon_live_usd(lv))
+    if target < min_amt:
+        reason = f"на балансе меньше минимального ордера ${min_amt:.2f}"
+        _live_note.update(why=f"докупка: {reason}", ts=t_now())
+        storage.a15_log(**base, price=None, size_usdc=0.0, shares=0.0, fee_usdc=0.0, dry_run=0,
+                        status="SKIP_NOMONEY", note=reason)
+        return
+    spent = shares = 0.0
+    oids: list[str] = []
+    status = last = ""
+    orders = errors = 0
+    first_fill = None
+    t_begin = time.monotonic()
+    for _i in range(lb.LIVE_MAX_TRIES):
+        if orders >= lb.ADDON_LIVE_TRIES or time.monotonic() - t_begin >= lb.ADDON_LIVE_WAIT_SEC:
+            break
+        tn = t_now()
+        if w.end - tn < lb.ADDON_MIN_LEFT_SEC:
+            last = last or f"до конца меньше {lb.ADDON_MIN_LEFT_SEC:g} с"
+            break
+        ask = book_stream.best_ask(token)
+        if ask is None or ask > lv + 1e-9:
+            last = f"цена выше {lv:.2f}"
+            await asyncio.sleep(lb.LIVE_RETRY_SEC)
+            continue
+        left = round(target - spent, 2)
+        if left < min_amt:
+            break
+        orders += 1
+        try:
+            res = await lb._live_buy(token, lv, left)
+        except Exception as exc:  # noqa: BLE001
+            last = f"ошибка: {exc}"[:200]
+            errors += 1
+            if polymarket_client.is_fatal_error(exc) or errors >= lb.LIVE_MAX_ERRORS:
+                await lb._notify_error(w.asset, exc)
+                break
+            await asyncio.sleep(lb.LIVE_RETRY_SEC)
+            continue
+        errors = 0
+        if res is None:
+            last = f"не исполнился по ≤{lv:.2f}"
+        else:
+            got, got_shares, oid, status = res
+            if first_fill is None:
+                first_fill = (tn, ask)
+            spent += got
+            shares += got_shares
+            if oid:
+                oids.append(oid)
+            if got >= left - 0.01:
+                break
+            last = f"частично: ${spent:.2f} из ${target:.2f}"
+        await asyncio.sleep(lb.LIVE_RETRY_SEC)
+    note = f"ордеров {orders}" + (f"; {last}" if last and spent < target - 0.01 else "")
+    if spent <= 0:
+        storage.a15_log(**base, price=None, size_usdc=0.0, shares=0.0, fee_usdc=0.0, dry_run=0,
+                        status="SKIP_NOFILL", note=note[:300])
+        return
+    price = round(spent / shares, 4) if shares > 0 else lv
+    t_fill, ask_fill = first_fill
+    storage.a15_log(**dict(base, ts=int(t_fill), t_left=round(w.end - t_fill, 1), ask=ask_fill), price=price,
+                    size_usdc=round(spent, 2), shares=round(shares, 4), fee_usdc=lb.fee_for(spent, price),
+                    dry_run=0, status=status or "matched", order_id=",".join(oids)[:500], note=note[:300])
+    _spawn(lb.refresh_bank(force=True))
+    await lb._notify(f"➕ ⏱15 {a}: докупка 15m {side} ${spent:.2f} по {price:.3f} (уровень {lv:.2f}) за "
+                     f"{lb.mmss(w.end - t_fill)} до конца")
+
+
+# -------------------------------------------------------------- итоги окна ----
+
+def settle_text(t: dict, outcome: str, pnl: float) -> str:
+    """Итог реальной ставки 15m для Telegram — с докупкой окна: реальной, а нет её — тестовой («было бы»)."""
+    win = outcome == t["side"]
+    s = f"⏱15 {'🟢' if win else '🔴'} {t['asset'].upper()} 15m: исход {outcome}, ставка {t['side']} → {pnl:+.2f} USDC"
+    rows = storage.a15_window(t["asset"], t["start_ts"])
+    real = [r for r in rows if not r["dry_run"] and lb._is_buy(r)]
+    test = [r for r in rows if r["dry_run"] and lb._is_buy(r)]
+    armed = any(r["status"] == "ARMED" for r in rows)
+    if real:
+        ap = sum(lb._row_pnl(r, outcome) for r in real)
+        s += (f"\n➕ Докупка реально: {lb.buys_text(len(real))} на ${sum(r['size_usdc'] for r in real):.2f} "
+              f"(уровни {levels_text([r['level'] for r in real])}) → {ap:+.2f}; итог окна {pnl + ap:+.2f} USDC")
+    elif test:
+        ap = sum(lb._row_pnl(r, outcome) for r in test)
+        s += (f"\n➕ С тестовой докупкой было бы {pnl + ap:+.2f} USDC (докупка {ap:+.2f}: {lb.buys_text(len(test))} "
+              f"на ${sum(r['size_usdc'] for r in test):.2f}, уровни {levels_text([r['level'] for r in test])})")
+    elif armed:
+        s += "\n➕ Докупки не было — цена не откатила до уровней ниже входа; итог тот же"
+    return s
+
+
+async def _official(t: dict, now: float, cache: dict) -> str | None:
+    key = (t["asset"], t["start_ts"])
+    if key in cache:
+        return cache[key]
+    o = storage.w15_outcome(*key)
+    if o is None and now - (t["start_ts"] + STEP) >= lb.SETTLE_LAG_SEC:
+        try:
+            o = await market_discovery.get_resolution(t["slug"])
+        except Exception:  # noqa: BLE001
+            o = None
+        await asyncio.sleep(lb.REQUEST_PAUSE_SEC)
+    cache[key] = o
+    return o
+
+
 async def settle_trades(now: float | None = None) -> int:
-    """Итоги тестовых ставок 15m по официальному исходу окна (без сообщений в Telegram)."""
+    """Итоги ставок и ➕ докупок 15m по официальному исходу окна. Докупки — первыми: итог реальной ставки в
+    Telegram показывает и докупку окна. Возвращает, сколько ставок закрыли."""
     now = time.time() if now is None else now
     n = 0
     cache: dict = {}
+    for a in storage.a15_open(int(now - 30)):
+        if a["start_ts"] < now - lb.SETTLE_MAX_AGE_SEC:
+            continue
+        o = await _official(a, now, cache)
+        if o in ("UP", "DOWN"):
+            storage.a15_settle(a["id"], o, round(lb._row_pnl(a, o), 4))
     for t in storage.t15_open(int(now - 30)):
         if t["start_ts"] < now - lb.SETTLE_MAX_AGE_SEC:
             continue
-        key = (t["asset"], t["start_ts"])
-        if key not in cache:
-            o = storage.w15_outcome(*key)
-            if o is None and now - (t["start_ts"] + STEP) >= lb.SETTLE_LAG_SEC:
-                try:
-                    o = await market_discovery.get_resolution(t["slug"])
-                except Exception:  # noqa: BLE001
-                    o = None
-                await asyncio.sleep(lb.REQUEST_PAUSE_SEC)
-            cache[key] = o
-        o = cache[key]
+        o = await _official(t, now, cache)
         if o not in ("UP", "DOWN"):
             continue
-        pnl = (t["shares"] if o == t["side"] else 0.0) - t["size_usdc"] - (t["fee_usdc"] or 0.0)
+        skip = str(t["status"] or "").startswith("SKIP")
+        pnl = 0.0 if skip else (t["shares"] if o == t["side"] else 0.0) - t["size_usdc"] - (t["fee_usdc"] or 0.0)
         if storage.t15_settle(t["id"], o, round(pnl, 4)):
             n += 1
+            if not t["dry_run"] and not skip:
+                await lb._notify(settle_text(t, o, pnl))
     return n
 
 
@@ -525,9 +897,9 @@ def trim_paths(now: float | None = None) -> int:
 
 # ------------------------------------------------------------- итоги ----
 
-def trade_stats(since_ts: int = 0, asset: str | None = None, side: str | None = None) -> dict:
-    rows = [t for t in storage.t15_since(since_ts)
-            if (asset is None or t["asset"] == asset) and (side is None or t["side"] == side)]
+def trade_stats(since_ts: int = 0, asset: str | None = None, side: str | None = None, live: bool = False) -> dict:
+    rows = [t for t in storage.t15_since(since_ts) if bool(t["dry_run"]) != live
+            and (asset is None or t["asset"] == asset) and (side is None or t["side"] == side)]
     bets = [t for t in rows if not str(t["status"] or "").startswith("SKIP")]
     settled = [t for t in bets if t["outcome"]]
     return {"bets": len(bets), "settled": len(settled),
@@ -535,6 +907,10 @@ def trade_stats(since_ts: int = 0, asset: str | None = None, side: str | None = 
             "pnl": sum(t["pnl_usdc"] or 0.0 for t in settled),
             "staked": sum(t["size_usdc"] or 0.0 for t in settled),
             "avg_price": (sum(t["price"] for t in bets if t["price"]) / len(bets)) if bets else None}
+
+
+def addon_stats(since_ts: int = 0, live: bool = False) -> dict:
+    return lb._addon_stats([r for r in storage.a15_since(since_ts) if bool(r["dry_run"]) != live])
 
 
 def recorder_line(now: float | None = None) -> str:
@@ -546,13 +922,12 @@ def recorder_line(now: float | None = None) -> str:
 
 
 def status_text() -> str:
-    return ("✅ пишет окна 15m и ставит тестовые ставки" if on()
-            else "⏸ выключено — окна 15m не пишутся, тест не идёт")
+    if not on():
+        return "⏸ выключено — окна 15m не пишутся, ставок нет"
+    return "✅ пишет окна 15m и ставит — " + mode_text()
 
 
-def day_text(now: float | None = None) -> str:
-    now = time.time() if now is None else now
-    st = trade_stats(int(now // 86400) * 86400)
+def _part(st: dict) -> str:
     if not st["bets"]:
         return "ставок нет"
     s = lb.bets_text(st["bets"])
@@ -561,11 +936,19 @@ def day_text(now: float | None = None) -> str:
     return s
 
 
+def day_text(now: float | None = None, live: bool = False) -> str:
+    now = time.time() if now is None else now
+    return _part(trade_stats(int(now // 86400) * 86400, live=live))
+
+
 def main_line() -> str:
     """Строка в главное меню."""
     if not on():
-        return "⏱ 15m: ⏸ выключено (только запись и тест — кнопка ⏱ 15m)"
-    return f"⏱ 15m (только тест): ✅ пишет окна; сегодня — {day_text()}"
+        return "⏱ 15m: ⏸ выключено (кнопка ⏱ 15m)"
+    s = f"⏱ 15m: ✅ {mode_text()}; сегодня — тест {day_text()}"
+    if live_on() or trade_stats(int(time.time() // 86400) * 86400, live=True)["bets"]:
+        s += f"; реальные {day_text(live=True)}"
+    return s
 
 
 def _side_short(name: str, st: dict) -> str:
@@ -588,10 +971,17 @@ def why_lines() -> list[str]:
 
 def stats_lines() -> list[str]:
     """Блок в 📊: коротко."""
-    lines = [f"⏱ 15m — только тест (реальных ставок нет): {'✅ вкл' if on() else '⏸ выкл'}; {rule_short()}",
+    lines = [f"⏱ 15m: {'✅ вкл' if on() else '⏸ выкл'}, {mode_text()}; {rule_short()}; ставка ${stake():g}",
              "  " + lb.stats_line("Тест 15m всего", trade_stats(0)),
-             "  Тест 15m сегодня (UTC): " + day_text(),
-             "  " + recorder_line()]
+             "  Тест 15m сегодня (UTC): " + day_text()]
+    if live_on() or trade_stats(0, live=True)["bets"]:
+        lines += ["  " + lb.stats_line("Реальные 15m всего", trade_stats(0, live=True)),
+                  "  Реальные 15m сегодня (UTC): " + day_text(live=True)]
+    lines.append(f"  ➕ Докупка 15m: {addon_short()}")
+    lines.append("  " + lb.addon_line("Тест докупки 15m", addon_stats(0)))
+    if live_on() or addon_stats(0, live=True)["bets"]:
+        lines.append("  " + lb.addon_line("Реальная докупка 15m", addon_stats(0, live=True)))
+    lines.append("  " + recorder_line())
     if _stats["discovery_errors"]:
         lines.append(f"  Поиск рынков 15m: ошибок {_stats['discovery_errors']}, последняя: {_stats['last_error']}")
     return lines
@@ -599,28 +989,33 @@ def stats_lines() -> list[str]:
 
 def screen_text(head: str = "") -> str:
     """Экран ⏱ 15m."""
-    up, dn = trade_stats(0, side="UP"), trade_stats(0, side="DOWN")
-    lines = [head + "⏱ 15m — только запись окон и тестовые ставки. Реальных ставок на 15m нет.", "",
+    lines = [head + "⏱ 15m — ставки на 15-минутных рынках (правило по архиву 15m) и запись окон.", "",
              "Статус: " + status_text(),
-             f"Тест: {rule_short()}; обе стороны, без своих порогов монет; ставка ${stake():g} (тест, по стакану)",
-             "Монеты теста: " + (", ".join(a.upper() for a in coins()) or "нет") + "; окна пишутся по всем: "
+             f"Правило: {rule_short()}; обе стороны; одна ставка на окно",
+             f"Сумма: ${stake():g} (тест и реальная, не меньше 5 акций)",
+             f"➕ Докупка 15m: {addon_short()} — тестовая всегда, реальная — если по окну есть реальная ставка",
+             "Монеты: " + (", ".join(a.upper() for a in coins()) or "нет") + "; окна пишутся по всем: "
              + ", ".join(a.upper() for a in settings.ASSETS),
              recorder_line(), "",
              lb.stats_line("Тест 15m всего", trade_stats(0)),
-             "Сегодня (UTC): " + day_text(),
-             "По сторонам: " + _side_short("UP", up) + " | " + _side_short("DOWN", dn)]
-    per = [(a, trade_stats(0, asset=a)) for a in coins()]
-    per = [_side_short(a.upper(), st) for a, st in per if st["bets"]]
-    if per:
-        lines.append("По монетам: " + "; ".join(per))
+             "Тест сегодня (UTC): " + day_text()]
+    live_st = trade_stats(0, live=True)
+    if live_on() or live_st["bets"]:
+        lines += [lb.stats_line("Реальные 15m всего", live_st), "Реальные сегодня (UTC): " + day_text(live=True)]
+    up, dn = trade_stats(0, side="UP"), trade_stats(0, side="DOWN")
+    lines.append("Тест по сторонам: " + _side_short("UP", up) + " | " + _side_short("DOWN", dn))
+    lines.append(lb.addon_line("Тест докупки 15m", addon_stats(0)))
+    if live_on() or addon_stats(0, live=True)["bets"]:
+        lines.append(lb.addon_line("Реальная докупка 15m", addon_stats(0, live=True)))
+    if live_on() and _live_note["why"] and time.time() - _live_note["ts"] < 3 * 3600:
+        lines.append(f"⚠️ Последняя реальная 15m не пошла: {_live_note['why']}")
     w = why_lines()
     if w:
         lines += [""] + w
     if _stats["discovery_errors"]:
         lines.append(f"Поиск рынков 15m: ошибок {_stats['discovery_errors']}, последняя: {_stats['last_error']}")
-    lines += ["", "Зачем: копим архив 15m (~2 недели). Потом по нему подберём для 15m время входа, цену и пороги, "
-                  "проверим на второй половине данных — и тогда решим про реальные ставки. Файлы 15m приходят в "
-                  "отчётах (*_windows15.zip, *_trades15.csv) и по кнопке 📤 Файлы."]
+    lines += ["", "🔴 Реальные ставки 15m идут, только когда 15m 🔴 (кнопка ниже) и бот в 🔴 LIVE; дневной стоп — "
+                  "общий с 5m. Файлы 15m — в отчётах (*_windows15.zip, *_trades15.csv, *_addons15.csv) и по 📤."]
     return "\n".join(lines)
 
 
@@ -629,16 +1024,30 @@ def report_caption(from_label: str, to_label: str, since_ts: int) -> str:
     lines = [f"🔁 Окна 15m {from_label} → {to_label} (UTC): {len(rec)}, со страйком "
              f"{sum(1 for r in rec if r['strike'])}, с официальным исходом {sum(1 for r in rec if r['outcome'])}",
              lb.stats_line("⏱ Тест 15m за период", trade_stats(since_ts))]
+    real = trade_stats(since_ts, live=True)
+    if real["bets"]:
+        lines.append(lb.stats_line("⏱ Реальные 15m за период", real))
     up, dn = trade_stats(since_ts, side="UP"), trade_stats(since_ts, side="DOWN")
     if up["bets"] or dn["bets"]:
-        lines.append("По сторонам: " + _side_short("UP", up) + " | " + _side_short("DOWN", dn))
+        lines.append("По сторонам (тест): " + _side_short("UP", up) + " | " + _side_short("DOWN", dn))
     return "\n".join(lines)
 
 
 def trades_caption() -> str:
-    return "\n".join([f"⏱ Тест 15m (реальных ставок нет): {rule_short()}; ставка ${stake():g}",
-                      lb.stats_line("Тест 15m всего", trade_stats(0)),
-                      "Сегодня (UTC): " + day_text()])
+    lines = [f"⏱ Ставки 15m ({mode_text()}): {rule_short()}; ставка ${stake():g}",
+             lb.stats_line("Тест 15m всего", trade_stats(0)),
+             "Тест сегодня (UTC): " + day_text()]
+    if trade_stats(0, live=True)["bets"]:
+        lines += [lb.stats_line("Реальные 15m всего", trade_stats(0, live=True)),
+                  "Реальные сегодня (UTC): " + day_text(live=True)]
+    return "\n".join(lines)
+
+
+def addons_caption(since_ts: int = 0) -> str:
+    lines = [f"➕ Докупки 15m: {addon_short()}", lb.addon_line("Тест докупки 15m", addon_stats(since_ts))]
+    if addon_stats(since_ts, live=True)["bets"]:
+        lines.append(lb.addon_line("Реальная докупка 15m", addon_stats(since_ts, live=True)))
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------- цикл ----

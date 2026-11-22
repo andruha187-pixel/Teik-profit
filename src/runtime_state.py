@@ -209,6 +209,24 @@ def _price(v) -> float:
     return round(min(PRICE_LIMITS[1], max(PRICE_LIMITS[0], float(v))), 2)
 
 
+WINDOW15_LIMITS = (5, 895)          # окно входа 15m — секунд до конца 15-минутного окна
+
+
+def _sec15(v) -> int:
+    return int(min(WINDOW15_LIMITS[1], max(WINDOW15_LIMITS[0], int(float(v)))))
+
+
+def _stake(v) -> float:
+    return round(min(STAKE_LIMITS[1], max(STAKE_LIMITS[0], float(v))), 2)
+
+
+def _default_levels15() -> str:
+    try:
+        return _levels_csv(settings.LATE15_ADDON_LEVELS)
+    except ValueError:
+        return ADDON_DEFAULT_LEVELS
+
+
 _DEFAULTS = {
     "dry_run": settings.DRY_RUN,
     "late_coins_on": _coins_csv(settings.LATE_COINS),
@@ -246,8 +264,16 @@ _DEFAULTS = {
     "late_coin_addons": "{}",
     # какая версия пресета монет уже поставлена (0 — никакая)
     "late_preset_v": 0,
-    # ⏱15 запись окон 15m и тестовые ставки по ним (реальных нет)
+    # ⏱15 запись окон 15m и ставки по ним: вкл/выкл, 🔴 реальные (иначе только тест), окно входа, сумма,
+    # ➕ докупка 15m (вкл/выкл, уровни, $ на уровень; реальная — вместе с реальными ставками 15m)
     "late15_on": settings.LATE15_ON,
+    "late15_live": settings.LATE15_LIVE,
+    "late15_from_sec": _sec15(max(settings.LATE15_FROM_SEC, settings.LATE15_TO_SEC)),
+    "late15_to_sec": _sec15(min(settings.LATE15_FROM_SEC, settings.LATE15_TO_SEC)),
+    "late15_stake": _stake(settings.LATE15_STAKE_USDC),
+    "late15_addon_on": settings.LATE15_ADDON_ON,
+    "late15_addon_levels": _default_levels15(),
+    "late15_addon_usd": _addon_usd(settings.LATE15_ADDON_USDC),
 }
 
 _CASTERS = {
@@ -278,6 +304,13 @@ _CASTERS = {
     "late_coin_addons": _coin_addons_json,
     "late_preset_v": lambda v: int(float(v)),
     "late15_on": _bool,
+    "late15_live": _bool,
+    "late15_from_sec": _sec15,
+    "late15_to_sec": _sec15,
+    "late15_stake": _stake,
+    "late15_addon_on": _bool,
+    "late15_addon_levels": _levels_csv,
+    "late15_addon_usd": _addon_usd,
 }
 
 _state: dict = dict(_DEFAULTS)
