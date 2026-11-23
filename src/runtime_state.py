@@ -271,9 +271,15 @@ _DEFAULTS = {
     "late15_from_sec": _sec15(max(settings.LATE15_FROM_SEC, settings.LATE15_TO_SEC)),
     "late15_to_sec": _sec15(min(settings.LATE15_FROM_SEC, settings.LATE15_TO_SEC)),
     "late15_stake": _stake(settings.LATE15_STAKE_USDC),
+    # сумма входа 15m: "usd" — late15_stake, "pct" — late15_stake_pct % от банка
+    "late15_stake_mode": "pct" if settings.LATE15_STAKE_PCT > 0 else "usd",
+    "late15_stake_pct": _pct(settings.LATE15_STAKE_PCT if settings.LATE15_STAKE_PCT > 0 else 1.0),
     "late15_addon_on": settings.LATE15_ADDON_ON,
     "late15_addon_levels": _default_levels15(),
     "late15_addon_usd": _addon_usd(settings.LATE15_ADDON_USDC),
+    # сумма на уровень докупки 15m: "usd" — late15_addon_usd, "pct" — late15_addon_pct % от банка
+    "late15_addon_mode": "pct" if settings.LATE15_ADDON_PCT > 0 else "usd",
+    "late15_addon_pct": _pct(settings.LATE15_ADDON_PCT if settings.LATE15_ADDON_PCT > 0 else 0.5),
 }
 
 _CASTERS = {
@@ -308,9 +314,13 @@ _CASTERS = {
     "late15_from_sec": _sec15,
     "late15_to_sec": _sec15,
     "late15_stake": _stake,
+    "late15_stake_mode": _addon_mode,
+    "late15_stake_pct": _pct,
     "late15_addon_on": _bool,
     "late15_addon_levels": _levels_csv,
     "late15_addon_usd": _addon_usd,
+    "late15_addon_mode": _addon_mode,
+    "late15_addon_pct": _pct,
 }
 
 _state: dict = dict(_DEFAULTS)

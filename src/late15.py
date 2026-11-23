@@ -133,9 +133,47 @@ def min_atr() -> float:
     return max(0.0, float(settings.LATE15_MIN_ATR))
 
 
+def stake_mode() -> str:
+    """Сумма входа 15m: "usd" — фиксированная $, "pct" — % от банка."""
+    return "pct" if runtime_state.get("late15_stake_mode") == "pct" else "usd"
+
+
+def stake_fixed() -> float:
+    return float(runtime_state.get("late15_stake"))
+
+
+def stake_pct() -> float:
+    return float(runtime_state.get("late15_stake_pct"))
+
+
+def _of_bank(pct: float, cap: float) -> float | None:
+    """pct% от банка (свободный баланс кошелька, не читается — банк вручную из ⚙️), не больше cap; None — банк
+    неизвестен."""
+    b, _src = lb.bank()
+    if b is None:
+        return None
+    return round(min(cap, max(0.0, b) * pct / 100.0), 2)
+
+
 def stake() -> float:
-    """Сумма входа 15m — одна для теста и реальной ставки (до правила «не меньше 5 акций»)."""
-    return max(lb.MIN_TRADE_USDC, float(runtime_state.get("late15_stake")))
+    """Сумма входа 15m — одна для теста и реальной ставки (до правила «не меньше 5 акций»): фиксированная или % от
+    банка в момент входа (банк неизвестен — фиксированная)."""
+    amt = _of_bank(stake_pct(), runtime_state.STAKE_LIMITS[1]) if stake_mode() == "pct" else None
+    return max(lb.MIN_TRADE_USDC, stake_fixed() if amt is None else amt)
+
+
+def _bank_note(pct: float, amt: float | None, fixed: float) -> str:
+    b, src = lb.bank()
+    if amt is None:
+        return f"{pct:g}% банка (банк неизвестен — ${fixed:g})"
+    return f"{pct:g}% банка (~${amt:.2f} от ${b:.2f}, {src})"
+
+
+def stake_text() -> str:
+    """«$30» или «5% банка (~$52.30 от $1046.00, баланс кошелька)»."""
+    if stake_mode() != "pct":
+        return f"${stake_fixed():g}"
+    return _bank_note(stake_pct(), _of_bank(stake_pct(), runtime_state.STAKE_LIMITS[1]), stake_fixed())
 
 
 def bet_usdc(cap: float) -> float:
@@ -151,8 +189,30 @@ def addon_levels() -> list[float]:
     return sorted({round(float(x), 2) for x in raw.split(",") if x.strip()}, reverse=True)
 
 
-def addon_usd() -> float:
+def addon_mode() -> str:
+    """Сумма на уровень докупки 15m: "usd" — фиксированная $, "pct" — % от банка."""
+    return "pct" if runtime_state.get("late15_addon_mode") == "pct" else "usd"
+
+
+def addon_fixed() -> float:
     return float(runtime_state.get("late15_addon_usd"))
+
+
+def addon_pct() -> float:
+    return float(runtime_state.get("late15_addon_pct"))
+
+
+def addon_usd() -> float:
+    """$ на уровень сейчас: фиксированная или % от банка (банк неизвестен — фиксированная)."""
+    amt = _of_bank(addon_pct(), runtime_state.ADDON_USD_LIMITS[1]) if addon_mode() == "pct" else None
+    return addon_fixed() if amt is None else amt
+
+
+def addon_amount_text() -> str:
+    """«$5» или «0.5% банка (~$5.23 от $1046.00, баланс кошелька)»."""
+    if addon_mode() != "pct":
+        return f"${addon_fixed():g}"
+    return _bank_note(addon_pct(), _of_bank(addon_pct(), runtime_state.ADDON_USD_LIMITS[1]), addon_fixed())
 
 
 def addon_live_usd(level: float) -> float:
@@ -185,7 +245,7 @@ def rule_short() -> str:
 def addon_short() -> str:
     if not addon_on():
         return "⏸ выключена"
-    return f"✅ {levels_text()}, ${addon_usd():g} на уровень"
+    return f"✅ {levels_text()}, {addon_amount_text()} на уровень"
 
 
 def live_blocked(now: float | None = None) -> str | None:
@@ -196,11 +256,12 @@ def live_blocked(now: float | None = None) -> str | None:
 
 
 def mode_text() -> str:
-    """«🔴 реальные $5 (идут)» / «🔴 реальные $5 — сейчас не идут: бот в DRY RUN» / «🧪 только тест»."""
+    """«🔴 реальные $5» / «🔴 реальные 5% банка — сейчас не идут: бот в DRY RUN» / «🧪 только тест»."""
     if not live_on():
         return "🧪 только тест"
     why = lb.live_blocked()
-    return f"🔴 реальные ${stake():g}" + (f" — сейчас не идут: {why}" if why else "")
+    amount = f"{stake_pct():g}% банка" if stake_mode() == "pct" else f"${stake_fixed():g}"
+    return f"🔴 реальные {amount}" + (f" — сейчас не идут: {why}" if why else "")
 
 
 def slug_for(asset: str, start: int) -> str:
@@ -971,7 +1032,7 @@ def why_lines() -> list[str]:
 
 def stats_lines() -> list[str]:
     """Блок в 📊: коротко."""
-    lines = [f"⏱ 15m: {'✅ вкл' if on() else '⏸ выкл'}, {mode_text()}; {rule_short()}; ставка ${stake():g}",
+    lines = [f"⏱ 15m: {'✅ вкл' if on() else '⏸ выкл'}, {mode_text()}; {rule_short()}; ставка {stake_text()}",
              "  " + lb.stats_line("Тест 15m всего", trade_stats(0)),
              "  Тест 15m сегодня (UTC): " + day_text()]
     if live_on() or trade_stats(0, live=True)["bets"]:
@@ -992,7 +1053,7 @@ def screen_text(head: str = "") -> str:
     lines = [head + "⏱ 15m — ставки на 15-минутных рынках (правило по архиву 15m) и запись окон.", "",
              "Статус: " + status_text(),
              f"Правило: {rule_short()}; обе стороны; одна ставка на окно",
-             f"Сумма: ${stake():g} (тест и реальная, не меньше 5 акций)",
+             f"Сумма: {stake_text()} — тест и реальная, не меньше 5 акций",
              f"➕ Докупка 15m: {addon_short()} — тестовая всегда, реальная — если по окну есть реальная ставка",
              "Монеты: " + (", ".join(a.upper() for a in coins()) or "нет") + "; окна пишутся по всем: "
              + ", ".join(a.upper() for a in settings.ASSETS),
@@ -1034,7 +1095,7 @@ def report_caption(from_label: str, to_label: str, since_ts: int) -> str:
 
 
 def trades_caption() -> str:
-    lines = [f"⏱ Ставки 15m ({mode_text()}): {rule_short()}; ставка ${stake():g}",
+    lines = [f"⏱ Ставки 15m ({mode_text()}): {rule_short()}; ставка {stake_text()}",
              lb.stats_line("Тест 15m всего", trade_stats(0)),
              "Тест сегодня (UTC): " + day_text()]
     if trade_stats(0, live=True)["bets"]:

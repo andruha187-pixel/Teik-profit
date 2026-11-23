@@ -148,25 +148,27 @@ def screen15_markup() -> InlineKeyboardMarkup:
              else Btn("➕ Докупка ✅ вкл", callback_data="f15a"))
     return _menu((toggle, live),
                  (Btn("⏱ Окно", callback_data="in:w15"), Btn("💵 Сумма", callback_data="in:s15")),
-                 (addon, Btn("➕ $ на уровень", callback_data="in:a15u"), Btn("➕ Уровни", callback_data="in:a15l")),
+                 (addon, Btn("➕ Сумма на уровень", callback_data="in:a15u"),
+                  Btn("➕ Уровни", callback_data="in:a15l")),
                  (Btn("🔄 Обновить", callback_data="f15"), BACK))
 
 
 PROMPTS15 = {
     "w15": "✏️ Окно входа 15m — сколько осталось до конца 15-минутного окна. Например «8:00-8:30», «7:50-9:00» "
            "или в секундах «480-510». Пределы — от 0:05 до 14:55.",
-    "s15": "✏️ Сумма входа 15m в $ — например «20» или «300» (от 1 до 1000). Одна для теста и реальной ставки; "
-           "меньше 5 акций биржа не берёт.",
-    "a15u": "✏️ Докупка 15m: сумма на один уровень в $ — например «5» или «50» (от 0.1 до 1000). Реальная — "
-            "не меньше 5 акций (~$4.76 при уровне 0.95).",
+    "s15": "✏️ Сумма входа 15m: в $ — например «30» или «300» (от 1 до 1000), или в % от банка — «5%» "
+           "(от 0.1 до 100). Банк — свободный баланс кошелька в момент входа (не читается — банк вручную из ⚙️). "
+           "Одна для теста и реальной ставки; меньше 5 акций биржа не берёт.",
+    "a15u": "✏️ Докупка 15m, сумма на один уровень: в $ — «5» или «50» (от 0.1 до 1000), или в % от банка — "
+            "«0.5%» (от 0.1 до 100). Реальная — не меньше 5 акций (~$4.76 при уровне 0.95).",
     "a15l": "✏️ Уровни докупки 15m — цены через запятую или пробел: «0.95, 0.94, 0.93» или в центах «95 93 91»; "
             "диапазон «0.95-0.90» — каждый цент. От 0.50 до 0.99, не больше 20 уровней.",
 }
 
 
 def _current15(kind: str) -> str:
-    return {"w15": late15.window_phrase(), "s15": f"${late15.stake():g}",
-            "a15u": f"${late15.addon_usd():g} на уровень", "a15l": late15.levels_text()}.get(kind, "")
+    return {"w15": late15.window_phrase(), "s15": late15.stake_text(),
+            "a15u": f"{late15.addon_amount_text()} на уровень", "a15l": late15.levels_text()}.get(kind, "")
 
 
 def prompt15_text(kind: str, head: str = "") -> str:
@@ -181,13 +183,25 @@ def apply15_input(kind: str, text: str) -> str:
         runtime_state.set("late15_to_sec", lo)
         return f"✅ Окно входа 15m: {late15.window_phrase()}."
     if kind == "s15":
-        v = parse_number(text.replace("$", ""), *runtime_state.STAKE_LIMITS, allow_off=False)
-        runtime_state.set("late15_stake", round(v, 2))
-        return f"✅ Сумма входа 15m: ${late15.stake():g} (не меньше 5 акций)."
+        if "%" in (text or ""):
+            v = parse_number(text.replace("%", ""), *runtime_state.PCT_LIMITS, allow_off=False)
+            runtime_state.set("late15_stake_pct", round(v, 2))
+            runtime_state.set("late15_stake_mode", "pct")
+        else:
+            v = parse_number(text.replace("$", ""), *runtime_state.STAKE_LIMITS, allow_off=False)
+            runtime_state.set("late15_stake", round(v, 2))
+            runtime_state.set("late15_stake_mode", "usd")
+        return f"✅ Сумма входа 15m: {late15.stake_text()} (не меньше 5 акций)."
     if kind == "a15u":
-        v = parse_number(text.replace("$", ""), *runtime_state.ADDON_USD_LIMITS, allow_off=False)
-        runtime_state.set("late15_addon_usd", round(v, 2))
-        return f"✅ Докупка 15m: ${late15.addon_usd():g} на уровень (реальная — не меньше 5 акций)."
+        if "%" in (text or ""):
+            v = parse_number(text.replace("%", ""), *runtime_state.PCT_LIMITS, allow_off=False)
+            runtime_state.set("late15_addon_pct", round(v, 2))
+            runtime_state.set("late15_addon_mode", "pct")
+        else:
+            v = parse_number(text.replace("$", ""), *runtime_state.ADDON_USD_LIMITS, allow_off=False)
+            runtime_state.set("late15_addon_usd", round(v, 2))
+            runtime_state.set("late15_addon_mode", "usd")
+        return f"✅ Докупка 15m: {late15.addon_amount_text()} на уровень (реальная — не меньше 5 акций)."
     if kind == "a15l":
         runtime_state.set("late15_addon_levels", runtime_state._levels_csv(parse_levels(text)))
         return f"✅ Уровни докупки 15m: {late15.levels_text()}."
@@ -197,7 +211,7 @@ def apply15_input(kind: str, text: str) -> str:
 def confirm15_text() -> str:
     lines = ["⚠️ Включить реальные ставки 15m? Бот будет ставить реальные деньги на 15-минутных рынках.", "",
              f"Монеты: {', '.join(a.upper() for a in late15.coins()) or 'нет'}; правило: {late15.rule_short()}; "
-             f"сумма ${late15.stake():g}.",
+             f"сумма {late15.stake_text()}.",
              f"➕ Докупка 15m: {late15.addon_short()} — реальная, если по окну есть реальная ставка."]
     levels = late15.addon_levels() if late15.addon_on() else []
     if levels:
@@ -1154,7 +1168,7 @@ def confirm_live_text() -> str:
                      "в 🪙 Монетах.")
     try:
         if late15.on() and late15.live_on():
-            lines.append(f"⏱ 15m 🔴: реальные ставки 15m — {late15.rule_short()}; ${late15.stake():g}; "
+            lines.append(f"⏱ 15m 🔴: реальные ставки 15m — {late15.rule_short()}; {late15.stake_text()}; "
                          f"➕ докупка {late15.addon_short()}.")
     except Exception:  # noqa: BLE001
         pass
@@ -1312,7 +1326,7 @@ async def handle(data: str) -> tuple[str, InlineKeyboardMarkup]:
         return screen15(head + ".\n\n")
     if cmd == "f15a":
         runtime_state.set("late15_addon_on", not late15.addon_on())
-        head = (f"➕ Докупка 15m ✅ включена: {late15.levels_text()}, ${late15.addon_usd():g} на уровень.\n\n"
+        head = (f"➕ Докупка 15m ✅ включена: {late15.levels_text()}, {late15.addon_amount_text()} на уровень.\n\n"
                 if late15.addon_on() else "➕ Докупка 15m ⏸ выключена.\n\n")
         return screen15(head)
     if cmd == "fx":
