@@ -101,8 +101,11 @@ class Settings:
     LATE15_MAX_PRICE: float = _get_float("LATE15_MAX_PRICE", 0.97)
     LATE15_MIN_DIST_PCT: float = _get_float("LATE15_MIN_DIST_PCT", 0.10)
     LATE15_MIN_ATR: float = _get_float("LATE15_MIN_ATR", 2.0)
-    # Сумма входа 15m, USDC — одна для теста и реальной ставки (не меньше 5 акций)
+    # Сумма входа 15m — одна для теста и реальной ставки (не меньше 5 акций): фиксированная, USDC, или, если
+    # LATE15_STAKE_PCT > 0, — % от банка (свободный баланс кошелька, не читается — банк вручную из ⚙️; банк
+    # неизвестен — фиксированная). И кнопкой 💵 в ⏱ 15m: «30» — $30, «5%» — 5% банка.
     LATE15_STAKE_USDC: float = _get_float("LATE15_STAKE_USDC", 5.0)
+    LATE15_STAKE_PCT: float = _get_float("LATE15_STAKE_PCT", 0.0)
     # true — реальные ставки 15m сразу после старта (идут, только когда бот в 🔴 LIVE); по умолчанию — только
     # тест, реальные включаются кнопкой в ⏱ 15m
     LATE15_LIVE: bool = _get_bool("LATE15_LIVE", False)
@@ -110,8 +113,10 @@ class Settings:
     # уровень — раз за окно). Тестовая — всегда, пока включена; реальная — если по окну есть реальная ставка 15m.
     LATE15_ADDON_ON: bool = _get_bool("LATE15_ADDON_ON", True)
     LATE15_ADDON_LEVELS: str = os.getenv("LATE15_ADDON_LEVELS", "0.95,0.94,0.93,0.92,0.91,0.90")
-    # Сумма на уровень, USDC (реальная — не меньше 5 акций: при уровне 0.95 это ~$4.76)
+    # Сумма на уровень: фиксированная, USDC, или, если LATE15_ADDON_PCT > 0, — % от банка (как у ставки 15m).
+    # Реальная — не меньше 5 акций (при уровне 0.95 это ~$4.76).
     LATE15_ADDON_USDC: float = _get_float("LATE15_ADDON_USDC", 5.0)
+    LATE15_ADDON_PCT: float = _get_float("LATE15_ADDON_PCT", 0.0)
     # Путь окна 15m: с REC15_FROM_SEC секунд до конца (900 — всё окно) каждые REC15_STEP_SEC секунд
     # (до REC_TO_SEC, хранится REC_KEEP_DAYS дней — как у 5m)
     REC15_FROM_SEC: int = _get_int("REC15_FROM_SEC", 900)
