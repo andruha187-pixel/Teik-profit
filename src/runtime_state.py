@@ -210,6 +210,16 @@ def _price(v) -> float:
 
 
 WINDOW15_LIMITS = (5, 895)          # окно входа 15m — секунд до конца 15-минутного окна
+HOT_ATR_LIMITS = (0.0, 10.0)        # 🌪 ATR сейчас / 15 мин назад (0 — выключено)
+HOT_MOVE_LIMITS = (0.0, 5.0)        # 🌪 ход за 10 мин в сторону ставки, % (0 — выключено)
+
+
+def _hotx(v) -> float:
+    return round(min(HOT_ATR_LIMITS[1], max(HOT_ATR_LIMITS[0], float(v))), 2)
+
+
+def _hotm(v) -> float:
+    return round(min(HOT_MOVE_LIMITS[1], max(HOT_MOVE_LIMITS[0], float(v))), 3)
 
 
 def _sec15(v) -> int:
@@ -240,6 +250,9 @@ _DEFAULTS = {
     "late_min_atr": max(0.0, settings.LATE_MIN_ATR),
     "late_stake": min(STAKE_LIMITS[1], max(STAKE_LIMITS[0], settings.LATE_STAKE_USDC)),
     "late_stop": max(0.0, settings.LATE_STOP_USDC),
+    # 🌪 резкий рынок: ATR × за 15 мин и ход за 10 мин, % (0 — выключено)
+    "late_hot_atr_x": _hotx(settings.LATE_HOT_ATR_X),
+    "late_hot_move_pct": _hotm(settings.LATE_HOT_MOVE_PCT),
     # с какого момента действует нынешнее правило (итоги «по нынешнему правилу» — с него)
     "late_rule_since": 0,
     # своя ставка у монеты: фиксированная $ или % от банка (нет записи — общая ставка late_stake)
@@ -295,6 +308,8 @@ _CASTERS = {
     "late_min_atr": lambda v: max(0.0, float(v)),
     "late_stake": lambda v: min(STAKE_LIMITS[1], max(STAKE_LIMITS[0], float(v))),
     "late_stop": lambda v: max(0.0, float(v)),
+    "late_hot_atr_x": _hotx,
+    "late_hot_move_pct": _hotm,
     "late_rule_since": lambda v: int(float(v)),
     "late_coin_stakes": _stakes_json,
     "late_bank_manual": lambda v: min(BANK_LIMITS[1], max(BANK_LIMITS[0], float(v))),

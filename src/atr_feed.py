@@ -10,6 +10,7 @@ ATR по каждой монете: Wilder ATR(ATR_PERIOD) по 1-минутны
 """
 from __future__ import annotations
 import asyncio
+import bisect
 import logging
 import time
 
@@ -25,6 +26,8 @@ KLINES = 100                  # столько 1m-свечей берём для
 
 _atr: dict[str, tuple[float, float]] = {}      # монета -> (ATR, когда посчитан)
 _errors: dict[str, str] = {}
+_hist: dict[str, tuple[list, list]] = {}      # монета -> ([время], [ATR]) за HISTORY_SEC — для 🌪 «ATR 15 мин назад»
+HISTORY_SEC = 40 * 60
 
 
 def wilder_atr(df: pd.DataFrame, period: int) -> float | None:
@@ -47,14 +50,48 @@ def get(asset: str, now: float | None = None) -> float | None:
     return v[0]
 
 
+def _remember(asset: str, value: float, ts: float) -> None:
+    tss, vals = _hist.setdefault(asset, ([], []))
+    if tss and ts <= tss[-1]:
+        i = bisect.bisect_left(tss, ts)
+        tss.insert(i, ts)
+        vals.insert(i, value)
+    else:
+        tss.append(ts)
+        vals.append(value)
+    drop = bisect.bisect_left(tss, tss[-1] - HISTORY_SEC)
+    if drop > 0:
+        del tss[:drop]
+        del vals[:drop]
+
+
+def get_at(asset: str, ts: float, tolerance_sec: float = 120.0) -> float | None:
+    """ATR, посчитанный ближе всего к моменту ts (не дальше tolerance), или None — истории нет (например, бот
+    только что запущен)."""
+    h = _hist.get(asset)
+    if not h or not h[0]:
+        return None
+    tss, vals = h
+    i = bisect.bisect_left(tss, ts)
+    best = None
+    for k in (i - 1, i):
+        if 0 <= k < len(tss) and abs(tss[k] - ts) <= tolerance_sec:
+            if best is None or abs(tss[k] - ts) < abs(tss[best] - ts):
+                best = k
+    return vals[best] if best is not None else None
+
+
 def put(asset: str, value: float, ts: float | None = None) -> None:
     """Для тестов и ручной подстановки."""
-    _atr[asset] = (float(value), time.time() if ts is None else ts)
+    t = time.time() if ts is None else ts
+    _atr[asset] = (float(value), t)
+    _remember(asset, float(value), t)
 
 
 def reset() -> None:
     _atr.clear()
     _errors.clear()
+    _hist.clear()
 
 
 async def refresh(asset: str) -> float | None:
@@ -65,7 +102,9 @@ async def refresh(asset: str) -> float | None:
         _errors[asset] = str(exc)[:200]
         return None
     if val is not None:
-        _atr[asset] = (val, time.time())
+        now = time.time()
+        _atr[asset] = (val, now)
+        _remember(asset, val, now)
         _errors.pop(asset, None)
     return val
 

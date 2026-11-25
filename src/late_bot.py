@@ -305,7 +305,50 @@ def rule_tag(asset: str | None = None, side: str | None = None) -> str:
     """Правило коротко — пишется в каждую ставку (колонка rule); у монеты и стороны — с их порогами."""
     hi, lo = window()
     pl, ph = price_range()
-    return f"{hi}-{lo}s|{pl:.2f}-{ph:.2f}|d{min_dist(asset, side):g}%|atr{min_atr(asset, side):g}"
+    tag = f"{hi}-{lo}s|{pl:.2f}-{ph:.2f}|d{min_dist(asset, side):g}%|atr{min_atr(asset, side):g}"
+    if hot_atr_x() > 0 or hot_move_pct() > 0:
+        tag += f"|hot{hot_atr_x():g}/{hot_move_pct():g}"
+    return tag
+
+
+# --- 🌪 резкий рынок ---
+HOT_ATR_BACK_SEC = 870         # «ATR 15 минут назад» — на момент за 14:30 до начала окна (как в разборе архива)
+HOT_MOVE_BACK_SEC = 600        # «ход за 10 минут» — от цены Chainlink на начало окна два окна назад
+
+
+def hot_atr_x() -> float:
+    return float(_rs("late_hot_atr_x") or 0.0)
+
+
+def hot_move_pct() -> float:
+    return float(_rs("late_hot_move_pct") or 0.0)
+
+
+def hot_text() -> str:
+    """«не ставит, если ATR ×≥1.7 за 15 мин или за 10 мин уже ≥0.45% в сторону ставки» / «выключен»."""
+    parts = []
+    if hot_atr_x() > 0:
+        parts.append(f"ATR вырос ×≥{hot_atr_x():g} за 15 мин")
+    if hot_move_pct() > 0:
+        parts.append(f"за 10 мин уже ≥{hot_move_pct():g}% в сторону ставки")
+    return ("не ставит, если " + " или ".join(parts)) if parts else "выключен"
+
+
+def hot_why(asset: str, start: int, price: float, side: str, atr: float | None) -> str | None:
+    """Причина не ставить на резком рынке или None. Нет истории (бот только что запущен) — не мешаем."""
+    x = hot_atr_x()
+    if x > 0 and atr:
+        a0 = atr_feed.get_at(asset, start - HOT_ATR_BACK_SEC)
+        if a0 and atr / a0 >= x - 1e-9:
+            return f"резкий рынок: ATR ×{atr / a0:.1f} за 15 мин"
+    m = hot_move_pct()
+    if m > 0:
+        p0 = chainlink_feed.price_at(asset, start - HOT_MOVE_BACK_SEC)
+        if p0:
+            mv = (price - p0) / p0 * 100 * (1 if side == "UP" else -1)
+            if mv >= m - 1e-12:
+                return f"резкий рынок: за 10 мин уже {mv:.2f}% в сторону ставки"
+    return None
 
 
 def atr_text() -> str:
@@ -317,17 +360,19 @@ def rule_short() -> str:
     pl, ph = price_range()
     atr = f" и {atr_text()}" if min_atr() > 0 else " (без ATR)"
     own = coin_rules_text()
+    hot = f"; 🌪 {hot_text()}" if hot_atr_x() > 0 or hot_move_pct() > 0 else ""
     return (f"{window_phrase()}, цена {pl:.2f}–{ph:.2f}, до страйка ≥{min_dist():g}%{atr}"
-            + (f" (своё у {own})" if own else ""))
+            + (f" (своё у {own})" if own else "") + hot)
 
 
 def rule_text() -> str:
     pl, ph = price_range()
     atr = f", не меньше {min_atr():g} ATR" if min_atr() > 0 else ", без условия по ATR"
     own = coin_rules_text()
+    hot = f"; 🌪 резкий рынок — {hot_text()}" if hot_atr_x() > 0 or hot_move_pct() > 0 else ""
     return (f"{window_phrase()} окна сторона по цене {pl:.2f}–{ph:.2f}, "
             f"цена Chainlink ушла от страйка не меньше чем на {min_dist():g}%{atr}"
-            + (f"; своё у монет: {own}" if own else ""))
+            + (f"; своё у монет: {own}" if own else "") + hot)
 
 
 def trade_assets() -> list[str]:
@@ -926,7 +971,10 @@ def evaluate(w: Win, now: float) -> tuple[bool, dict]:
     elif min_atr(w.asset, side) > 0 and datr < min_atr(w.asset, side) - 1e-9:
         info["why"] = f"меньше {min_atr(w.asset, side):g} ATR от страйка" + _side_note(w.asset, side, "atr")
     else:
-        return True, info
+        hot = hot_why(w.asset, w.start, price, side, atr)
+        if hot is None:
+            return True, info
+        info["why"] = hot
     return False, info
 
 

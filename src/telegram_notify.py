@@ -140,12 +140,10 @@ def _block15() -> str:
 
 
 def screen15_markup() -> InlineKeyboardMarkup:
-    toggle = (Btn("⏸ Выключить 15m", callback_data="f15t") if late15.on()
-              else Btn("✅ Включить 15m", callback_data="f15t"))
-    live = (Btn("🧪 Только тест 15m", callback_data="f15l") if late15.live_on()
-            else Btn("🔴 Реальные 15m", callback_data="f15l"))
-    addon = (Btn("➕ Докупка ⏸ выкл", callback_data="f15a") if late15.addon_on()
-             else Btn("➕ Докупка ✅ вкл", callback_data="f15a"))
+    """Кнопки показывают, что СЕЙЧАС (как у ➕ докупки 5m); нажатие — переключает."""
+    toggle = Btn("15m ✅ включено" if late15.on() else "15m ⏸ выключено", callback_data="f15t")
+    live = Btn("🔴 реально" if late15.live_on() else "🧪 тест", callback_data="f15l")
+    addon = Btn("➕ Докупка ✅" if late15.addon_on() else "➕ Докупка ⏸", callback_data="f15a")
     return _menu((toggle, live),
                  (Btn("⏱ Окно", callback_data="in:w15"), Btn("💵 Сумма", callback_data="in:s15")),
                  (addon, Btn("➕ Сумма на уровень", callback_data="in:a15u"),
@@ -399,6 +397,7 @@ def settings_text(head: str = "") -> str:
         f"Ставка: {stake_text()}.",
         "Стратегия: " + ("✅ включена" if late_bot.enabled() else "⏸ выключена — ставок нет, окна пишутся"),
         f"➕ Докупка на откате: {late_bot.addon_short()} (кнопка ниже).",
+        f"🌪 Резкий рынок: {late_bot.hot_text()}.",
         "",
         "• Окно входа — сколько осталось до конца 5-минутного окна. Бот проверяет раз в секунду и входит на "
         "первой секунде окна, где выполнены все условия; одна ставка на окно, держим до конца.",
@@ -407,6 +406,8 @@ def settings_text(head: str = "") -> str:
         "• До страйка — насколько цена Chainlink ушла от страйка (цены на начало окна): в % и в ATR "
         "(Wilder ATR(7) по 1-минутным свечам Binance).",
         "• ✏️ — своё значение сообщением (окно, цена, %, ATR, сумма, стоп).",
+        "• 🌪 Резкий рынок — не ставить, если ATR вырос за 15 минут во столько раз или цена за 10 минут уже "
+        "ушла в сторону ставки на столько % (по архиву: 1.7 и 0.45). 0 — выключено.",
         "",
         "На архиве 21.10–13.11 (6 монет): 3:20–3:30, 0.96–0.97, ≥0.10% и ≥2 ATR — 845 ставок, 18 проигрышей "
         "(97.9%); с порогами монет (📏, 🎯 — стоят по умолчанию) — 545 ставок, 3 проигрыша. Окупаемость при цене "
@@ -440,6 +441,9 @@ def settings_markup() -> InlineKeyboardMarkup:
         tuple(Btn(_mark(_same(stop, v)) + (f"стоп ${v:g}" if v else "без стопа"), callback_data=f"ss:{v:g}")
               for v in lb.STOP_PRESETS) + (Btn("✏️ стоп", callback_data="in:stop"),),
         (Btn(f"➕ Докупка: {_addon_button()}", callback_data="ad"),),
+        (Btn("🌪 ATR× " + (f"{lb.hot_atr_x():g}" if lb.hot_atr_x() > 0 else "выкл"), callback_data="in:hotx"),
+         Btn("🌪 ход 10 мин " + (f"{lb.hot_move_pct():g}%" if lb.hot_move_pct() > 0 else "выкл"),
+             callback_data="in:hotm")),
         (Btn("🔄 Обновить", callback_data="se"), BACK),
     )
 
@@ -959,6 +963,10 @@ PROMPTS = {
     "stake": "✏️ Сумма входа в $ — например «7» или «12.5» (от 1 до 1000). Меньше 5 акций биржа не берёт: при "
              "цене 0.95 это ~$4.8 — ставка будет не меньше.",
     "stop": "✏️ Дневной стоп реальных ставок в $ — например «40». 0 — без стопа.",
+    "hotx": "✏️ 🌪 Резкий рынок, ATR: не ставить, если ATR сейчас во столько раз выше, чем 15 минут назад — "
+            "например «1.7». 0 — выключено.",
+    "hotm": "✏️ 🌪 Резкий рынок, ход: не ставить, если цена за 10 минут уже ушла в сторону ставки на столько % — "
+            "например «0.45». 0 — выключено.",
 }
 
 _NUM = r"\d+(?:[.,]\d+)?"
@@ -1073,6 +1081,13 @@ def apply_input(kind: str, text: str) -> str:
         return apply_stake(parse_number(text.replace("$", ""), *runtime_state.STAKE_LIMITS, allow_off=False))
     if kind == "stop":
         return apply_stop(parse_number(text.replace("$", ""), 0.0, 100000.0))
+    if kind == "hotx":
+        runtime_state.set("late_hot_atr_x", parse_number(text.replace("×", "").replace("x", ""),
+                                                          *runtime_state.HOT_ATR_LIMITS))
+        return f"✅ 🌪 Резкий рынок: {late_bot.hot_text()}." + _rule_changed()
+    if kind == "hotm":
+        runtime_state.set("late_hot_move_pct", parse_number(text.replace("%", ""), *runtime_state.HOT_MOVE_LIMITS))
+        return f"✅ 🌪 Резкий рынок: {late_bot.hot_text()}." + _rule_changed()
     raise ValueError("неизвестная настройка")
 
 
@@ -1082,7 +1097,9 @@ def _current_value(kind: str) -> str:
     return {"win": lb.window_phrase(), "price": f"{pl:.2f}–{ph:.2f}",
             "dist": f"≥{lb.min_dist():g}%" if lb.min_dist() > 0 else "без условия",
             "atr": lb.atr_text(), "stake": f"${lb.stake():g}",
-            "stop": f"−${lb.stop():g}" if lb.stop() > 0 else "без стопа"}.get(kind, "")
+            "stop": f"−${lb.stop():g}" if lb.stop() > 0 else "без стопа",
+            "hotx": f"×{lb.hot_atr_x():g}" if lb.hot_atr_x() > 0 else "выключено",
+            "hotm": f"{lb.hot_move_pct():g}%" if lb.hot_move_pct() > 0 else "выключено"}.get(kind, "")
 
 
 def prompt_text(kind: str, head: str = "") -> str:
